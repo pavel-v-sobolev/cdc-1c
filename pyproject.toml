@@ -3,7 +3,7 @@ requires = ["hatchling >= 1.26"]
 build-backend = "hatchling.build"
 
 [project]
-name = "cdc-1C"
+name = "cdc_1C"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"

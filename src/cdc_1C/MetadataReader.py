@@ -1,6 +1,7 @@
 import requests
 import logging
 from typing import Any
+from collections import UserDict
 
 import xmltodict
 from sqlalchemy import String, Uuid, BigInteger, SmallInteger, Numeric, Boolean, DateTime
@@ -33,7 +34,7 @@ ODATA_PREFIX = 'StandardODATA.'
 TYPE_PREFIX = 'Edm.'
 
 
-from collections import UserDict
+
 
 class MetadataObject(UserDict):
     def __init__(self,properties,primary_key):
