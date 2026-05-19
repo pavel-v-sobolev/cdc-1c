@@ -40,7 +40,7 @@ class DataReader(UserDict):
 
             object_id = object_entry.get('id')
             object_full_name = (object_entry.get('category') or {}).get('@term')
-            object_name, object_type = self._parce_object_full_name(object_full_name)
+            object_name, object_type = self._parse_object_full_name(object_full_name)
 
             logger.info(f'Parcing {object_name}')
             
@@ -53,7 +53,7 @@ class DataReader(UserDict):
                 self._get_entity_records(object_name,properties)
 
 
-    def _parce_object_full_name(self,object_full_name):
+    def _parse_object_full_name(self,object_full_name):
         """
         Очищаем имя объекта от разных префиксов, постфиксов и скобок.
         Возвращает очищенное имя и тип объекта
@@ -120,7 +120,7 @@ class DataReader(UserDict):
         if not new_records:
             # Если записей нет, то значит запись удалена, создаем пустую запись.
             if recorder and recorder_type:
-                recorder_name, _ = self._parce_object_full_name(recorder_type)
+                recorder_name, _ = self._parse_object_full_name(recorder_type)
                 new_records = [{'Recorder':recorder, 'Recorder_Type':recorder_name}]
             else:
                 logger.error(f'No recorder or recorder type for {object_name}')
@@ -154,7 +154,7 @@ class DataReader(UserDict):
         for table_part_key,table_part in table_parts.items():
             table_part_full_name = table_part.get('@m:type')
             if table_part_full_name:
-                table_part_name, _ = self._parce_object_full_name(table_part_full_name)
+                table_part_name, _ = self._parse_object_full_name(table_part_full_name)
                 table_part_rows = table_part.get('d:element') or []
                 if table_part_rows:
                     for table_part_row in table_part_rows:

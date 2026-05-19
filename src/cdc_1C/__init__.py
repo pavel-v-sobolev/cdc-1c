@@ -1,13 +1,13 @@
 from importlib.metadata import version, PackageNotFoundError
 
-# try:
-#     __version__ = version("CDC_1C")
-# except PackageNotFoundError:
-#     __version__ = "dev"
+try:
+    __version__ = version("cdc_1C")
+except PackageNotFoundError:
+    __version__ = "dev"
 
 from .MetadataReader import MetadataReader
 from .DataReader import DataReader
+from .ChangeReader import ChangeReader
 
-__all__ = ["MetadataReader","DataReader"]
+__all__ = ["MetadataReader","DataReader","ChangeReader", "__version__"]
 
-#__all__ = ["MetadataReader", "__version__"]

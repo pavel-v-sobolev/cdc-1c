@@ -27,6 +27,7 @@ GUESS_UUID_TYPES = True
 # Конечно, если отключить флаг, то это часть полей будут UUID, а часть VARCHAR.
 # В этом случает VARCHAR поля лучше руками в базе поменять на UUID, 
 # т.к. иначе будут медленно работать JOIN
+
 REGISTER_TYPES = ('InformationRegister','AccumulationRegister')
 ENTITY_TYPES = ('Catalog','Document')
 METADATA_POSTFIXES = ('_RecordType','_RowType','_Balance','_Turnover','_BalanceAndTurnover')
@@ -39,7 +40,7 @@ TYPE_PREFIX = 'Edm.'
 class MetadataObject(UserDict):
     def __init__(self,properties,primary_key):
         super().__init__(properties)
-        self.primary_key = []
+        self.primary_key = primary_key
 
 class MetadataReader(UserDict):
     def __init__(self, base_url:str):
@@ -81,7 +82,7 @@ class MetadataReader(UserDict):
                 if property_name.endswith('_Type'):
                     uuid_property_name = property_name.removesuffix('_Type')
                     if uuid_property_name in properties.keys():
-                        properties[uuid_property_name] = Uuid()
+                        properties[uuid_property_name] = 'Guid'
 
 
         return properties
