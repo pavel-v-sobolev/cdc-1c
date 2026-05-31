@@ -108,18 +108,13 @@ class DataReader1C(UserDict):
             return None, None
         return object_name, object_type
 
-    def _get_polars_schema(self, object_name: str) -> dict:
-        metadata_obj = self.metadata.get(object_name) or {}
-        return {name: POLARS_TYPE_MAPPING.get(type_str, pl.Utf8)
-                for name, type_str in metadata_obj.items()}
-
     def _add_records(self, object_name, new_records: list):
         if new_records:
             if object_name in self.keys():
                 self[object_name].extend(new_records)
             else:
-                schema = self._get_polars_schema(object_name)
-                self[object_name] = DataObject1C(new_records, schema=schema)
+                metadata_obj = self.metadata.get(object_name)
+                self[object_name] = DataObject1C(new_records, metadata_obj=metadata_obj)
 
     @staticmethod
     def _get_record_fields(properties: dict) -> dict:
