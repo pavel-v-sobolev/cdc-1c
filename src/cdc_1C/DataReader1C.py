@@ -28,13 +28,18 @@ POLARS_TYPE_MAPPING = {
 
 
 class DataObject1C(UserList):
-    def __init__(self, records: list = [], schema: dict = None):
+    def __init__(self, records: list = [], metadata_obj=None):
         super().__init__(records)
-        self._schema: dict = schema or {}
+        self.metadata_obj = metadata_obj  # MetadataObject1C или None
+
+    def _get_polars_schema(self, columns: list[str]) -> dict:
+        metadata_dict = self.metadata_obj or {}
+        return {col: POLARS_TYPE_MAPPING.get(metadata_dict.get(col, 'String'), pl.Utf8)
+                for col in columns}
 
     def to_dataframe(self, name_mapper=None) -> pl.DataFrame:
-        columns = list(self[0].keys()) if self else list(self._schema.keys())
-        schema = {col: self._schema.get(col, pl.Utf8) for col in columns}
+        columns = list(self[0].keys()) if self else list(self.metadata_obj or {})
+        schema = self._get_polars_schema(columns)
         df = pl.DataFrame(list(self), schema=schema)
         if name_mapper:
             df = df.rename({col: name_mapper.map_field_name(col) for col in df.columns})
