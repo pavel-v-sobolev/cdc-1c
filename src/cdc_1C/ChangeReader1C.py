@@ -6,15 +6,16 @@ from collections import UserDict
 import xmltodict
 from sqlalchemy import String, Uuid, BigInteger, SmallInteger, Numeric, Boolean, DateTime
 
-from cdc_1C import MetadataReader, DataReader
+from cdc_1C.DataReader1C import DataReader1C
+from cdc_1C.MetadataReader1C import MetadataReader1C
 
 logging.basicConfig()
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
-class ChangeReader(DataReader):
-    def __init__(self, base_url:str, exchange_name:str, queue_guid:str, metadata: MetadataReader):
+class ChangeReader1C(DataReader1C):
+    def __init__(self, base_url:str, exchange_name:str, queue_guid:str, metadata: MetadataReader1C):
         super().__init__(base_url, metadata)
         self.exchange_name = exchange_name
         self.queue_guid = queue_guid

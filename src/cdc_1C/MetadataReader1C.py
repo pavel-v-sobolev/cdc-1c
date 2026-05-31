@@ -37,12 +37,12 @@ TYPE_PREFIX = 'Edm.'
 
 
 
-class MetadataObject(UserDict):
+class MetadataObject1C(UserDict):
     def __init__(self,properties,primary_key):
         super().__init__(properties)
         self.primary_key = primary_key
 
-class MetadataReader(UserDict):
+class MetadataReader1C(UserDict):
     def __init__(self, base_url:str):
         super().__init__()
         self.base_url=base_url
@@ -124,7 +124,7 @@ class MetadataReader(UserDict):
                 item_name = item_name.removesuffix("_RecordType")
                 properties = self._read_metadata_item_properties(item) 
                 primary_key = self._read_metadata_item_key(item)
-                self[item_name] = MetadataObject(properties,primary_key)
+                self[item_name] = MetadataObject1C(properties,primary_key)
 
             elif item_name.startswith(ENTITY_TYPES) and not item_name.endswith(METADATA_POSTFIXES):
             # если документ или справочник без постфикса, то
@@ -132,5 +132,5 @@ class MetadataReader(UserDict):
             # (также может быть табличная часть документа или справочника)
                 properties = self._read_metadata_item_properties(item)
                 primary_key = self._read_metadata_item_key(item)
-                self[item_name] = MetadataObject(properties,primary_key)
+                self[item_name] = MetadataObject1C(properties,primary_key)
 
