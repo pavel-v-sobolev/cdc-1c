@@ -5,7 +5,7 @@ from typing import Any
 import xmltodict
 from sqlalchemy import String, Uuid, BigInteger, SmallInteger, Numeric, Boolean, DateTime
 
-from cdc_1C import MetadataReader1C, DataReader1C, ChangeReader1C
+from cdc_1C import MetadataReader1C, DataReader1C, ChangeReader1C, NameMapper1C
 
 logging.basicConfig()
 logger = logging.getLogger()
@@ -25,5 +25,9 @@ metadata = MetadataReader1C(base_url)
 changes = ChangeReader1C(base_url, exchange_name, queue_guid, metadata)
 changes.read_changes()
 
+mapper = NameMapper1C()
+
+df = changes['Document_ЗаказКлиента'].to_dataframe(mapper)
+df.row(0,named=True)
 
 pass

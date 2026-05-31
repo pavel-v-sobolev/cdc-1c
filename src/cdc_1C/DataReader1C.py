@@ -28,21 +28,34 @@ POLARS_TYPE_MAPPING = {
 
 
 class DataObject1C(UserList):
-    def __init__(self, records: list = [], metadata_obj=None):
+    def __init__(self, metadata_obj: dict, records: list = []):
         super().__init__(records)
-        self.metadata_obj = metadata_obj  # MetadataObject1C или None
+        self.metadata_obj = metadata_obj  # MetadataObject1C
 
     def _get_polars_schema(self, columns: list[str]) -> dict:
         metadata_dict = self.metadata_obj or {}
         return {col: POLARS_TYPE_MAPPING.get(metadata_dict.get(col, 'String'), pl.Utf8)
                 for col in columns}
 
-    def to_dataframe(self, name_mapper=None) -> pl.DataFrame:
+    def to_dataframe(self, name_mapper) -> pl.DataFrame:
         columns = list(self[0].keys()) if self else list(self.metadata_obj or {})
         schema = self._get_polars_schema(columns)
-        df = pl.DataFrame(list(self), schema=schema)
-        if name_mapper:
-            df = df.rename({col: name_mapper.map_field_name(col) for col in df.columns})
+        df = pl.DataFrame(list(self))
+
+        cast_exprs = []
+        for col, dtype in schema.items():
+            if col not in df.columns:
+                continue
+            if dtype == pl.Boolean:
+                cast_exprs.append((pl.col(col).str.to_lowercase() == 'true').alias(col))
+            elif dtype == pl.Datetime:
+                cast_exprs.append(pl.col(col).str.to_datetime(strict=False).alias(col))
+            else:
+                cast_exprs.append(pl.col(col).cast(dtype, strict=False))
+        if cast_exprs:
+            df = df.with_columns(cast_exprs)
+
+        df = df.rename(name_mapper.get_column_mapping(df.columns))
         return df
 
 
@@ -114,7 +127,7 @@ class DataReader1C(UserDict):
                 self[object_name].extend(new_records)
             else:
                 metadata_obj = self.metadata.get(object_name)
-                self[object_name] = DataObject1C(new_records, metadata_obj=metadata_obj)
+                self[object_name] = DataObject1C(metadata_obj=metadata_obj, records=new_records)
 
     @staticmethod
     def _get_record_fields(properties: dict) -> dict:
@@ -123,8 +136,12 @@ class DataReader1C(UserDict):
         for k, v in properties.items():
             if not k.startswith('d:') or k.endswith('_Type'):
                 continue
+            if isinstance(v, list):
+                continue
             if isinstance(v, dict):
-                fields[k.removeprefix('d:')] = None
+                if v.get('@xsi:nil') == 'true':
+                    fields[k.removeprefix('d:')] = None
+                # иначе — вложенная структура (table part), пропускаем
             else:
                 fields[k.removeprefix('d:')] = v
 

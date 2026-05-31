@@ -50,3 +50,6 @@ class NameMapper1C:
 
     def map_field_name(self, name: str) -> str:
         return self.map_name(name)
+
+    def get_column_mapping(self, columns: list[str]) -> dict[str, str]:
+        return {col: self.map_field_name(col) for col in columns}
