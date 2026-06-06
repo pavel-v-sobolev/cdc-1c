@@ -42,6 +42,9 @@ class MetadataObject1C(UserDict):
         super().__init__(properties)
         self.primary_key = primary_key
 
+    def get_column_types(self) -> dict[str, Any]:
+        return {col: type_mapping[typ] for col, typ in self.data.items()}
+
 class MetadataReader1C(UserDict):
     def __init__(self, base_url:str):
         super().__init__()
@@ -106,6 +109,8 @@ class MetadataReader1C(UserDict):
         Далее в цикле читаем из содержимое и сохраняем в структуре, которую будем использовать дальше,
         при создании таблиц и полей.
         """
+        logger.info('Requesting metadata from 1C ODATA')
+        
         url = f'{self.base_url}/$metadata'
         response = requests.get(url,auth=('admin', 'admin'))
 

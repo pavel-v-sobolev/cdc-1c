@@ -1,9 +1,10 @@
 import requests
 import logging
+from typing import Any
 from collections import UserDict, UserList
+from datetime import datetime
 
 import xmltodict
-import polars as pl
 
 from cdc_1C.MetadataReader1C import MetadataReader1C
 
@@ -16,54 +17,40 @@ ENTITY_TYPES = ('Catalog','Document')
 METADATA_POSTFIXES = ('_RecordType','_RowType','_Balance','_Turnover','_BalanceAndTurnover')
 ODATA_PREFIX = 'StandardODATA.'
 
-POLARS_TYPE_MAPPING = {
-    'Guid':     pl.Utf8,
-    'String':   pl.Utf8,
-    'Int64':    pl.Int64,
-    'Int16':    pl.Int16,
-    'Double':   pl.Float64,
-    'Boolean':  pl.Boolean,
-    'DateTime': pl.Datetime,
-}
 
-
-class DataObject1C(UserList):
-    def __init__(self, metadata_obj: dict, records: list = []):
-        super().__init__(records)
+class DataObject1C(UserDict):
+    def __init__(self, metadata_obj=None, records: list = []):
+        super().__init__()
         self.metadata_obj = metadata_obj  # MetadataObject1C
+        self.data_length = 0
+        self.add_records(records)
 
-    def _get_polars_schema(self, columns: list[str]) -> dict:
-        metadata_dict = self.metadata_obj or {}
-        return {col: POLARS_TYPE_MAPPING.get(metadata_dict.get(col, 'String'), pl.Utf8)
-                for col in columns}
+    def add_records(self, records: list):
+        for record in records:
+            for k,v in record.items():
+                if k not in self.data.keys():
+                    # встретилось новое поле, нужно добавить его во все записи, которые уже есть.
+                    if self.data_length > 0:
+                        self.data[k] = [None] * self.data_length
+                    else:
+                        self.data[k] = []
+                self.data[k].append(v)
 
-    def to_dataframe(self, name_mapper) -> pl.DataFrame:
-        columns = list(self[0].keys()) if self else list(self.metadata_obj or {})
-        schema = self._get_polars_schema(columns)
-        df = pl.DataFrame(list(self))
+            for k in self.data.keys():
+                 # если в новой записи нет какого-то поля, которое уже есть в данных, то нужно добавить это поле со значением None
+                if k not in record.keys():
+                    self.data[k].append(None)
 
-        cast_exprs = []
-        for col, dtype in schema.items():
-            if col not in df.columns:
-                continue
-            if dtype == pl.Boolean:
-                cast_exprs.append((pl.col(col).str.to_lowercase() == 'true').alias(col))
-            elif dtype == pl.Datetime:
-                cast_exprs.append(pl.col(col).str.to_datetime(strict=False).alias(col))
-            else:
-                cast_exprs.append(pl.col(col).cast(dtype, strict=False))
-        if cast_exprs:
-            df = df.with_columns(cast_exprs)
-
-        df = df.rename(name_mapper.get_column_mapping(df.columns))
-        return df
+            self.data_length += 1
+            
 
 
 class DataReader1C(UserDict):
-    def __init__(self, base_url: str, metadata: MetadataReader1C):
+    def __init__(self, base_url: str, metadata: MetadataReader1C, name_mapper=None):
         super().__init__()
         self.base_url = base_url
         self.metadata = metadata
+        self.name_mapper = name_mapper
 
     def read_object(self, object_name: str):
         url = f"{self.base_url}/{object_name}"
@@ -124,33 +111,70 @@ class DataReader1C(UserDict):
     def _add_records(self, object_name, new_records: list):
         if new_records:
             if object_name in self.keys():
-                self[object_name].extend(new_records)
+                self[object_name].add_records(new_records)
             else:
                 metadata_obj = self.metadata.get(object_name)
                 self[object_name] = DataObject1C(metadata_obj=metadata_obj, records=new_records)
 
     @staticmethod
-    def _get_record_fields(properties: dict) -> dict:
-        # обычные поля; любой dict-значение нормализуем в None
+    def _convert_value(value: Any, type_name: str) -> Any:
+        # Конвертируем значение в нужный тип данных на основе метаданных.
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            logger.warning(f'Expected value to be a string for conversion, got {type(value).__name__}: {value!r}')
+            return value
+        try:
+            if type_name == 'Boolean':
+                return value.lower() == 'true'
+            if type_name in ('Int64', 'Int16'):
+                return int(value)
+            if type_name == 'Double':
+                return float(value)
+            if type_name == 'DateTime':
+                return datetime.fromisoformat(value)
+        except (ValueError, TypeError) as e:
+            logger.warning(f'Failed to convert value {value!r} to type {type_name}: {e}')
+        return value
+
+    def _get_record_fields(self, properties: dict, object_name: str = None) -> dict:
+        if object_name not in self.metadata.keys():
+            self.metadata.get_metadata()
+            if object_name not in self.metadata.keys():
+                logger.error(f'Metadata not found for {object_name}')
+                raise ValueError(f'Metadata not found for {object_name}')            
+        
+        metadata_obj = self.metadata[object_name]
+
         fields = {}
         for k, v in properties.items():
-            if not k.startswith('d:') or k.endswith('_Type'):
-                continue
-            if isinstance(v, list):
-                continue
-            if isinstance(v, dict):
-                if v.get('@xsi:nil') == 'true':
-                    fields[k.removeprefix('d:')] = None
-                # иначе — вложенная структура (table part), пропускаем
-            else:
-                fields[k.removeprefix('d:')] = v
+            if k.startswith('d:') and isinstance(v, str):
 
-        # поля составных типов (убираем ODATA_PREFIX в значении)
-        fields_type = {k.removeprefix('d:'): (v.removeprefix(ODATA_PREFIX) if isinstance(v, str) else v)
-                       for k, v in properties.items()
-                       if k.startswith('d:') and k.endswith('_Type') and not isinstance(v, dict)}
+                field_name = k.removeprefix('d:')
 
-        return fields | fields_type
+                if field_name.endswith('_Type'):
+                    # если поле заканчивается на _Type, то это поле составного типа
+                    # и в значении будет полное имя типа, например "StandardODATA.СправочникСсылка.Контрагенты"
+                    # для удобства убираем префикс и оставляем только имя типа, например "СправочникСсылка.Контрагенты"
+                    value = v.removeprefix(ODATA_PREFIX)
+                else:
+                    value = v
+
+                if field_name not in metadata_obj.keys():
+                    # поле не найдено в метаданных, пробуем их перечитать.
+                    self.metadata.get_metadata()
+                    metadata_obj = self.metadata[object_name]
+                    if field_name not in metadata_obj.keys():
+                        logger.warning(f'Metadata field {field_name} not found for object {object_name}')
+                        
+                type_name = metadata_obj.get(field_name) or 'String'
+
+                converted = self._convert_value(value, type_name)
+
+                fields[field_name] = converted
+
+        
+        return fields
 
     def _get_register_records(self, object_name: str, properties: dict):
         """
@@ -163,7 +187,7 @@ class DataReader1C(UserDict):
 
         records = (properties.get('d:RecordSet') or {}).get('d:element') or []
 
-        new_records = [self._get_record_fields(record) for record in records]
+        new_records = [self._get_record_fields(record, object_name) for record in records]
 
         if not new_records:
             # Если записей нет, то значит запись удалена, создаем пустую запись.
@@ -189,7 +213,7 @@ class DataReader1C(UserDict):
         Функция забирает поля документа или справочника.
         Запись одна, но могут быть табличные части, которые будут записаны в отдельные элементы структуры changes
         """
-        fields = self._get_record_fields(properties)
+        fields = self._get_record_fields(properties, object_name)
         self._add_records(object_name, [fields])
 
         table_parts = self._get_record_table_parts(properties)
@@ -201,11 +225,4 @@ class DataReader1C(UserDict):
                 table_part_rows = table_part.get('d:element') or []
                 if table_part_rows:
                     for table_part_row in table_part_rows:
-                        self._add_records(table_part_name, [self._get_record_fields(table_part_row)])
-
-    def to_dataframes(self, name_mapper=None) -> dict[str, pl.DataFrame]:
-        result = {}
-        for object_name in self.keys():
-            mapped_name = name_mapper.map_object_name(object_name) if name_mapper else object_name
-            result[mapped_name] = self[object_name].to_dataframe(name_mapper)
-        return result
+                        self._add_records(table_part_name, [self._get_record_fields(table_part_row, table_part_name)])

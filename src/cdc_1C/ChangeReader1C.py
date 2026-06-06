@@ -1,10 +1,7 @@
 import requests
 import logging
-from typing import Any
-from collections import UserDict
 
 import xmltodict
-from sqlalchemy import String, Uuid, BigInteger, SmallInteger, Numeric, Boolean, DateTime
 
 from cdc_1C.DataReader1C import DataReader1C
 from cdc_1C.MetadataReader1C import MetadataReader1C
@@ -15,8 +12,9 @@ logger.setLevel(logging.INFO)
 
 
 class ChangeReader1C(DataReader1C):
-    def __init__(self, base_url:str, exchange_name:str, queue_guid:str, metadata: MetadataReader1C):
-        super().__init__(base_url, metadata)
+    def __init__(self, base_url: str, exchange_name: str, queue_guid: str,
+                 metadata: MetadataReader1C, name_mapper=None):
+        super().__init__(base_url, metadata, name_mapper)
         self.exchange_name = exchange_name
         self.queue_guid = queue_guid
 

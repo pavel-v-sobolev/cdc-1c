@@ -21,13 +21,15 @@ metadata = MetadataReader1C(base_url)
 
 # order_data = DataReader(base_url, metadata)
 # order_data.read_object('Document_ЗаказКлиента')
-
-changes = ChangeReader1C(base_url, exchange_name, queue_guid, metadata)
+mapper = NameMapper1C(manual_mapping={
+    'Комментарий': 'Comment'
+})
+changes = ChangeReader1C(base_url, exchange_name, queue_guid, metadata, mapper)
 changes.read_changes()
 
-mapper = NameMapper1C()
 
-df = changes['Document_ЗаказКлиента'].to_dataframe(mapper)
-df.row(0,named=True)
+
+changes['Document_ЗаказКлиента']
+changes['AccumulationRegister_ЗаказыКлиентов']
 
 pass
