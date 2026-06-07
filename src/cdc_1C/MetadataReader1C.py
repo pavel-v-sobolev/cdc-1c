@@ -90,15 +90,17 @@ class MetadataReader1C(UserDict):
 
         return properties
 
-    def _read_metadata_item_key(self, item:dict):
+    def _read_metadata_item_key(self, item:dict, properties: dict):
         """
         Читаем список ключевых полей объекта метаданных
         """
-        key = []
+        key = {}
         item_key = (item.get('Key') or {}).get('PropertyRef')
 
         if item_key:
-            key = [k.get('@Name') for k in item_key if k.get('@Name') is not None]
+            key_fields = [k.get('@Name') for k in item_key if k.get('@Name') is not None]
+
+        key = {k: properties[k] for k in key_fields if k in properties}
 
         return key
 
@@ -128,7 +130,7 @@ class MetadataReader1C(UserDict):
             # регистр с постфиксом RecordType содержит описание полей регистра и описание ключа
                 item_name = item_name.removesuffix("_RecordType")
                 properties = self._read_metadata_item_properties(item) 
-                primary_key = self._read_metadata_item_key(item)
+                primary_key = self._read_metadata_item_key(item,properties)
                 self[item_name] = MetadataObject1C(properties,primary_key)
 
             elif item_name.startswith(ENTITY_TYPES) and not item_name.endswith(METADATA_POSTFIXES):
@@ -136,6 +138,6 @@ class MetadataReader1C(UserDict):
             # читаем его описание полей и ключ
             # (также может быть табличная часть документа или справочника)
                 properties = self._read_metadata_item_properties(item)
-                primary_key = self._read_metadata_item_key(item)
+                primary_key = self._read_metadata_item_key(item,properties)
                 self[item_name] = MetadataObject1C(properties,primary_key)
 

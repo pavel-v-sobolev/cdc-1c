@@ -17,11 +17,12 @@ class ChangeReader1C(DataReader1C):
         super().__init__(base_url, metadata, name_mapper)
         self.exchange_name = exchange_name
         self.queue_guid = queue_guid
+        self.message_no = 0
 
     def read_changes(self):
-        message_no = self.get_last_received_no()+1
+        self.message_no = self.get_last_received_no()+1
 
-        url = f"{self.base_url}/SelectChanges?DataExchangePoint='{self.base_url}/ExchangePlan_{self.exchange_name}(guid'{self.queue_guid}')'&MessageNo={message_no}"
+        url = f"{self.base_url}/SelectChanges?DataExchangePoint='{self.base_url}/ExchangePlan_{self.exchange_name}(guid'{self.queue_guid}')'&MessageNo={self.message_no}"
 
         response = requests.post(url,auth=('admin', 'admin'))
 
@@ -30,6 +31,16 @@ class ChangeReader1C(DataReader1C):
 
         self.read_data_entries(change_entries)
 
+    def notify_changes_received(self):
+        """
+        Подтвердить получение изменений, отправив запрос на сервер
+        """
+        url = f"{self.base_url}/NotifyChangesReceived?DataExchangePoint='{self.base_url}/ExchangePlan_{self.exchange_name}(guid'{self.queue_guid}')'&MessageNo={self.message_no}"
+        response = requests.post(url,auth=('admin', 'admin'))
+        if response.status_code == 200:
+            logger.info(f"Changes confirmed for queue {self.queue_guid}")
+        else:
+            logger.error(f"Failed to confirm changes for queue {self.queue_guid}. Status code: {response.status_code}")
 
 
     def get_last_received_no(self)->int:

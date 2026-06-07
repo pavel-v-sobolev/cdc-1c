@@ -133,6 +133,11 @@ class DataReader1C(UserDict):
                 return float(value)
             if type_name == 'DateTime':
                 return datetime.fromisoformat(value)
+            if type_name == 'Guid':
+                if value == '00000000-0000-0000-0000-000000000000':
+                    return None
+                else:
+                    return value
         except (ValueError, TypeError) as e:
             logger.warning(f'Failed to convert value {value!r} to type {type_name}: {e}')
         return value
@@ -193,6 +198,8 @@ class DataReader1C(UserDict):
             # Если записей нет, то значит запись удалена, создаем пустую запись.
             if recorder and recorder_type:
                 recorder_name, _ = self._parse_object_full_name(recorder_type)
+                self.metadata[object_name].primary_key
+                # тут надо дополнить другими полями ключа
                 new_records = [{'Recorder': recorder, 'Recorder_Type': recorder_name}]
             else:
                 logger.error(f'No recorder or recorder type for {object_name}')

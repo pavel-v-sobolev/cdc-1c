@@ -32,4 +32,6 @@ changes.read_changes()
 changes['Document_ЗаказКлиента']
 changes['AccumulationRegister_ЗаказыКлиентов']
 
+changes.notify_changes_received()
+
 pass
