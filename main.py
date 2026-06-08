@@ -21,9 +21,7 @@ metadata = MetadataReader1C(base_url)
 
 # order_data = DataReader(base_url, metadata)
 # order_data.read_object('Document_ЗаказКлиента')
-mapper = NameMapper1C(manual_mapping={
-    'Комментарий': 'Comment'
-})
+mapper = NameMapper1C()
 changes = ChangeReader1C(base_url, exchange_name, queue_guid, metadata, mapper)
 changes.read_changes()
 

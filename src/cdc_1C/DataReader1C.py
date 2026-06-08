@@ -3,6 +3,7 @@ import logging
 from typing import Any
 from collections import UserDict, UserList
 from datetime import datetime
+import uuid
 
 import xmltodict
 
@@ -16,6 +17,12 @@ REGISTER_TYPES = ('InformationRegister','AccumulationRegister')
 ENTITY_TYPES = ('Catalog','Document')
 METADATA_POSTFIXES = ('_RecordType','_RowType','_Balance','_Turnover','_BalanceAndTurnover')
 ODATA_PREFIX = 'StandardODATA.'
+
+# Поле 1С с пометкой удаления у документов и справочников.
+DELETION_MARK_FIELD = 'DeletionMark'
+# Спец-поле, заполняемое при загрузке: True для удаленных объектов (DeletionMark)
+# и для фиктивных записей (удаленный набор регистра, опустевшая табличная часть).
+IS_DELETED_OR_EMPTY_FIELD = 'is_deleted_or_empty'
 
 
 class DataObject1C(UserDict):
@@ -42,6 +49,17 @@ class DataObject1C(UserDict):
                     self.data[k].append(None)
 
             self.data_length += 1
+
+    def to_records_mapped(self, column_mapping: dict[str, str] | None = None) -> list[dict]:
+        """
+        Преобразует колоночное хранилище (dict of lists) в список записей (list of dict)
+        для передачи в dbmerge. Если задан column_mapping, имена колонок заменяются на лету,
+        без отдельной переименованной копии данных (значения колонок переиспользуются по ссылке).
+        """
+        keys = list(self.data.keys())
+        out_keys = [column_mapping.get(k, k) for k in keys] if column_mapping else keys
+        cols = list(self.data.values())
+        return [dict(zip(out_keys, row)) for row in zip(*cols)]
             
 
 
@@ -137,7 +155,7 @@ class DataReader1C(UserDict):
                 if value == '00000000-0000-0000-0000-000000000000':
                     return None
                 else:
-                    return value
+                    return uuid.UUID(value)
         except (ValueError, TypeError) as e:
             logger.warning(f'Failed to convert value {value!r} to type {type_name}: {e}')
         return value
@@ -178,8 +196,54 @@ class DataReader1C(UserDict):
 
                 fields[field_name] = converted
 
-        
+        # Спец-поле: для документов/справочников True по пометке удаления,
+        # для регистров/табличных частей (нет DeletionMark) — False.
+        fields[IS_DELETED_OR_EMPTY_FIELD] = bool(fields.get(DELETION_MARK_FIELD))
+
         return fields
+
+    @staticmethod
+    def _default_key_value(type_name: str) -> Any:
+        # Дефолтное значение поля ключа для удаленной записи регистра:
+        # '' для строк, 0 для чисел, чтобы получить непустой составной ключ.
+        if type_name == 'String':
+            return ''
+        if type_name in ('Int64', 'Int16', 'Double'):
+            return 0
+        if type_name == 'Boolean':
+            return False
+        if type_name == 'DateTime':
+            return datetime(1, 1, 1)  # пустая дата 1С
+        return None  # Guid (Recorder перекрывается ниже) и прочее
+
+    def _make_deleted_register_record(self, object_name: str, recorder: str, recorder_type: str) -> dict:
+        """
+        Создает запись для удаленного набора записей регистра (пришел пустой RecordSet).
+        Заполняет полный первичный ключ из метаданных дефолтами по типу поля
+        и проставляет реальные Recorder и Recorder_Type.
+        """
+        primary_key = self.metadata[object_name].primary_key
+        record = {field: self._default_key_value(type_name)
+                  for field, type_name in primary_key.items()}
+
+        recorder_name, _ = self._parse_object_full_name(recorder_type)
+        record['Recorder'] = recorder
+        record['Recorder_Type'] = recorder_name
+        record[IS_DELETED_OR_EMPTY_FIELD] = True
+        return record
+
+    def _make_empty_table_part_record(self, table_part_name: str, ref_key: Any) -> dict:
+        """
+        Создает запись для опустевшей табличной части (пришла без строк), по аналогии с удаленным
+        набором регистра. Полный ключ из метаданных заполняется дефолтами, а Ref_Key —
+        реальным значением владельца, чтобы scoped-удаление по Ref_Key убрало старые строки.
+        """
+        primary_key = self.metadata[table_part_name].primary_key
+        record = {field: self._default_key_value(type_name)
+                  for field, type_name in primary_key.items()}
+        record['Ref_Key'] = ref_key
+        record[IS_DELETED_OR_EMPTY_FIELD] = True
+        return record
 
     def _get_register_records(self, object_name: str, properties: dict):
         """
@@ -195,12 +259,9 @@ class DataReader1C(UserDict):
         new_records = [self._get_record_fields(record, object_name) for record in records]
 
         if not new_records:
-            # Если записей нет, то значит запись удалена, создаем пустую запись.
+            # Если записей нет, то значит набор записей удален.
             if recorder and recorder_type:
-                recorder_name, _ = self._parse_object_full_name(recorder_type)
-                self.metadata[object_name].primary_key
-                # тут надо дополнить другими полями ключа
-                new_records = [{'Recorder': recorder, 'Recorder_Type': recorder_name}]
+                new_records = [self._make_deleted_register_record(object_name, recorder, recorder_type)]
             else:
                 logger.error(f'No recorder or recorder type for {object_name}')
 
@@ -233,3 +294,10 @@ class DataReader1C(UserDict):
                 if table_part_rows:
                     for table_part_row in table_part_rows:
                         self._add_records(table_part_name, [self._get_record_fields(table_part_row, table_part_name)])
+                else:
+                    # Табличная часть пришла без строк — добавляем фиктивную запись,
+                    # чтобы scoped-удаление по Ref_Key убрало ранее сохраненные строки.
+                    ref_key = fields.get('Ref_Key')
+                    if ref_key is not None and table_part_name in self.metadata.keys():
+                        self._add_records(table_part_name,
+                                          [self._make_empty_table_part_record(table_part_name, ref_key)])

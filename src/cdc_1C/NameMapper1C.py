@@ -1,3 +1,5 @@
+import hashlib
+
 _TRANSLIT_TABLE = str.maketrans({
     'а': 'a',  'б': 'b',  'в': 'v',  'г': 'g',  'д': 'd',
     'е': 'e',  'ё': 'yo', 'ж': 'zh', 'з': 'z',  'и': 'i',
@@ -20,36 +22,69 @@ def _translit(s: str) -> str:
     return s.translate(_TRANSLIT_TABLE)
 
 
+# Лимит длины идентификатора в PostgreSQL (63 байта). Транслитерация даёт ASCII,
+# поэтому длину можно считать в символах.
+POSTGRES_MAX_IDENTIFIER = 63
+HASH_LENGTH = 4
+
+# Служебные имена полей, которые добавляются при сохранении в БД.
+# Если такое имя приходит из 1С, его нужно изменить (добавить хэш), чтобы не было конфликта.
+RESERVED_FIELD_NAMES = ('merged_on', 'inserted_on', 'change_message_no')
+
+
 class NameMapper1C:
     """
-    Транслитерирует русские имена объектов и полей 1С в латиницу.
-    manual_mapping позволяет задать точные переводы, минуя транслитерацию.
-    Ключи могут быть как именами объектов ("Document_ЗаказКлиента"),
-    так и именами полей ("НомерСтроки").
+    Транслитерирует русские имена объектов и полей 1С в латиницу и приводит их
+    к ограничениям идентификаторов PostgreSQL (длина, служебные имена).
+    Применённые соответствия (оригинал -> результат) сохраняются для отладки.
     """
 
-    def __init__(self, manual_mapping: dict[str, str] | None = None):
-        self.manual_mapping: dict[str, str] = manual_mapping or {}
+    def __init__(self):
+        self.object_mappings: dict[str, str] = {}
+        self.field_mappings: dict[str, str] = {}
 
-    def map_name(self, name: str) -> str:
-        if name in self.manual_mapping:
-            return self.manual_mapping[name]
-        return _translit(name)
+    @staticmethod
+    def _short_hash(name: str) -> str:
+        return hashlib.md5(name.encode('utf-8')).hexdigest()[:HASH_LENGTH]
+
+    @classmethod
+    def _append_hash(cls, name: str) -> str:
+        # Обрезаем имя при необходимости и добавляем хэш: Имя_Хэш, итог не длиннее лимита.
+        suffix = '_' + cls._short_hash(name)
+        return name[:POSTGRES_MAX_IDENTIFIER - len(suffix)] + suffix
+
+    @classmethod
+    def _fit_length(cls, name: str) -> str:
+        if len(name) <= POSTGRES_MAX_IDENTIFIER:
+            return name
+        return cls._append_hash(name)
 
     def map_object_name(self, name: str) -> str:
         """
         Имя объекта вида "Document_ЗаказКлиента":
         тип (Document) оставляем без изменений, русскую часть транслитерируем.
         """
-        if name in self.manual_mapping:
-            return self.manual_mapping[name]
         if '_' in name:
             prefix, _, rest = name.partition('_')
-            return f'{prefix}_{_translit(rest)}'
-        return _translit(name)
+            mapped = f'{prefix}_{_translit(rest)}'
+        else:
+            mapped = _translit(name)
+
+        mapped = self._fit_length(mapped)
+        self.object_mappings[name] = mapped
+        return mapped
 
     def map_field_name(self, name: str) -> str:
-        return self.map_name(name)
+        mapped = _translit(name)
+
+        if mapped in RESERVED_FIELD_NAMES:
+            # совпало со служебным именем — добавляем хэш, чтобы развести
+            mapped = self._append_hash(mapped)
+        else:
+            mapped = self._fit_length(mapped)
+
+        self.field_mappings[name] = mapped
+        return mapped
 
     def get_column_mapping(self, columns: list[str]) -> dict[str, str]:
         return {col: self.map_field_name(col) for col in columns}

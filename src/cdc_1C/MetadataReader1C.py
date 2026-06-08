@@ -38,9 +38,13 @@ TYPE_PREFIX = 'Edm.'
 
 
 class MetadataObject1C(UserDict):
-    def __init__(self,properties,primary_key):
+    def __init__(self,properties,primary_key,delete_key=None):
         super().__init__(properties)
         self.primary_key = primary_key
+        # Ключ для scoped-удаления при merge (см. _get_delete_key):
+        # регистр -> Recorder(+Recorder_Type), табличная часть -> Ref_Key,
+        # документ/справочник -> None (одна запись, delete не нужен).
+        self.delete_key = delete_key
 
     def get_column_types(self) -> dict[str, Any]:
         return {col: type_mapping[typ] for col, typ in self.data.items()}
@@ -105,6 +109,20 @@ class MetadataReader1C(UserDict):
         return key
 
 
+    def _get_delete_key(self, item_name: str, properties: dict, primary_key: dict):
+        """
+        Ключ для scoped-удаления при merge (delete_condition в dbmerge).
+        Изменения приходят группами, которые целиком заменяют существующие строки:
+        - регистр: набор записей одного регистратора -> Recorder (+ Recorder_Type);
+        - табличная часть (ключ Ref_Key + ещё поля) -> Ref_Key владельца;
+        - документ/справочник (единственная запись по Ref_Key) -> None, удаление не нужно.
+        """
+        if item_name.startswith(REGISTER_TYPES):
+            return [c for c in ('Recorder', 'Recorder_Type') if c in properties]
+        if 'Ref_Key' in primary_key and len(primary_key) > 1:
+            return ['Ref_Key']
+        return None
+
     def get_metadata(self):
         """
         Запрашиваем метаданные всех доступных объектов из odata.
@@ -129,9 +147,10 @@ class MetadataReader1C(UserDict):
             if item_name.startswith(REGISTER_TYPES) and item_name.endswith("_RecordType"):
             # регистр с постфиксом RecordType содержит описание полей регистра и описание ключа
                 item_name = item_name.removesuffix("_RecordType")
-                properties = self._read_metadata_item_properties(item) 
+                properties = self._read_metadata_item_properties(item)
                 primary_key = self._read_metadata_item_key(item,properties)
-                self[item_name] = MetadataObject1C(properties,primary_key)
+                delete_key = self._get_delete_key(item_name, properties, primary_key)
+                self[item_name] = MetadataObject1C(properties,primary_key,delete_key)
 
             elif item_name.startswith(ENTITY_TYPES) and not item_name.endswith(METADATA_POSTFIXES):
             # если документ или справочник без постфикса, то
@@ -139,5 +158,6 @@ class MetadataReader1C(UserDict):
             # (также может быть табличная часть документа или справочника)
                 properties = self._read_metadata_item_properties(item)
                 primary_key = self._read_metadata_item_key(item,properties)
-                self[item_name] = MetadataObject1C(properties,primary_key)
+                delete_key = self._get_delete_key(item_name, properties, primary_key)
+                self[item_name] = MetadataObject1C(properties,primary_key,delete_key)
 
