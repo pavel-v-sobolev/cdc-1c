@@ -1,10 +1,10 @@
 import logging
 
-from sqlalchemy import Engine, tuple_
+from sqlalchemy import Engine, tuple_, select
 from dbmerge import dbmerge
 
-from cdc_1C.DataReader1C import DataReader1C, DataObject1C
-from cdc_1C.NameMapper1C import NameMapper1C
+from cdc_1c.DataReader1C import DataReader1C, DataObject1C
+from cdc_1c.NameMapper1C import NameMapper1C
 
 logging.basicConfig()
 logger = logging.getLogger()
@@ -19,16 +19,17 @@ class DBWriter1C:
     """
 
     def __init__(self, engine: Engine, name_mapper: NameMapper1C,
-                 delete_mode: str = 'no', schema: str | None = None):
+                 data_reader: DataReader1C, schema: str | None = None):
         self.engine = engine
         self.name_mapper = name_mapper
-        self.delete_mode = delete_mode
+        self.data_reader = data_reader
         self.schema = schema
 
     def save(self, object_name: str, data_object: DataObject1C) -> None:
         if data_object.data_length == 0:
             return
 
+        logger.info(f"Saving {data_object.data_length} records of {object_name}")
         metadata_obj = data_object.metadata_obj
         if metadata_obj is None or not metadata_obj.primary_key:
             logger.warning(f'No metadata/primary key for {object_name}, skipping save')
@@ -49,7 +50,7 @@ class DBWriter1C:
             # Документ/справочник: одна запись на Ref_Key, удалять чужие строки не нужно.
             with dbmerge(engine=self.engine, table_name=table_name, data=records,
                          key=key, data_types=data_types,
-                         delete_mode=self.delete_mode, schema=self.schema) as merge:
+                         delete_mode='no', schema=self.schema) as merge:
                 merge.exec()
         else:
             # Регистр/табличная часть: набор по delete_key целиком заменяет существующий.
@@ -58,31 +59,33 @@ class DBWriter1C:
             with dbmerge(engine=self.engine, table_name=table_name, data=records,
                          key=key, data_types=data_types,
                          delete_mode='delete', schema=self.schema) as merge:
-                condition = self._scoped_delete_condition(merge.table, mapped_delete_key, records)
+                condition = self._scoped_delete_condition(merge.table, merge.temp_table, mapped_delete_key)
                 merge.exec(delete_condition=condition)
 
     @staticmethod
-    def _scoped_delete_condition(table, mapped_delete_key: list[str], records: list[dict]):
+    def _scoped_delete_condition(table, temp_table, mapped_delete_key: list[str]):
         """
-        Ограничивает удаление строками тех групп (по delete_key), что присутствуют в наборе.
-        Какие именно строки удалить (отсутствующие в источнике), dbmerge определяет по PK.
+        Ограничивает удаление строками тех групп (по delete_key), что присутствуют в staging-таблице
+        (temp_table). Какие именно строки внутри групп удалить (отсутствующие в источнике),
+        dbmerge определяет по PK.
 
-        Один столбец (Ref_Key табличной части):  Ref_Key IN (...)
-        Несколько (Recorder + Recorder_Type):     (Recorder, Recorder_Type) IN ((..,..), ...)
+        Внешние колонки — целевой таблицы, значения групп берём подзапросом из temp_table:
+          один столбец:   target.Ref_Key IN (SELECT Ref_Key FROM temp)
+          несколько:      (target.Recorder, target.Recorder_Type) IN (SELECT Recorder, Recorder_Type FROM temp)
         """
         if len(mapped_delete_key) == 1:
             col = mapped_delete_key[0]
-            values = {record[col] for record in records}
-            return table.c[col].in_(values)
+            return table.c[col].in_(select(temp_table.c[col]))
 
-        values = {tuple(record[col] for col in mapped_delete_key) for record in records}
-        return tuple_(*[table.c[col] for col in mapped_delete_key]).in_(values)
+        target_cols = [table.c[col] for col in mapped_delete_key]
+        temp_cols = [temp_table.c[col] for col in mapped_delete_key]
+        return tuple_(*target_cols).in_(select(*temp_cols))
 
-    def save_all(self, data_reader: DataReader1C) -> None:
+    def save_all(self) -> None:
         """
-        Сохраняет все объекты по одному. Каждый объект мержится отдельным вызовом dbmerge
-        (своя транзакция). Исключение пробрасывается, чтобы не подтверждать получение изменений
-        при неполном сохранении.
+        Сохраняет все объекты data_reader по одному. Каждый объект мержится отдельным вызовом
+        dbmerge (своя транзакция). Исключение пробрасывается, чтобы не подтверждать получение
+        изменений при неполном сохранении.
         """
-        for object_name, data_object in data_reader.items():
+        for object_name, data_object in self.data_reader.items():
             self.save(object_name, data_object)

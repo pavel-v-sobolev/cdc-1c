@@ -1,7 +1,7 @@
 from importlib.metadata import version, PackageNotFoundError
 
 try:
-    __version__ = version("cdc_1C")
+    __version__ = version("cdc-1c")
 except PackageNotFoundError:
     __version__ = "dev"
 

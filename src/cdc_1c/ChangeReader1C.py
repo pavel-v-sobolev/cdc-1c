@@ -3,8 +3,8 @@ import logging
 
 import xmltodict
 
-from cdc_1C.DataReader1C import DataReader1C
-from cdc_1C.MetadataReader1C import MetadataReader1C
+from cdc_1c.DataReader1C import DataReader1C
+from cdc_1c.MetadataReader1C import MetadataReader1C
 
 logging.basicConfig()
 logger = logging.getLogger()
@@ -13,14 +13,15 @@ logger.setLevel(logging.INFO)
 
 class ChangeReader1C(DataReader1C):
     def __init__(self, base_url: str, exchange_name: str, queue_guid: str,
-                 metadata: MetadataReader1C, name_mapper=None):
-        super().__init__(base_url, metadata, name_mapper)
+                 metadata: MetadataReader1C):
+        super().__init__(base_url, metadata)
         self.exchange_name = exchange_name
         self.queue_guid = queue_guid
         self.message_no = 0
 
     def read_changes(self):
         self.message_no = self.get_last_received_no()+1
+        self.exchange_message_no = self.message_no
 
         url = f"{self.base_url}/SelectChanges?DataExchangePoint='{self.base_url}/ExchangePlan_{self.exchange_name}(guid'{self.queue_guid}')'&MessageNo={self.message_no}"
 

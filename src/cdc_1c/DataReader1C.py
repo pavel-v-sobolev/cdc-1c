@@ -7,7 +7,7 @@ import uuid
 
 import xmltodict
 
-from cdc_1C.MetadataReader1C import MetadataReader1C
+from cdc_1c.MetadataReader1C import MetadataReader1C
 
 logging.basicConfig()
 logger = logging.getLogger()
@@ -23,6 +23,8 @@ DELETION_MARK_FIELD = 'DeletionMark'
 # Спец-поле, заполняемое при загрузке: True для удаленных объектов (DeletionMark)
 # и для фиктивных записей (удаленный набор регистра, опустевшая табличная часть).
 IS_DELETED_OR_EMPTY_FIELD = 'is_deleted_or_empty'
+# Спец-поле: номер пакета обмена (message_no), проставляется во все записи при чтении изменений.
+EXCHANGE_MESSAGE_NO_FIELD = 'exchange_message_no'
 
 
 class DataObject1C(UserDict):
@@ -64,11 +66,11 @@ class DataObject1C(UserDict):
 
 
 class DataReader1C(UserDict):
-    def __init__(self, base_url: str, metadata: MetadataReader1C, name_mapper=None):
+    def __init__(self, base_url: str, metadata: MetadataReader1C):
         super().__init__()
         self.base_url = base_url
         self.metadata = metadata
-        self.name_mapper = name_mapper
+        self.exchange_message_no = None  # номер пакета обмена, проставляется в записи при чтении изменений
 
     def read_object(self, object_name: str):
         url = f"{self.base_url}/{object_name}"
@@ -199,6 +201,7 @@ class DataReader1C(UserDict):
         # Спец-поле: для документов/справочников True по пометке удаления,
         # для регистров/табличных частей (нет DeletionMark) — False.
         fields[IS_DELETED_OR_EMPTY_FIELD] = bool(fields.get(DELETION_MARK_FIELD))
+        fields[EXCHANGE_MESSAGE_NO_FIELD] = self.exchange_message_no
 
         return fields
 
@@ -230,6 +233,7 @@ class DataReader1C(UserDict):
         record['Recorder'] = recorder
         record['Recorder_Type'] = recorder_name
         record[IS_DELETED_OR_EMPTY_FIELD] = True
+        record[EXCHANGE_MESSAGE_NO_FIELD] = self.exchange_message_no
         return record
 
     def _make_empty_table_part_record(self, table_part_name: str, ref_key: Any) -> dict:
@@ -243,6 +247,7 @@ class DataReader1C(UserDict):
                   for field, type_name in primary_key.items()}
         record['Ref_Key'] = ref_key
         record[IS_DELETED_OR_EMPTY_FIELD] = True
+        record[EXCHANGE_MESSAGE_NO_FIELD] = self.exchange_message_no
         return record
 
     def _get_register_records(self, object_name: str, properties: dict):
@@ -284,6 +289,11 @@ class DataReader1C(UserDict):
         fields = self._get_record_fields(properties, object_name)
         self._add_records(object_name, [fields])
 
+        # Строки табличных частей приходят без ссылки на владельца — проставляем Ref_Key документа.
+        ref_key = fields.get('Ref_Key')
+        # Пометку удаления документа/справочника распространяем на его табличные части.
+        parent_deleted = fields.get(IS_DELETED_OR_EMPTY_FIELD)
+
         table_parts = self._get_record_table_parts(properties)
 
         for table_part_key, table_part in table_parts.items():
@@ -293,7 +303,10 @@ class DataReader1C(UserDict):
                 table_part_rows = table_part.get('d:element') or []
                 if table_part_rows:
                     for table_part_row in table_part_rows:
-                        self._add_records(table_part_name, [self._get_record_fields(table_part_row, table_part_name)])
+                        row = self._get_record_fields(table_part_row, table_part_name)
+                        row['Ref_Key'] = ref_key
+                        row[IS_DELETED_OR_EMPTY_FIELD] = parent_deleted
+                        self._add_records(table_part_name, [row])
                 else:
                     # Табличная часть пришла без строк — добавляем фиктивную запись,
                     # чтобы scoped-удаление по Ref_Key убрало ранее сохраненные строки.

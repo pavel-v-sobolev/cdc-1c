@@ -27,9 +27,10 @@ def _translit(s: str) -> str:
 POSTGRES_MAX_IDENTIFIER = 63
 HASH_LENGTH = 4
 
-# Служебные имена полей, которые добавляются при сохранении в БД.
-# Если такое имя приходит из 1С, его нужно изменить (добавить хэш), чтобы не было конфликта.
-RESERVED_FIELD_NAMES = ('merged_on', 'inserted_on', 'change_message_no')
+# Служебные имена полей (добавляются при загрузке/сохранении).
+# Наше собственное служебное поле сохраняет имя как есть; поле 1С, которое
+# транслитерируется в служебное имя, переименовывается (добавляется хэш), чтобы не было конфликта.
+RESERVED_FIELD_NAMES = ('merged_on', 'inserted_on', 'exchange_message_no')
 
 
 class NameMapper1C:
@@ -75,13 +76,16 @@ class NameMapper1C:
         return mapped
 
     def map_field_name(self, name: str) -> str:
-        mapped = _translit(name)
-
-        if mapped in RESERVED_FIELD_NAMES:
-            # совпало со служебным именем — добавляем хэш, чтобы развести
-            mapped = self._append_hash(mapped)
+        if name in RESERVED_FIELD_NAMES:
+            # наше служебное поле (добавлено при загрузке) — сохраняем имя как есть
+            mapped = name
         else:
-            mapped = self._fit_length(mapped)
+            mapped = _translit(name)
+            if mapped in RESERVED_FIELD_NAMES:
+                # имя поля 1С совпало со служебным — добавляем хэш, чтобы развести
+                mapped = self._append_hash(mapped)
+            else:
+                mapped = self._fit_length(mapped)
 
         self.field_mappings[name] = mapped
         return mapped
