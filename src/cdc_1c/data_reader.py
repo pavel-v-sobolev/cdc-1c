@@ -7,11 +7,9 @@ import uuid
 
 import xmltodict
 
-from cdc_1c.MetadataReader1C import MetadataReader1C
+from cdc_1c.metadata_reader import MetadataReader1C
 
-logging.basicConfig()
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
 REGISTER_TYPES = ('InformationRegister','AccumulationRegister')
 ENTITY_TYPES = ('Catalog','Document')
@@ -66,15 +64,17 @@ class DataObject1C(UserDict):
 
 
 class DataReader1C(UserDict):
-    def __init__(self, base_url: str, metadata: MetadataReader1C):
+    def __init__(self, base_url: str, metadata: MetadataReader1C,
+                 auth: tuple[str, str] | None = None):
         super().__init__()
         self.base_url = base_url
         self.metadata = metadata
+        self.auth = auth
         self.exchange_message_no = None  # номер пакета обмена, проставляется в записи при чтении изменений
 
     def read_object(self, object_name: str):
         url = f"{self.base_url}/{object_name}"
-        response = requests.get(url, auth=('admin', 'admin'))
+        response = requests.get(url, auth=self.auth)
 
         object_data = xmltodict.parse(response.text, force_list=('d:element', 'entry'))
         object_entries = (object_data.get('feed') or {}).get('entry') or []

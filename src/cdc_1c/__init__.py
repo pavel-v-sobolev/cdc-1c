@@ -5,11 +5,13 @@ try:
 except PackageNotFoundError:
     __version__ = "dev"
 
-from .MetadataReader1C import MetadataReader1C
-from .DataReader1C import DataReader1C, DataObject1C
-from .ChangeReader1C import ChangeReader1C
-from .NameMapper1C import NameMapper1C
-from .DBWriter1C import DBWriter1C
+from .metadata_reader import MetadataReader1C
+from .data_reader import DataReader1C, DataObject1C
+from .change_reader import ChangeReader1C
+from .name_mapper import NameMapper1C
+from .db_writer import DBWriter1C
+from .config import Config
+from .replicator import Replicator1C
 
-__all__ = ["MetadataReader1C", "DataReader1C", "DataObject1C", "ChangeReader1C", "NameMapper1C", "DBWriter1C", "__version__"]
+__all__ = ["MetadataReader1C", "DataReader1C", "DataObject1C", "ChangeReader1C", "NameMapper1C", "DBWriter1C", "Config", "Replicator1C", "__version__"]
 

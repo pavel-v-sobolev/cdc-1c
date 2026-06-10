@@ -13,8 +13,13 @@
 
 ## Решения
 - Имя: дистрибутив **cdc-1c**, import-пакет **cdc_1c** (нижний регистр); классы PascalCase.
-- Конфиг: оркестратор принимает `Config` в конструкторе (ядро не зависит от env); отдельный
-  entrypoint контейнера читает ENV (`Config.from_env()`) и запускает оркестратор.
+- Оркестратор: класс **`Replicator1C`** (суффикс `1C` — как у остальных публичных классов).
+- Конструктор: **отдельные именованные аргументы** (не объект `Config`) — прямой библиотечный
+  вызов без обёртки, единый стиль с прочими классами. БД передаётся готовым **`engine`** (DI по-
+  sqlalchemy'ному, тестируемость, переиспользование), а не строкой; тот же engine идёт в `DBWriter1C`.
+- `Config` (dataclass) — env-сторона: хранит `db_url`; classmethod **`Replicator1C.from_config(cfg)`**
+  строит engine из `db_url` (граница «строка → engine» в одном месте) и маппит поля. `poll_interval`/
+  `log_level` остаются в `Config` для `run_forever`/логирования. Entrypoint: `Config.from_env()`.
 - Режимы оркестратора: `run_once()` и `run_forever(interval)`.
 - Python: **>=3.10**. Лицензия: **MIT** (предварительно).
 
@@ -50,21 +55,30 @@
 ## Осталось
 
 ### Фаза A. Hardening ядра
-- **A2. Конфигурируемый auth** — `MetadataReader1C`/`DataReader1C.__init__` принимают
+- **A2. Конфигурируемый auth** — ✅ (частично) `MetadataReader1C`/`DataReader1C.__init__` принимают
   `auth: tuple[str,str] | None`, хранят `self.auth`; все `requests.*` используют `auth=self.auth`;
-  `ChangeReader1C` пробрасывает `auth`. Убрать захардкоженные `('admin','admin')` (ридеры — 4 места).
-  Заодно общий `requests.Session`, `timeout`, опц. `verify`.
-- **A3. Сброс состояния** — `ChangeReader1C.read_changes()` в начале делает `self.clear()` (иначе при
-  `run_forever` данные накапливаются между циклами).
-- **A4. `Config` (dataclass)** — `src/cdc_1c/config.py`: `odata_url`, `odata_user`, `odata_password`,
-  `exchange_name`, `queue_guid`, `db_url`, `db_schema`, `poll_interval`, `log_level`,
-  (опц.) `request_timeout`, `verify_ssl`. `from_env()` читает `CDC1C_*` (только для entrypoint).
-- **A5. Оркестратор `Replicator`** — `src/cdc_1c/replicator.py`: собирает metadata/changes/writer из
-  `Config`; `run_once()` (read → save → **notify только после успешного save**); `run_forever(interval)`
-  с обработкой исключений (упал цикл → лог, без notify, повтор) и graceful SIGTERM/SIGINT.
-- **A6. Логирование** — в модулях `logger = logging.getLogger(__name__)`, убрать `basicConfig()`/root;
-  конфигурировать только в entrypoint (уровень из `Config.log_level`).
-- (Опц.) файлы модулей в snake_case (`metadata_reader.py`, …), классы/реэкспорт не менять.
+  `ChangeReader1C` пробрасывает `auth`. Захардкоженные `('admin','admin')` убраны (4 места).
+  Осталось: общий `requests.Session`, `timeout`, опц. `verify`.
+- **A3. Сброс состояния** — ✅ `ChangeReader1C.read_changes()` в начале делает `self.clear()`.
+- **A4. `Config` (dataclass)** — ✅ (частично) `src/cdc_1c/config.py`: `odata_url`, `odata_user`,
+  `odata_password`, `exchange_name`, `queue_guid`, `db_url`, `db_schema`, `poll_interval`, `log_level`;
+  `from_env()` читает `CDC1C_*`. Осталось: опц. `request_timeout`, `verify_ssl` (вместе с остатком A2).
+- **A5. Оркестратор `Replicator1C`** — ✅ `src/cdc_1c/replicator.py`: собирает
+  metadata/changes/mapper/writer из отдельных аргументов (engine + auth из user/password); classmethod
+  `from_config(Config)` строит engine из `db_url`; `run_once()` (read → save → **notify только после
+  успешного save**); `run_forever(interval)` с обработкой исключений (упал цикл → лог, без notify,
+  повтор) и graceful SIGTERM/SIGINT (`_StopSignal`). Экспортирован из `cdc_1c`.
+- **A6. Логирование** — ✅ во всех модулях `logger = logging.getLogger(__name__)`, `basicConfig()`/root
+  убраны (ридеры/writer/replicator/config). Авто-вывод из коробки — `src/cdc_1c/logging_config.py`
+  `_ensure_handler()` (вешает StreamHandler на логгер `cdc_1c` с INFO, только если `hasHandlers()` ==
+  False), вызывается из `Replicator1C.__init__`. Если приложение настроило логирование — молчим.
+  Уровень из `Config.log_level` — настраивать в entrypoint (B2). Проверено: на чистом root INFO виден
+  из коробки, при настроенном приложением логировании — молчим. Зависимость **dbmerge** переведена на
+  тот же паттерн (`getLogger('dbmerge')` + `hasHandlers()`, без `basicConfig`) — root больше не
+  загрязняется, обе библиотеки сосуществуют чисто.
+- ✅ Файлы модулей в snake_case (`metadata_reader.py`, `data_reader.py`, `change_reader.py`,
+  `name_mapper.py`, `db_writer.py`); классы и реэкспорт из `__init__` не изменены, публичный API
+  (`from cdc_1c import …`) прежний.
 
 ### Фаза B. Упаковка для PyPI
 - **B1. `pyproject.toml`** — описание, `license = "MIT"`, авторы, `requires-python = ">=3.10"`,

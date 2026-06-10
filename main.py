@@ -18,12 +18,13 @@ queue_guid = 'a9bc23c5-3689-11f1-926c-0800270bc6cb'
 base_url = "http://192.168.56.101/trade_demo/odata/standard.odata"
 
 
-metadata = MetadataReader1C(base_url)
+auth=('admin', 'admin')
+metadata = MetadataReader1C(base_url, auth=auth)
 
 # order_data = DataReader(base_url, metadata)
 # order_data.read_object('Document_ЗаказКлиента')
 mapper = NameMapper1C()
-changes = ChangeReader1C(base_url, exchange_name, queue_guid, metadata)
+changes = ChangeReader1C(base_url, exchange_name, queue_guid, metadata, auth=auth)
 
 writer = DBWriter1C(engine=engine, name_mapper=mapper, data_reader=changes, schema='cdc_1c_trade_demo')
 

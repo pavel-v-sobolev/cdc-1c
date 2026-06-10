@@ -6,9 +6,7 @@ from collections import UserDict
 import xmltodict
 from sqlalchemy import String, Uuid, BigInteger, SmallInteger, Numeric, Boolean, DateTime
 
-logging.basicConfig()
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 type_mapping = {'Guid':Uuid(),
@@ -50,9 +48,10 @@ class MetadataObject1C(UserDict):
         return {col: type_mapping[typ] for col, typ in self.data.items()}
 
 class MetadataReader1C(UserDict):
-    def __init__(self, base_url:str):
+    def __init__(self, base_url:str, auth: tuple[str, str] | None = None):
         super().__init__()
         self.base_url=base_url
+        self.auth=auth
         self.get_metadata()
 
     def _read_metadata_item_properties(self, item:dict):
@@ -132,7 +131,7 @@ class MetadataReader1C(UserDict):
         logger.info('Requesting metadata from 1C ODATA')
         
         url = f'{self.base_url}/$metadata'
-        response = requests.get(url,auth=('admin', 'admin'))
+        response = requests.get(url,auth=self.auth)
 
         metadata = xmltodict.parse(response.text,force_list=('Property','PropertyRef'))
         metadata_schema = ((metadata.get('edmx:Edmx') or {}).get('edmx:DataServices') or {}).get('Schema') or {}

@@ -3,12 +3,10 @@ import logging
 from sqlalchemy import Engine, tuple_, select
 from dbmerge import dbmerge
 
-from cdc_1c.DataReader1C import DataReader1C, DataObject1C
-from cdc_1c.NameMapper1C import NameMapper1C
+from cdc_1c.data_reader import DataReader1C, DataObject1C
+from cdc_1c.name_mapper import NameMapper1C
 
-logging.basicConfig()
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class DBWriter1C:
