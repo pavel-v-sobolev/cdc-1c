@@ -65,16 +65,19 @@ class DataObject1C(UserDict):
 
 class DataReader1C(UserDict):
     def __init__(self, base_url: str, metadata: MetadataReader1C,
-                 auth: tuple[str, str] | None = None):
+                 auth: tuple[str, str] | None = None,
+                 request_timeout: float | None = None):
         super().__init__()
         self.base_url = base_url
         self.metadata = metadata
         self.auth = auth
+        self.request_timeout = request_timeout
         self.exchange_message_no = None  # номер пакета обмена, проставляется в записи при чтении изменений
 
     def read_object(self, object_name: str):
         url = f"{self.base_url}/{object_name}"
-        response = requests.get(url, auth=self.auth)
+        response = requests.get(url, auth=self.auth, timeout=self.request_timeout)
+        response.raise_for_status()
 
         object_data = xmltodict.parse(response.text, force_list=('d:element', 'entry'))
         object_entries = (object_data.get('feed') or {}).get('entry') or []

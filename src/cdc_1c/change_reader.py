@@ -11,8 +11,9 @@ logger = logging.getLogger(__name__)
 
 class ChangeReader1C(DataReader1C):
     def __init__(self, base_url: str, exchange_name: str, queue_guid: str,
-                 metadata: MetadataReader1C, auth: tuple[str, str] | None = None):
-        super().__init__(base_url, metadata, auth)
+                 metadata: MetadataReader1C, auth: tuple[str, str] | None = None,
+                 request_timeout: float | None = None):
+        super().__init__(base_url, metadata, auth, request_timeout)
         self.exchange_name = exchange_name
         self.queue_guid = queue_guid
         self.message_no = 0
@@ -23,9 +24,12 @@ class ChangeReader1C(DataReader1C):
         self.message_no = self.get_last_received_no()+1
         self.exchange_message_no = self.message_no
 
+        logger.info(f"Reading changes from 1C (message {self.message_no})")
+
         url = f"{self.base_url}/SelectChanges?DataExchangePoint='{self.base_url}/ExchangePlan_{self.exchange_name}(guid'{self.queue_guid}')'&MessageNo={self.message_no}"
 
-        response = requests.post(url,auth=self.auth)
+        response = requests.post(url,auth=self.auth,timeout=self.request_timeout)
+        response.raise_for_status()
 
         change_data = xmltodict.parse(response.text,force_list=('d:element','entry'))
         change_entries = (change_data.get('feed') or {}).get('entry') or []
@@ -37,11 +41,11 @@ class ChangeReader1C(DataReader1C):
         Подтвердить получение изменений, отправив запрос на сервер
         """
         url = f"{self.base_url}/NotifyChangesReceived?DataExchangePoint='{self.base_url}/ExchangePlan_{self.exchange_name}(guid'{self.queue_guid}')'&MessageNo={self.message_no}"
-        response = requests.post(url,auth=self.auth)
-        if response.status_code == 200:
-            logger.info(f"Changes confirmed for queue {self.queue_guid}")
-        else:
-            logger.error(f"Failed to confirm changes for queue {self.queue_guid}. Status code: {response.status_code}")
+        response = requests.post(url,auth=self.auth,timeout=self.request_timeout)
+        # Не-2xx -> HTTPError. Подтверждение не прошло — изменения не списаны и придут снова
+        # (в run_forever цикл повторится, save идемпотентен).
+        response.raise_for_status()
+        logger.info(f"Changes confirmed for queue {self.queue_guid} (message {self.message_no})")
 
 
     def get_last_received_no(self)->int:
@@ -49,7 +53,8 @@ class ChangeReader1C(DataReader1C):
         Получить номер последнего пакета обмена, который был получен и подтвержден
         """
         url = f"{self.base_url}/ExchangePlan_{self.exchange_name}?$format=json"
-        response = requests.get(url,auth=self.auth)
+        response = requests.get(url,auth=self.auth,timeout=self.request_timeout)
+        response.raise_for_status()
         queues_data = response.json()
 
         queues = queues_data.get('value') or []

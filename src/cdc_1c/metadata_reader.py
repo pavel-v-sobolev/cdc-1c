@@ -48,11 +48,16 @@ class MetadataObject1C(UserDict):
         return {col: type_mapping[typ] for col, typ in self.data.items()}
 
 class MetadataReader1C(UserDict):
-    def __init__(self, base_url:str, auth: tuple[str, str] | None = None):
+    def __init__(self, base_url:str, auth: tuple[str, str] | None = None,
+                 request_timeout: float | None = None):
         super().__init__()
         self.base_url=base_url
         self.auth=auth
-        self.get_metadata()
+        self.request_timeout=request_timeout
+        # В конструкторе метаданные НЕ загружаются (без сетевого запроса), чтобы недоступность 1С
+        # на старте не роняла процесс. Загрузка — get_metadata(), которая выставляет is_loaded=True.
+        self.is_loaded = False
+
 
     def _read_metadata_item_properties(self, item:dict):
         """
@@ -127,11 +132,14 @@ class MetadataReader1C(UserDict):
         Запрашиваем метаданные всех доступных объектов из odata.
         Далее в цикле читаем из содержимое и сохраняем в структуре, которую будем использовать дальше,
         при создании таблиц и полей.
+        Можно вызывать повторно для обновления (при появлении нового объекта/поля — см. data_reader).
+        В конце выставляет is_loaded=True.
         """
         logger.info('Requesting metadata from 1C ODATA')
         
         url = f'{self.base_url}/$metadata'
-        response = requests.get(url,auth=self.auth)
+        response = requests.get(url,auth=self.auth,timeout=self.request_timeout)
+        response.raise_for_status()
 
         metadata = xmltodict.parse(response.text,force_list=('Property','PropertyRef'))
         metadata_schema = ((metadata.get('edmx:Edmx') or {}).get('edmx:DataServices') or {}).get('Schema') or {}
@@ -160,3 +168,4 @@ class MetadataReader1C(UserDict):
                 delete_key = self._get_delete_key(item_name, properties, primary_key)
                 self[item_name] = MetadataObject1C(properties,primary_key,delete_key)
 
+        self.is_loaded = True

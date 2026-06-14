@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<edmx:Edmx>
+  <edmx:DataServices>
+    <Schema>
+      <EntityType Name="Catalog_Тест">
+        <Key>
+          <PropertyRef Name="Ref_Key"/>
+        </Key>
+        <Property Name="Ref_Key" Type="Edm.Guid"/>
+        <Property Name="Description" Type="Edm.String"/>
+        <Property Name="DeletionMark" Type="Edm.Boolean"/>
+      </EntityType>
+      <EntityType Name="Document_Прочее">
+        <Key>
+          <PropertyRef Name="Ref_Key"/>
+        </Key>
+        <Property Name="Ref_Key" Type="Edm.Guid"/>
+      </EntityType>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

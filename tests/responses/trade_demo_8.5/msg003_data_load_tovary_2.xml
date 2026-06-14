@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed>
+  <entry>
+    <category term="StandardODATA.Catalog_Тест"/>
+    <content>
+      <m:properties>
+        <d:Ref_Key>22222222-2222-2222-2222-222222222222</d:Ref_Key>
+        <d:Description>Товар 2</d:Description>
+        <d:DeletionMark>false</d:DeletionMark>
+      </m:properties>
+    </content>
+  </entry>
+</feed>
