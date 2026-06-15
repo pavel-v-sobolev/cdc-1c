@@ -32,17 +32,77 @@ METADATA_POSTFIXES = ('_RecordType','_RowType','_Balance','_Turnover','_BalanceA
 ODATA_PREFIX = 'StandardODATA.'
 TYPE_PREFIX = 'Edm.'
 
+# Системные поля движений регистра (не измерения/ресурсы/реквизиты).
+SYSTEM_REGISTER_FIELDS = frozenset(
+    ('Recorder', 'Period', 'LineNumber', 'Active', 'RecordType', 'Recorder_Type'))
+# Поля period-спайна в виртуальной таблице _Turnover (агрегаты по периодам, не измерения).
+TURNOVER_PERIOD_FIELDS = frozenset(
+    ('Period', 'SecondPeriod', 'MinutePeriod', 'HourPeriod', 'DayPeriod', 'WeekPeriod',
+     'TenDaysPeriod', 'MonthPeriod', 'QuarterPeriod', 'HalfYearPeriod', 'YearPeriod'))
+TURNOVER_RESOURCE_SUFFIXES = ('Turnover', 'Receipt', 'Expense')
+
+
+def _classify_register_fields(base_name: str, properties: dict, complextypes: dict[str, list[str]]):
+    """
+    Делит поля движений регистра на измерения / ресурсы / реквизиты, сравнивая с виртуальными
+    таблицами _Balance / _Turnover (ComplexType из $metadata). Виртуальные таблицы 1С считает
+    функциями на лету — здесь они нужны ТОЛЬКО как описание типов для классификации.
+
+    Возвращает (dimensions, resources, attributes, kind). Если функции для регистра не опубликованы
+    (нет _Balance/_Turnover) — ([], [], [], None).
+    """
+    prop_names = set(properties)
+    balance = complextypes.get(base_name + '_Balance')
+    turnover = complextypes.get(base_name + '_Turnover')
+
+    dimensions: list[str] = []
+    resources: list[str] = []
+
+    if balance is not None:
+        kind = 'balance'
+        for f in balance:
+            if f.endswith('Balance'):
+                resources.append(f[:-len('Balance')])
+            elif not f.endswith('_Type'):
+                dimensions.append(f)
+    elif turnover is not None:
+        kind = 'turnover'
+        for f in turnover:
+            suffix = next((s for s in TURNOVER_RESOURCE_SUFFIXES if f.endswith(s)), None)
+            if suffix is not None:
+                resources.append(f[:-len(suffix)])
+            elif f in TURNOVER_PERIOD_FIELDS or f in SYSTEM_REGISTER_FIELDS or f.endswith('_Type'):
+                continue
+            else:
+                dimensions.append(f)
+    else:
+        return [], [], [], None
+
+    # Оставляем только реально присутствующие в движениях поля, без дублей (порядок сохраняем).
+    dimensions = [d for d in dict.fromkeys(dimensions) if d in prop_names]
+    resources = [r for r in dict.fromkeys(resources) if r in prop_names]
+    used = set(dimensions) | set(resources) | SYSTEM_REGISTER_FIELDS
+    attributes = [f for f in properties if f not in used and not f.endswith('_Type')]
+    return dimensions, resources, attributes, kind
+
 
 
 
 class MetadataObject1C(UserDict):
-    def __init__(self,properties,primary_key,delete_key=None):
+    def __init__(self, properties, primary_key, delete_key=None,
+                 dimensions=None, resources=None, attributes=None, kind=None):
         super().__init__(properties)
         self.primary_key = primary_key
         # Ключ для scoped-удаления при merge (см. _get_delete_key):
         # регистр -> Recorder(+Recorder_Type), табличная часть -> Ref_Key,
         # документ/справочник -> None (одна запись, delete не нужен).
         self.delete_key = delete_key
+        # Классификация полей регистра (см. _classify_register_fields); для не-регистров пусто.
+        # Имена — оригинальные (1С), маппятся NameMapper-ом при использовании, как delete_key.
+        self.dimensions = dimensions or []   # измерения
+        self.resources = resources or []     # ресурсы
+        self.attributes = attributes or []   # реквизиты
+        self.kind = kind                     # 'balance' | 'turnover' | None
 
     def get_column_types(self) -> dict[str, Any]:
         return {col: type_mapping[typ] for col, typ in self.data.items()}
@@ -141,11 +201,14 @@ class MetadataReader1C(UserDict):
         response = requests.get(url,auth=self.auth,timeout=self.request_timeout)
         response.raise_for_status()
 
-        metadata = xmltodict.parse(response.text,force_list=('Property','PropertyRef'))
+        metadata = xmltodict.parse(response.text,force_list=('Property','PropertyRef','ComplexType'))
         metadata_schema = ((metadata.get('edmx:Edmx') or {}).get('edmx:DataServices') or {}).get('Schema') or {}
         metadata_entity_types = metadata_schema.get('EntityType') or []
-        #metadata_complex_types = metadata_schema.get('ComplexType') or []
-        
+        # Виртуальные таблицы регистров (_Balance/_Turnover) приходят как ComplexType — нужны для
+        # классификации полей регистра на измерения/ресурсы/реквизиты (см. _classify_register_fields).
+        complextypes = {ct.get('@Name'): [p.get('@Name') for p in (ct.get('Property') or [])]
+                        for ct in (metadata_schema.get('ComplexType') or [])}
+
 
         for item in metadata_entity_types:
 
@@ -157,7 +220,10 @@ class MetadataReader1C(UserDict):
                 properties = self._read_metadata_item_properties(item)
                 primary_key = self._read_metadata_item_key(item,properties)
                 delete_key = self._get_delete_key(item_name, properties, primary_key)
-                self[item_name] = MetadataObject1C(properties,primary_key,delete_key)
+                dimensions, resources, attributes, kind = _classify_register_fields(
+                    item_name, properties, complextypes)
+                self[item_name] = MetadataObject1C(properties, primary_key, delete_key,
+                                                   dimensions, resources, attributes, kind)
 
             elif item_name.startswith(ENTITY_TYPES) and not item_name.endswith(METADATA_POSTFIXES):
             # если документ или справочник без постфикса, то

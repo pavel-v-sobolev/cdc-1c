@@ -1,12 +1,17 @@
 import logging
 
-from sqlalchemy import Engine, tuple_, select
+from sqlalchemy import Engine, Index, MetaData, Table, tuple_, select
 from dbmerge import dbmerge
 
 from cdc_1c.data_reader import DataReader1C, DataObject1C
 from cdc_1c.name_mapper import NameMapper1C
+from cdc_1c.db_logs import Replicator1CLog
 
 logger = logging.getLogger(__name__)
+
+# Служебные поля, которыми управляет dbmerge (момент merge/первой вставки строки).
+MERGED_ON_FIELD = 'merged_on'
+INSERTED_ON_FIELD = 'inserted_on'
 
 
 class DBWriter1C:
@@ -14,6 +19,9 @@ class DBWriter1C:
     Сохраняет объекты 1С (DataObject1C) в БД через dbmerge.
     Имена таблиц и колонок переводятся NameMapper1C, типы и первичный ключ берутся из метаданных.
     Обрабатывает объекты по одному (см. save_all).
+
+    Заполняет служебные merged_on/inserted_on, создаёт индекс по merged_on (для инкрементальной
+    материализации) и пишет лог загрузки replicator_1c_log (строка на объект).
     """
 
     def __init__(self, engine: Engine, name_mapper: NameMapper1C,
@@ -22,6 +30,7 @@ class DBWriter1C:
         self.name_mapper = name_mapper
         self.data_reader = data_reader
         self.schema = schema
+        self.replicator_log = Replicator1CLog(engine, schema)
 
     def save(self, object_name: str, data_object: DataObject1C) -> None:
         if data_object.data_length == 0:
@@ -44,10 +53,17 @@ class DBWriter1C:
 
         delete_key = metadata_obj.delete_key
 
+        # Лог загрузки: строка на объект (только в контексте обмена — у ChangeReader1C есть
+        # exchange_name/message_no; при прямом read_object их нет → лог пропускаем).
+        exchange = getattr(self.data_reader, 'exchange_name', None)
+        message_no = getattr(self.data_reader, 'message_no', None)
+        log_id = self.replicator_log.start(exchange, object_name, message_no) if exchange is not None else None
+
         if not delete_key:
             # Документ/справочник: одна запись на Ref_Key, удалять чужие строки не нужно.
             with dbmerge(engine=self.engine, table_name=table_name, data=records,
                          key=key, data_types=data_types,
+                         merged_on_field=MERGED_ON_FIELD, inserted_on_field=INSERTED_ON_FIELD,
                          delete_mode='no', schema=self.schema) as merge:
                 merge.exec()
         else:
@@ -56,9 +72,26 @@ class DBWriter1C:
             mapped_delete_key = [self.name_mapper.map_field_name(k) for k in delete_key]
             with dbmerge(engine=self.engine, table_name=table_name, data=records,
                          key=key, data_types=data_types,
+                         merged_on_field=MERGED_ON_FIELD, inserted_on_field=INSERTED_ON_FIELD,
                          delete_mode='delete', schema=self.schema) as merge:
                 condition = self._scoped_delete_condition(merge.table, merge.temp_table, mapped_delete_key)
                 merge.exec(delete_condition=condition)
+
+        self._ensure_merged_on_index(table_name)
+        if log_id is not None:
+            self.replicator_log.finish(log_id)
+
+    def _ensure_merged_on_index(self, table_name: str) -> None:
+        """
+        Индекс по merged_on (для быстрых сканов материализатора `merged_on > watermark`).
+        Только средствами SQLAlchemy, идемпотентно (checkfirst). Таблицу уже создал dbmerge.
+        """
+        eff_schema = None if self.engine.dialect.name == 'sqlite' else self.schema
+        tbl = Table(table_name, MetaData(), schema=eff_schema, autoload_with=self.engine)
+        if MERGED_ON_FIELD not in tbl.c:
+            return
+        ix_name = NameMapper1C._fit_length(f'ix_{table_name}_merged_on')
+        Index(ix_name, tbl.c[MERGED_ON_FIELD]).create(self.engine, checkfirst=True)
 
     @staticmethod
     def _scoped_delete_condition(table, temp_table, mapped_delete_key: list[str]):

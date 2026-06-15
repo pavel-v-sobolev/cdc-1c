@@ -1,0 +1,322 @@
+<feed xmlns="http://www.w3.org/2005/Atom"
+		xmlns:at="http://purl.org/atompub/tombstones/1.0"
+		xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"
+		xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
+		xml:base="http://192.168.56.101/trade_demo/odata/standard.odata/">
+	<entry>
+		<id>http://192.168.56.101/trade_demo/odata/standard.odata/Catalog_Контрагенты(guid'ff564c10-a268-11e5-92f1-0050568b35ac')</id>
+		<category term="StandardODATA.Catalog_Контрагенты"
+				scheme="http://schemas.microsoft.com/ado/2007/08/dataservices/scheme"/>
+		<title type="text"/>
+		<updated>2026-06-15T09:47:42</updated>
+		<author/>
+		<summary/>
+		<link rel="http://schemas.microsoft.com/ado/2007/08/dataservices/related/ГоловнойКонтрагент"
+				href="Catalog_Контрагенты(guid'ff564c10-a268-11e5-92f1-0050568b35ac')/ГоловнойКонтрагент"
+				type="application/atom+xml;type=entry;charset=utf-8"
+				title="ГоловнойКонтрагент"/>
+		<link rel="edit"
+				href="Catalog_Контрагенты(guid'ff564c10-a268-11e5-92f1-0050568b35ac')"
+				title="edit-link"/>
+		<content type="application/xml"><m:properties xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+	<d:DeletionMark>false</d:DeletionMark>
+	<d:КПП>482201001</d:КПП>
+	<d:DataVersion>AAAAAAAAAAI=</d:DataVersion>
+	<d:ГоловнойКонтрагент_Key>ff564c10-a268-11e5-92f1-0050568b35ac</d:ГоловнойКонтрагент_Key>
+	<d:НаименованиеПолное>АВИКА</d:НаименованиеПолное>
+	<d:ДополнительныеРеквизиты m:type="Collection(StandardODATA.Catalog_Контрагенты_ДополнительныеРеквизиты_RowType)"/>
+	<d:PredefinedDataName/>
+	<d:ИНН>4825005381</d:ИНН>
+	<d:ЮридическоеФизическоеЛицо>ЮридическоеЛицо</d:ЮридическоеФизическоеЛицо>
+	<d:Description>АВИКА1</d:Description>
+	<d:Predefined>false</d:Predefined>
+	<d:ДополнительнаяИнформация>Исполнитель четвертого уровня кооперации по государственному контракту ДУК-15
+г. Липецк</d:ДополнительнаяИнформация>
+	<d:Партнер_Key>d8b56d04-a268-11e5-92f1-0050568b35ac</d:Партнер_Key>
+	<d:Ref_Key>ff564c10-a268-11e5-92f1-0050568b35ac</d:Ref_Key>
+	<d:СтранаРегистрации_Key>26093578-c180-11e4-a7a9-000d884fd00d</d:СтранаРегистрации_Key>
+	<d:ЮрФизЛицо>ЮрЛицо</d:ЮрФизЛицо>
+	<d:ОбособленноеПодразделение>false</d:ОбособленноеПодразделение>
+	<d:ИсторияНаименований m:type="Collection(StandardODATA.Catalog_Контрагенты_ИсторияНаименований_RowType)"/>
+	<d:ИсторияКПП m:type="Collection(StandardODATA.Catalog_Контрагенты_ИсторияКПП_RowType)"/>
+	<d:КонтактнаяИнформация m:type="Collection(StandardODATA.Catalog_Контрагенты_КонтактнаяИнформация_RowType)"/>
+	<d:НДСПоСтавкам4и2>false</d:НДСПоСтавкам4и2>
+	<d:НалоговыйНомер/>
+	<d:РегистрационныйНомер/>
+	<d:КодПоОКПО/>
+	<d:НаименованиеМеждународное/>
+</m:properties>
+		</content>
+	</entry>
+	<entry>
+		<id>http://192.168.56.101/trade_demo/odata/standard.odata/Catalog_Контрагенты(guid'624595b8-2d34-11e1-afd3-0015e9b8c48d')</id>
+		<category term="StandardODATA.Catalog_Контрагенты"
+				scheme="http://schemas.microsoft.com/ado/2007/08/dataservices/scheme"/>
+		<title type="text"/>
+		<updated>2026-06-15T09:47:42</updated>
+		<author/>
+		<summary/>
+		<link rel="http://schemas.microsoft.com/ado/2007/08/dataservices/related/ГоловнойКонтрагент"
+				href="Catalog_Контрагенты(guid'624595b8-2d34-11e1-afd3-0015e9b8c48d')/ГоловнойКонтрагент"
+				type="application/atom+xml;type=entry;charset=utf-8"
+				title="ГоловнойКонтрагент"/>
+		<link rel="edit"
+				href="Catalog_Контрагенты(guid'624595b8-2d34-11e1-afd3-0015e9b8c48d')"
+				title="edit-link"/>
+		<content type="application/xml"><m:properties xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+	<d:DeletionMark>true</d:DeletionMark>
+	<d:КПП>770500001</d:КПП>
+	<d:DataVersion>AAAAAAAAAAI=</d:DataVersion>
+	<d:ГоловнойКонтрагент_Key>624595b8-2d34-11e1-afd3-0015e9b8c48d</d:ГоловнойКонтрагент_Key>
+	<d:НаименованиеПолное>ООО "Альтаир"</d:НаименованиеПолное>
+	<d:ДополнительныеРеквизиты m:type="Collection(StandardODATA.Catalog_Контрагенты_ДополнительныеРеквизиты_RowType)"/>
+	<d:PredefinedDataName/>
+	<d:ИНН>7705260674</d:ИНН>
+	<d:ЮридическоеФизическоеЛицо>ЮридическоеЛицо</d:ЮридическоеФизическоеЛицо>
+	<d:Description>Альтаир</d:Description>
+	<d:Predefined>false</d:Predefined>
+	<d:ДополнительнаяИнформация/>
+	<d:Партнер_Key>624595b7-2d34-11e1-afd3-0015e9b8c48d</d:Партнер_Key>
+	<d:Ref_Key>624595b8-2d34-11e1-afd3-0015e9b8c48d</d:Ref_Key>
+	<d:СтранаРегистрации_Key>26093578-c180-11e4-a7a9-000d884fd00d</d:СтранаРегистрации_Key>
+	<d:ЮрФизЛицо>ЮрЛицо</d:ЮрФизЛицо>
+	<d:ОбособленноеПодразделение>false</d:ОбособленноеПодразделение>
+	<d:ИсторияНаименований m:type="Collection(StandardODATA.Catalog_Контрагенты_ИсторияНаименований_RowType)"/>
+	<d:ИсторияКПП m:type="Collection(StandardODATA.Catalog_Контрагенты_ИсторияКПП_RowType)"/>
+	<d:КонтактнаяИнформация m:type="Collection(StandardODATA.Catalog_Контрагенты_КонтактнаяИнформация_RowType)">
+		<d:element m:type="StandardODATA.Catalog_Контрагенты_КонтактнаяИнформация_RowType">
+			<d:LineNumber>1</d:LineNumber>
+			<d:Тип>Адрес</d:Тип>
+			<d:Вид_Key>1d78f391-c180-11e4-a7a9-000d884fd00d</d:Вид_Key>
+			<d:Представление>Москва г, 40 лет Октября пр-кт, дом № 89</d:Представление>
+			<d:ЗначенияПолей>&lt;КонтактнаяИнформация xmlns="http://www.v8.1c.ru/ssl/contactinfo" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" Представление="Москва г, 40 лет Октября пр-кт, дом № 89"&gt;&lt;Комментарий/&gt;&lt;Состав xsi:type="Адрес" Страна="РОССИЯ"&gt;&lt;Состав xsi:type="АдресРФ"&gt;&lt;СубъектРФ&gt;Москва г&lt;/СубъектРФ&gt;&lt;СвРайМО&gt;&lt;Район/&gt;&lt;/СвРайМО&gt;&lt;Город/&gt;&lt;НаселПункт/&gt;&lt;Улица&gt;40 лет Октября пр-кт&lt;/Улица&gt;&lt;ДопАдрЭл&gt;&lt;Номер Тип="1010" Значение="89"/&gt;&lt;/ДопАдрЭл&gt;&lt;ДопАдрЭл ТипАдрЭл="10100000" Значение=""/&gt;&lt;/Состав&gt;&lt;/Состав&gt;&lt;/КонтактнаяИнформация&gt;</d:ЗначенияПолей>
+			<d:Страна>РОССИЯ</d:Страна>
+			<d:Регион>Москва г</d:Регион>
+			<d:Город/>
+			<d:АдресЭП/>
+			<d:ДоменноеИмяСервера/>
+			<d:НомерТелефона/>
+			<d:НомерТелефонаБезКодов/>
+			<d:ВидДляСписка_Key>1d78f391-c180-11e4-a7a9-000d884fd00d</d:ВидДляСписка_Key>
+			<d:ДействуетС>0001-01-01T00:00:00</d:ДействуетС>
+			<d:Значение/>
+		</d:element>
+		<d:element m:type="StandardODATA.Catalog_Контрагенты_КонтактнаяИнформация_RowType">
+			<d:LineNumber>2</d:LineNumber>
+			<d:Тип>Адрес</d:Тип>
+			<d:Вид_Key>1d78f393-c180-11e4-a7a9-000d884fd00d</d:Вид_Key>
+			<d:Представление>Москва г, 40 лет Октября пр-кт, дом № 89</d:Представление>
+			<d:ЗначенияПолей>&lt;КонтактнаяИнформация xmlns="http://www.v8.1c.ru/ssl/contactinfo" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" Представление="Москва г, 40 лет Октября пр-кт, дом № 89"&gt;&lt;Комментарий/&gt;&lt;Состав xsi:type="Адрес" Страна="РОССИЯ"&gt;&lt;Состав xsi:type="АдресРФ"&gt;&lt;СубъектРФ&gt;Москва г&lt;/СубъектРФ&gt;&lt;СвРайМО&gt;&lt;Район/&gt;&lt;/СвРайМО&gt;&lt;Город/&gt;&lt;НаселПункт/&gt;&lt;Улица&gt;40 лет Октября пр-кт&lt;/Улица&gt;&lt;ДопАдрЭл&gt;&lt;Номер Тип="1010" Значение="89"/&gt;&lt;/ДопАдрЭл&gt;&lt;ДопАдрЭл ТипАдрЭл="10100000" Значение=""/&gt;&lt;/Состав&gt;&lt;/Состав&gt;&lt;/КонтактнаяИнформация&gt;</d:ЗначенияПолей>
+			<d:Страна>РОССИЯ</d:Страна>
+			<d:Регион>Москва г</d:Регион>
+			<d:Город/>
+			<d:АдресЭП/>
+			<d:ДоменноеИмяСервера/>
+			<d:НомерТелефона/>
+			<d:НомерТелефонаБезКодов/>
+			<d:ВидДляСписка_Key>1d78f393-c180-11e4-a7a9-000d884fd00d</d:ВидДляСписка_Key>
+			<d:ДействуетС>0001-01-01T00:00:00</d:ДействуетС>
+			<d:Значение/>
+		</d:element>
+		<d:element m:type="StandardODATA.Catalog_Контрагенты_КонтактнаяИнформация_RowType">
+			<d:LineNumber>3</d:LineNumber>
+			<d:Тип>Адрес</d:Тип>
+			<d:Вид_Key>1d78f38e-c180-11e4-a7a9-000d884fd00d</d:Вид_Key>
+			<d:Представление>Москва г, 40 лет Октября пр-кт, дом № 89</d:Представление>
+			<d:ЗначенияПолей>&lt;КонтактнаяИнформация xmlns="http://www.v8.1c.ru/ssl/contactinfo" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" Представление="Москва г, 40 лет Октября пр-кт, дом № 89"&gt;&lt;Комментарий/&gt;&lt;Состав xsi:type="Адрес" Страна="РОССИЯ"&gt;&lt;Состав xsi:type="АдресРФ"&gt;&lt;СубъектРФ&gt;Москва г&lt;/СубъектРФ&gt;&lt;СвРайМО&gt;&lt;Район/&gt;&lt;/СвРайМО&gt;&lt;Город/&gt;&lt;НаселПункт/&gt;&lt;Улица&gt;40 лет Октября пр-кт&lt;/Улица&gt;&lt;ДопАдрЭл&gt;&lt;Номер Тип="1010" Значение="89"/&gt;&lt;/ДопАдрЭл&gt;&lt;ДопАдрЭл ТипАдрЭл="10100000" Значение=""/&gt;&lt;/Состав&gt;&lt;/Состав&gt;&lt;/КонтактнаяИнформация&gt;</d:ЗначенияПолей>
+			<d:Страна>РОССИЯ</d:Страна>
+			<d:Регион>Москва г</d:Регион>
+			<d:Город/>
+			<d:АдресЭП/>
+			<d:ДоменноеИмяСервера/>
+			<d:НомерТелефона/>
+			<d:НомерТелефонаБезКодов/>
+			<d:ВидДляСписка_Key>1d78f38e-c180-11e4-a7a9-000d884fd00d</d:ВидДляСписка_Key>
+			<d:ДействуетС>0001-01-01T00:00:00</d:ДействуетС>
+			<d:Значение/>
+		</d:element>
+	</d:КонтактнаяИнформация>
+	<d:НДСПоСтавкам4и2>false</d:НДСПоСтавкам4и2>
+	<d:НалоговыйНомер/>
+	<d:РегистрационныйНомер/>
+	<d:КодПоОКПО/>
+	<d:НаименованиеМеждународное/>
+</m:properties>
+		</content>
+	</entry>
+	<entry>
+		<id>http://192.168.56.101/trade_demo/odata/standard.odata/Catalog_Контрагенты(guid'0e617604-55bd-11d9-848a-00112f43529a')</id>
+		<category term="StandardODATA.Catalog_Контрагенты"
+				scheme="http://schemas.microsoft.com/ado/2007/08/dataservices/scheme"/>
+		<title type="text"/>
+		<updated>2026-06-15T09:47:42</updated>
+		<author/>
+		<summary/>
+		<link rel="http://schemas.microsoft.com/ado/2007/08/dataservices/related/ГоловнойКонтрагент"
+				href="Catalog_Контрагенты(guid'0e617604-55bd-11d9-848a-00112f43529a')/ГоловнойКонтрагент"
+				type="application/atom+xml;type=entry;charset=utf-8"
+				title="ГоловнойКонтрагент"/>
+		<link rel="edit"
+				href="Catalog_Контрагенты(guid'0e617604-55bd-11d9-848a-00112f43529a')"
+				title="edit-link"/>
+		<content type="application/xml"><m:properties xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+	<d:DeletionMark>false</d:DeletionMark>
+	<d:КПП>781001001</d:КПП>
+	<d:DataVersion>AAAAAAAAAAI=</d:DataVersion>
+	<d:ГоловнойКонтрагент_Key>0e617604-55bd-11d9-848a-00112f43529a</d:ГоловнойКонтрагент_Key>
+	<d:НаименованиеПолное>ООО "Все для дома"</d:НаименованиеПолное>
+	<d:ДополнительныеРеквизиты m:type="Collection(StandardODATA.Catalog_Контрагенты_ДополнительныеРеквизиты_RowType)"/>
+	<d:PredefinedDataName/>
+	<d:ИНН>7810300284</d:ИНН>
+	<d:ЮридическоеФизическоеЛицо>ЮридическоеЛицо</d:ЮридическоеФизическоеЛицо>
+	<d:Description>Все для дома</d:Description>
+	<d:Predefined>false</d:Predefined>
+	<d:ДополнительнаяИнформация/>
+	<d:Партнер_Key>0e617604-55bd-11d9-848a-00112f43529a</d:Партнер_Key>
+	<d:Ref_Key>0e617604-55bd-11d9-848a-00112f43529a</d:Ref_Key>
+	<d:СтранаРегистрации_Key>26093578-c180-11e4-a7a9-000d884fd00d</d:СтранаРегистрации_Key>
+	<d:ЮрФизЛицо>ЮрЛицо</d:ЮрФизЛицо>
+	<d:ОбособленноеПодразделение>false</d:ОбособленноеПодразделение>
+	<d:ИсторияНаименований m:type="Collection(StandardODATA.Catalog_Контрагенты_ИсторияНаименований_RowType)"/>
+	<d:ИсторияКПП m:type="Collection(StandardODATA.Catalog_Контрагенты_ИсторияКПП_RowType)"/>
+	<d:КонтактнаяИнформация m:type="Collection(StandardODATA.Catalog_Контрагенты_КонтактнаяИнформация_RowType)">
+		<d:element m:type="StandardODATA.Catalog_Контрагенты_КонтактнаяИнформация_RowType">
+			<d:LineNumber>1</d:LineNumber>
+			<d:Тип>Адрес</d:Тип>
+			<d:Вид_Key>1d78f393-c180-11e4-a7a9-000d884fd00d</d:Вид_Key>
+			<d:Представление>196135, Санкт-Петербург г, Типанова ул, дом № 18, корпус А, квартира 7Н</d:Представление>
+			<d:ЗначенияПолей>&lt;КонтактнаяИнформация xmlns="http://www.v8.1c.ru/ssl/contactinfo" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" Представление="196135, Санкт-Петербург г, Типанова ул, дом № 18, корпус А, квартира 7Н"&gt;&lt;Состав xsi:type="Адрес" Страна="РОССИЯ"&gt;&lt;Состав xsi:type="АдресРФ"&gt;&lt;СубъектРФ&gt;Санкт-Петербург г&lt;/СубъектРФ&gt;&lt;Улица&gt;Типанова ул&lt;/Улица&gt;&lt;ДопАдрЭл ТипАдрЭл="10100000" Значение="196135"/&gt;&lt;ДопАдрЭл&gt;&lt;Номер Тип="1010" Значение="18"/&gt;&lt;/ДопАдрЭл&gt;&lt;ДопАдрЭл&gt;&lt;Номер Тип="1050" Значение="А"/&gt;&lt;/ДопАдрЭл&gt;&lt;ДопАдрЭл&gt;&lt;Номер Тип="2010" Значение="7Н"/&gt;&lt;/ДопАдрЭл&gt;&lt;/Состав&gt;&lt;/Состав&gt;&lt;/КонтактнаяИнформация&gt;</d:ЗначенияПолей>
+			<d:Страна>РОССИЯ</d:Страна>
+			<d:Регион>Санкт-Петербург г</d:Регион>
+			<d:Город/>
+			<d:АдресЭП/>
+			<d:ДоменноеИмяСервера/>
+			<d:НомерТелефона/>
+			<d:НомерТелефонаБезКодов/>
+			<d:ВидДляСписка_Key>1d78f393-c180-11e4-a7a9-000d884fd00d</d:ВидДляСписка_Key>
+			<d:ДействуетС>0001-01-01T00:00:00</d:ДействуетС>
+			<d:Значение>{
+"value": "196135, Санкт-Петербург г, Типанова ул, дом № 18, корпус А, квартира 7Н",
+"type": "Адрес",
+"country": "РОССИЯ",
+"addressType": "Административно-территориальный",
+"countryCode": "643",
+"ZIPcode": "196135",
+"area": "Санкт-Петербург",
+"areaType": "г",
+"street": "Типанова",
+"streetType": "ул",
+"houseType": "Дом",
+"houseNumber": "18",
+"buildings": [
+{
+"type": "Корпус",
+"number": "А"
+}
+],
+"apartments": [
+{
+"type": "Квартира",
+"number": "7Н"
+}
+]
+}</d:Значение>
+		</d:element>
+	</d:КонтактнаяИнформация>
+	<d:НДСПоСтавкам4и2>false</d:НДСПоСтавкам4и2>
+	<d:НалоговыйНомер/>
+	<d:РегистрационныйНомер/>
+	<d:КодПоОКПО>4446789000</d:КодПоОКПО>
+	<d:НаименованиеМеждународное>1</d:НаименованиеМеждународное>
+</m:properties>
+		</content>
+	</entry>
+	<entry>
+		<id>http://192.168.56.101/trade_demo/odata/standard.odata/Catalog_Контрагенты(guid'cc1e1ad8-e504-11e0-af8f-0015e9b8c48d')</id>
+		<category term="StandardODATA.Catalog_Контрагенты"
+				scheme="http://schemas.microsoft.com/ado/2007/08/dataservices/scheme"/>
+		<title type="text"/>
+		<updated>2026-06-15T09:47:42</updated>
+		<author/>
+		<summary/>
+		<link rel="http://schemas.microsoft.com/ado/2007/08/dataservices/related/ГоловнойКонтрагент"
+				href="Catalog_Контрагенты(guid'cc1e1ad8-e504-11e0-af8f-0015e9b8c48d')/ГоловнойКонтрагент"
+				type="application/atom+xml;type=entry;charset=utf-8"
+				title="ГоловнойКонтрагент"/>
+		<link rel="edit"
+				href="Catalog_Контрагенты(guid'cc1e1ad8-e504-11e0-af8f-0015e9b8c48d')"
+				title="edit-link"/>
+		<content type="application/xml"><m:properties xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+	<d:DeletionMark>false</d:DeletionMark>
+	<d:КПП/>
+	<d:DataVersion>AAAAAAAAAAI=</d:DataVersion>
+	<d:ГоловнойКонтрагент_Key>cc1e1ad8-e504-11e0-af8f-0015e9b8c48d</d:ГоловнойКонтрагент_Key>
+	<d:НаименованиеПолное>ЗАО "Заря"</d:НаименованиеПолное>
+	<d:ДополнительныеРеквизиты m:type="Collection(StandardODATA.Catalog_Контрагенты_ДополнительныеРеквизиты_RowType)"/>
+	<d:PredefinedDataName/>
+	<d:ИНН/>
+	<d:ЮридическоеФизическоеЛицо>ЮридическоеЛицо</d:ЮридическоеФизическоеЛицо>
+	<d:Description>Гостиница "Заря"</d:Description>
+	<d:Predefined>false</d:Predefined>
+	<d:ДополнительнаяИнформация/>
+	<d:Партнер_Key>00263a6c-596c-11d9-a2c3-00055d80a2d1</d:Партнер_Key>
+	<d:Ref_Key>cc1e1ad8-e504-11e0-af8f-0015e9b8c48d</d:Ref_Key>
+	<d:СтранаРегистрации_Key>26093578-c180-11e4-a7a9-000d884fd00d</d:СтранаРегистрации_Key>
+	<d:ЮрФизЛицо>ЮрЛицо</d:ЮрФизЛицо>
+	<d:ОбособленноеПодразделение>false</d:ОбособленноеПодразделение>
+	<d:ИсторияНаименований m:type="Collection(StandardODATA.Catalog_Контрагенты_ИсторияНаименований_RowType)"/>
+	<d:ИсторияКПП m:type="Collection(StandardODATA.Catalog_Контрагенты_ИсторияКПП_RowType)"/>
+	<d:КонтактнаяИнформация m:type="Collection(StandardODATA.Catalog_Контрагенты_КонтактнаяИнформация_RowType)"/>
+	<d:НДСПоСтавкам4и2>false</d:НДСПоСтавкам4и2>
+	<d:НалоговыйНомер/>
+	<d:РегистрационныйНомер/>
+	<d:КодПоОКПО/>
+	<d:НаименованиеМеждународное>1</d:НаименованиеМеждународное>
+</m:properties>
+		</content>
+	</entry>
+	<entry>
+		<id>http://192.168.56.101/trade_demo/odata/standard.odata/Catalog_Контрагенты(guid'cbcf495f-55bc-11d9-848a-00112f43529a')</id>
+		<category term="StandardODATA.Catalog_Контрагенты"
+				scheme="http://schemas.microsoft.com/ado/2007/08/dataservices/scheme"/>
+		<title type="text"/>
+		<updated>2026-06-15T09:47:42</updated>
+		<author/>
+		<summary/>
+		<link rel="http://schemas.microsoft.com/ado/2007/08/dataservices/related/ГоловнойКонтрагент"
+				href="Catalog_Контрагенты(guid'cbcf495f-55bc-11d9-848a-00112f43529a')/ГоловнойКонтрагент"
+				type="application/atom+xml;type=entry;charset=utf-8"
+				title="ГоловнойКонтрагент"/>
+		<link rel="edit"
+				href="Catalog_Контрагенты(guid'cbcf495f-55bc-11d9-848a-00112f43529a')"
+				title="edit-link"/>
+		<content type="application/xml"><m:properties xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+	<d:DeletionMark>false</d:DeletionMark>
+	<d:КПП>5678999</d:КПП>
+	<d:DataVersion>AAAAAAAAAAI=</d:DataVersion>
+	<d:ГоловнойКонтрагент_Key>cbcf495f-55bc-11d9-848a-00112f43529a</d:ГоловнойКонтрагент_Key>
+	<d:НаименованиеПолное>ООО "ИнноТрейд"</d:НаименованиеПолное>
+	<d:ДополнительныеРеквизиты m:type="Collection(StandardODATA.Catalog_Контрагенты_ДополнительныеРеквизиты_RowType)"/>
+	<d:PredefinedDataName/>
+	<d:ИНН>0012123456</d:ИНН>
+	<d:ЮридическоеФизическоеЛицо>ЮридическоеЛицо</d:ЮридическоеФизическоеЛицо>
+	<d:Description>ИнноТрейд</d:Description>
+	<d:Predefined>false</d:Predefined>
+	<d:ДополнительнаяИнформация/>
+	<d:Партнер_Key>cbcf495f-55bc-11d9-848a-00112f43529a</d:Партнер_Key>
+	<d:Ref_Key>cbcf495f-55bc-11d9-848a-00112f43529a</d:Ref_Key>
+	<d:СтранаРегистрации_Key>26093578-c180-11e4-a7a9-000d884fd00d</d:СтранаРегистрации_Key>
+	<d:ЮрФизЛицо>ЮрЛицо</d:ЮрФизЛицо>
+	<d:ОбособленноеПодразделение>false</d:ОбособленноеПодразделение>
+	<d:ИсторияНаименований m:type="Collection(StandardODATA.Catalog_Контрагенты_ИсторияНаименований_RowType)"/>
+	<d:ИсторияКПП m:type="Collection(StandardODATA.Catalog_Контрагенты_ИсторияКПП_RowType)"/>
+	<d:КонтактнаяИнформация m:type="Collection(StandardODATA.Catalog_Контрагенты_КонтактнаяИнформация_RowType)"/>
+	<d:НДСПоСтавкам4и2>false</d:НДСПоСтавкам4и2>
+	<d:НалоговыйНомер/>
+	<d:РегистрационныйНомер/>
+	<d:КодПоОКПО>6666667777</d:КодПоОКПО>
+	<d:НаименованиеМеждународное/>
+</m:properties>
+		</content>
+	</entry>
+</feed>

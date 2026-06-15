@@ -1,9 +1,12 @@
 {
-  "description": "Trade demo, 1C 8.5 (синтетические фикстуры — заменить записанными recorder-ом)",
+  "description": "Trade demo, 1C 8.5",
   "queue_guid": "a9bc23c5-3689-11f1-926c-0800270bc6cb",
   "metadata": "msg001_metadata.xml",
   "batches": [
-    "msg002_data_load_tovary.xml",
-    "msg003_data_load_tovary_2.xml"
+    "msg002_nomenklatura.xml",
+    "msg003_zakaz_klienta.xml",
+    "msg004_kontragenti.xml",
+    "msg005_zakaz_klienta_2.xml",
+    "msg006_realizatsiya.xml"
   ]
 }
