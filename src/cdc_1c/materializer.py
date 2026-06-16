@@ -14,7 +14,7 @@ DataMaterializer1C — инкрементальная материализаци
   5) при успехе пишем boundary как новый watermark в materializer_1c_log.
 
 Материализатор не зависит от 1С — работает только БД→БД. Имена таблиц/колонок в правилах — уже
-в виде, как они лежат в БД (после NameMapper). key_columns триггера = его delete_key
+в виде, как они лежат в БД (после NameMapper). key_columns триггера = его object_key
 (регистр → Recorder[+Recorder_Type], ТЧ/документ → Ref_Key), позиционно отображается на merge_key.
 """
 
@@ -36,7 +36,7 @@ MERGED_ON_FIELD = 'merged_on'
 class TriggerTable:
     """Таблица-триггер: где ловим изменения (по merged_on) и какие колонки дают ключ."""
     table: str                 # имя таблицы в БД (уже транслитерированное)
-    key_columns: list[str]     # = delete_key таблицы; позиционно соответствует merge_key правила
+    key_columns: list[str]     # = object_key таблицы; позиционно соответствует merge_key правила
 
 
 @dataclass

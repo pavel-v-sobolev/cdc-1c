@@ -33,7 +33,7 @@ writer = DBWriter1C(engine=engine, name_mapper=mapper, data_reader=changes, sche
 changes.read_changes()
 
 writer.save_all()
-
+changes['Document_ЗаказКлиента'].to_nested_records()
 #changes.notify_changes_received()
 
 pass

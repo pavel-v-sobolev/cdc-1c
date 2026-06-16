@@ -1,15 +1,27 @@
+from __future__ import annotations
+
 import requests
 import logging
 from typing import Any
 from collections import UserDict, UserList
-from datetime import datetime
+from datetime import datetime, date
 import uuid
 
 import xmltodict
 
 from cdc_1c.metadata_reader import MetadataReader1C
+from cdc_1c.name_mapper import NameMapper1C
 
 logger = logging.getLogger(__name__)
+
+
+def _json_safe(value: Any) -> Any:
+    """Приводит значение к JSON-сериализуемому виду: UUID -> str, datetime/date -> ISO."""
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
 
 REGISTER_TYPES = ('InformationRegister','AccumulationRegister')
 ENTITY_TYPES = ('Catalog','Document')
@@ -29,6 +41,9 @@ class DataObject1C(UserDict):
     def __init__(self, metadata_obj=None, records: list = []):
         super().__init__()
         self.metadata_obj = metadata_obj  # MetadataObject1C
+        # Табличные части этого объекта: {имя_части: DataObject1C}. Заполняются при чтении
+        # (_get_entity_records связывает владельца с его ТЧ), используются to_nested_records.
+        self.table_parts: dict[str, DataObject1C] = {}
         self.data_length = 0
         self.add_records(records)
 
@@ -50,16 +65,67 @@ class DataObject1C(UserDict):
 
             self.data_length += 1
 
-    def to_records_mapped(self, column_mapping: dict[str, str] | None = None) -> list[dict]:
+    def to_records_mapped(self, column_mapping: dict[str, str] | None = None,
+                          json_safe: bool = False) -> list[dict]:
         """
         Преобразует колоночное хранилище (dict of lists) в список записей (list of dict)
         для передачи в dbmerge. Если задан column_mapping, имена колонок заменяются на лету,
         без отдельной переименованной копии данных (значения колонок переиспользуются по ссылке).
+
+        json_safe=True приводит значения к JSON-сериализуемому виду (UUID->str, datetime->ISO) —
+        для экспорта в JSON; по умолчанию False, чтобы dbmerge получал исходные типы.
         """
         keys = list(self.data.keys())
         out_keys = [column_mapping.get(k, k) for k in keys] if column_mapping else keys
         cols = list(self.data.values())
+        if json_safe:
+            return [dict(zip(out_keys, (_json_safe(v) for v in row))) for row in zip(*cols)]
         return [dict(zip(out_keys, row)) for row in zip(*cols)]
+
+    def group_by(self, key_field: str = 'Ref_Key', name_mapper: NameMapper1C | None = None,
+                 json_safe: bool = False, skip_deleted: bool = False) -> dict[Any, list[dict]]:
+        """
+        Группирует записи объекта в {значение key_field: [записи]} одним проходом (hash group-by).
+        Записи — как в to_records_mapped (с маппингом/json_safe). Индекс не хранится в объекте, а
+        строится на вызов: платим только при экспорте, без накладных в add_records и без устаревания.
+
+        skip_deleted=True пропускает записи с is_deleted_or_empty (удалённые/фиктивные строки) —
+        для вложенных табличных частей: опустевшая ТЧ приходит фиктивной записью и должна дать
+        пустой список, а не группу с записью-пустышкой.
+        """
+        col_map = name_mapper.get_column_mapping(list(self.data.keys())) if name_mapper else None
+        key = name_mapper.map_field_name(key_field) if name_mapper else key_field
+        del_key = (name_mapper.map_field_name(IS_DELETED_OR_EMPTY_FIELD)
+                   if name_mapper else IS_DELETED_OR_EMPTY_FIELD)
+        grouped: dict[Any, list[dict]] = {}
+        for row in self.to_records_mapped(col_map, json_safe=json_safe):
+            if skip_deleted and row.get(del_key):
+                continue
+            grouped.setdefault(row.get(key), []).append(row)
+        return grouped
+
+    def to_nested_records(self, name_mapper: NameMapper1C | None = None,
+                          json_safe: bool = False) -> list[dict]:
+        """
+        Записи этого объекта (list of dict) с вложенными табличными частями — например, чтобы
+        отправить во внешний приёмник (RabbitMQ и т.п.) вместо записи в БД.
+
+        Табличные части берутся из self.table_parts (их связал контейнер при чтении), кладутся
+        вложенным списком под ключом = имя части, строки группируются по Ref_Key (group_by).
+
+        name_mapper=None → имена полей/частей как в 1С; передан — транслитерируем (как в БД).
+        json_safe=True → значения JSON-сериализуемы (UUID->str, datetime->ISO), готово к json.dumps.
+        """
+        col_map = name_mapper.get_column_mapping(list(self.data.keys())) if name_mapper else None
+        key = name_mapper.map_field_name('Ref_Key') if name_mapper else 'Ref_Key'
+        records = self.to_records_mapped(col_map, json_safe=json_safe)
+
+        for part_name, part_obj in self.table_parts.items():
+            part_key = name_mapper.map_field_name(part_name) if name_mapper else part_name
+            grouped = part_obj.group_by('Ref_Key', name_mapper, json_safe, skip_deleted=True)
+            for rec in records:
+                rec[part_key] = grouped.get(rec.get(key), [])
+        return records
             
 
 
@@ -317,3 +383,7 @@ class DataReader1C(UserDict):
                     if ref_key is not None and table_part_name in self.metadata.keys():
                         self._add_records(table_part_name,
                                           [self._make_empty_table_part_record(table_part_name, ref_key)])
+
+                # Связываем объект-ТЧ с владельцем — чтобы to_nested_records нашёл его сам.
+                if table_part_name in self:
+                    self[object_name].table_parts[table_part_key] = self[table_part_name]

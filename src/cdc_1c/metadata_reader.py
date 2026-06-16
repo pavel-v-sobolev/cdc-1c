@@ -89,16 +89,16 @@ def _classify_register_fields(base_name: str, properties: dict, complextypes: di
 
 
 class MetadataObject1C(UserDict):
-    def __init__(self, properties, primary_key, delete_key=None,
+    def __init__(self, properties, primary_key, object_key=None,
                  dimensions=None, resources=None, attributes=None, kind=None):
         super().__init__(properties)
         self.primary_key = primary_key
-        # Ключ для scoped-удаления при merge (см. _get_delete_key):
+        # Ключ для scoped-удаления при merge (см. _get_object_key):
         # регистр -> Recorder(+Recorder_Type), табличная часть -> Ref_Key,
         # документ/справочник -> None (одна запись, delete не нужен).
-        self.delete_key = delete_key
+        self.object_key = object_key
         # Классификация полей регистра (см. _classify_register_fields); для не-регистров пусто.
-        # Имена — оригинальные (1С), маппятся NameMapper-ом при использовании, как delete_key.
+        # Имена — оригинальные (1С), маппятся NameMapper-ом при использовании, как object_key.
         self.dimensions = dimensions or []   # измерения
         self.resources = resources or []     # ресурсы
         self.attributes = attributes or []   # реквизиты
@@ -173,7 +173,7 @@ class MetadataReader1C(UserDict):
         return key
 
 
-    def _get_delete_key(self, item_name: str, properties: dict, primary_key: dict):
+    def _get_object_key(self, item_name: str, properties: dict, primary_key: dict):
         """
         Ключ для scoped-удаления при merge (delete_condition в dbmerge).
         Изменения приходят группами, которые целиком заменяют существующие строки:
@@ -219,10 +219,10 @@ class MetadataReader1C(UserDict):
                 item_name = item_name.removesuffix("_RecordType")
                 properties = self._read_metadata_item_properties(item)
                 primary_key = self._read_metadata_item_key(item,properties)
-                delete_key = self._get_delete_key(item_name, properties, primary_key)
+                object_key = self._get_object_key(item_name, properties, primary_key)
                 dimensions, resources, attributes, kind = _classify_register_fields(
                     item_name, properties, complextypes)
-                self[item_name] = MetadataObject1C(properties, primary_key, delete_key,
+                self[item_name] = MetadataObject1C(properties, primary_key, object_key,
                                                    dimensions, resources, attributes, kind)
 
             elif item_name.startswith(ENTITY_TYPES) and not item_name.endswith(METADATA_POSTFIXES):
@@ -231,7 +231,7 @@ class MetadataReader1C(UserDict):
             # (также может быть табличная часть документа или справочника)
                 properties = self._read_metadata_item_properties(item)
                 primary_key = self._read_metadata_item_key(item,properties)
-                delete_key = self._get_delete_key(item_name, properties, primary_key)
-                self[item_name] = MetadataObject1C(properties,primary_key,delete_key)
+                object_key = self._get_object_key(item_name, properties, primary_key)
+                self[item_name] = MetadataObject1C(properties,primary_key,object_key)
 
         self.is_loaded = True

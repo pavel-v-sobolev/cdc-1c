@@ -9,6 +9,7 @@ from cdc_1c.change_reader import ChangeReader1C
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.db_writer import DBWriter1C
 from cdc_1c.config import Config
+from cdc_1c.db_logs import Replicator1CLog
 from cdc_1c.logging_config import _ensure_handler
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,9 @@ class Replicator1C:
                                       request_timeout=self._request_timeout)
         self.writer = DBWriter1C(engine=self.engine, name_mapper=self.name_mapper,
                                  data_reader=self.changes, schema=self.db_schema)
+        # Лог загрузки (строка на объект) пишет оркестратор: только здесь есть контекст обмена
+        # (exchange_name/message_no), а writer универсален и может делать и полную перевыгрузку.
+        self.replicator_log = Replicator1CLog(self.engine, self.db_schema)
 
 
     @classmethod
@@ -94,11 +98,24 @@ class Replicator1C:
         if not self.metadata.is_loaded:
             self.metadata.get_metadata()
         self.changes.read_changes()
-        self.writer.save_all()
+        self._save_changes()
         if notify_changes and len(self.changes) > 0:
             self.changes.notify_changes_received()
         else:
             logger.debug("No changes — skipping confirmation")
+
+    def _save_changes(self) -> None:
+        """
+        Сохраняет объекты пакета по одному, записывая лог загрузки на каждый объект
+        (replicator_1c_log). finish() — только после успешного save: упавший объект остаётся с
+        finished_at=NULL и не двигает watermark материализатора. Лог здесь, а не в DBWriter1C,
+        потому что только тут есть контекст обмена (exchange_name/message_no).
+        """
+        for object_name, data_object in self.changes.items():
+            log_id = self.replicator_log.start(
+                self.changes.exchange_name, object_name, self.changes.message_no)
+            self.writer.save(object_name, data_object)
+            self.replicator_log.finish(log_id)
 
     def run_forever(self, interval: float = 60.0, max_iterations: int = 0) -> None:
         """
