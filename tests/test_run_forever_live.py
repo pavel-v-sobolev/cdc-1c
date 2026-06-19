@@ -34,8 +34,7 @@ if __name__ == "__main__":
 
     repl = Replicator1C(
         odata_url=ODATA_URL,
-        odata_user=ODATA_USER,
-        odata_password=ODATA_PASSWORD,
+        odata_auth=(ODATA_USER, ODATA_PASSWORD),
         exchange_name=EXCHANGE_NAME,
         queue_guid=QUEUE_GUID,
         engine=create_engine(DB_URL),

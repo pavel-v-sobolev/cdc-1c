@@ -12,9 +12,7 @@ from .name_mapper import NameMapper1C
 from .db_writer import DBWriter1C
 from .config import Config
 from .replicator import Replicator1C
-from .materializer import DataMaterializer1C, MaterializationRule, TriggerTable
 
 __all__ = ["MetadataReader1C", "DataReader1C", "DataObject1C", "ChangeReader1C", "NameMapper1C",
-           "DBWriter1C", "Config", "Replicator1C", "DataMaterializer1C", "MaterializationRule",
-           "TriggerTable", "__version__"]
+           "DBWriter1C", "Config", "Replicator1C", "__version__"]
 

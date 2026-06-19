@@ -83,9 +83,9 @@ def test_group_by():
 
 
 def test_over_replay():
-    with fake_1c.running_server("tests/responses/trade_demo_8.5") as (base_url, fake):
-        md = MetadataReader1C(base_url)
-        changes = ChangeReader1C(base_url, "E", fake.queue_guid, md)
+    with fake_1c.running_server("tests/responses/trade_demo_8.5") as (odata_url, fake):
+        md = MetadataReader1C(odata_url)
+        changes = ChangeReader1C(odata_url, "E", fake.queue_guid, md)
         md.get_metadata()
         changes.read_changes()                        # первый пакет: номенклатура + её ТЧ
 

@@ -17,8 +17,8 @@ class Config:
     queue_guid: str
     db_url: str
     db_schema: str | None = None
-    poll_interval: float = 60.0
     log_level: str = "INFO"
+    full_load_workers: int = 2
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -31,6 +31,6 @@ class Config:
             queue_guid=os.environ["CDC1C_QUEUE_GUID"],
             db_url=os.environ["CDC1C_DB_URL"],
             db_schema=os.environ.get("CDC1C_DB_SCHEMA"),
-            poll_interval=float(os.environ.get("CDC1C_POLL_INTERVAL", "60")),
             log_level=os.environ.get("CDC1C_LOG_LEVEL", "INFO"),
+            full_load_workers=int(os.environ.get("CDC1C_FULL_LOAD_WORKERS", "2")),
         )

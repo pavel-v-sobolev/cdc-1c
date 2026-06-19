@@ -32,7 +32,13 @@ class DBWriter1C:
         self.data_reader = data_reader
         self.schema = schema
 
-    def save(self, object_name: str, data_object: DataObject1C) -> None:
+    def save(self, object_name: str, data_object: DataObject1C, delete: bool = True) -> None:
+        """
+        Сохраняет один объект через dbmerge. delete=True (по умолчанию, режим изменений): для
+        регистров/табличных частей делает scoped-удаление по object_key (набор группы заменяется
+        целиком). delete=False — чистый upsert без удаления (для полной постраничной выгрузки, где
+        группа может быть разрезана между страницами и удалять отсутствующее на странице нельзя).
+        """
         if data_object.data_length == 0:
             return
 
@@ -53,8 +59,8 @@ class DBWriter1C:
 
         object_key = metadata_obj.object_key
 
-        if not object_key:
-            # Документ/справочник: одна запись на Ref_Key, удалять чужие строки не нужно.
+        if not object_key or not delete:
+            # Документ/справочник (или полная выгрузка): чистый upsert по ключу, без удаления.
             with dbmerge(engine=self.engine, table_name=table_name, data=records,
                          key=key, data_types=data_types,
                          merged_on_field=MERGED_ON_FIELD, inserted_on_field=INSERTED_ON_FIELD,

@@ -1,10 +1,13 @@
 import logging
 import signal
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy import Engine, create_engine
 
 from cdc_1c.metadata_reader import MetadataReader1C
+from cdc_1c.data_reader import DataReader1C
 from cdc_1c.change_reader import ChangeReader1C
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.db_writer import DBWriter1C
@@ -32,10 +35,11 @@ class Replicator1C:
     а тот же engine прокидывается в DBWriter1C. Для запуска из env есть classmethod from_config.
     """
 
-    def __init__(self, odata_url: str, odata_user: str | None, odata_password: str | None,
+    def __init__(self, odata_url: str, odata_auth: tuple[str, str] | None,
                  exchange_name: str, queue_guid: str,
                  engine: Engine, db_schema: str | None = None,
-                 request_timeout: float | None = None):
+                 request_timeout: float | None = None,
+                 full_load_workers: int = 2):
         # Включаем вывод логов, если приложение не настроило логирование само.
         _ensure_handler()
 
@@ -44,18 +48,26 @@ class Replicator1C:
         self._odata_url = odata_url
         self._exchange_name = exchange_name
         self._queue_guid = queue_guid
-        self._auth = (odata_user, odata_password) if odata_user is not None else None
+        # odata_auth — кортеж (user, password) либо None, как в ридерах (передаётся им как есть).
+        self._odata_auth = odata_auth
         # None → таймаут не задан явно: run_forever возьмёт его равным interval; одиночный
         # run_once без явного значения работает без таймаута (поведение requests по умолчанию).
         self._request_timeout = request_timeout
 
         # Компоненты строятся сразу, но в сеть не ходят: MetadataReader1C создаётся пустым,
-        # метаданные подгрузятся лениво при первом run_once.
-        self.metadata = MetadataReader1C(self._odata_url, auth=self._auth,
-                                         request_timeout=self._request_timeout)
+        # метаданные подгрузятся лениво при первом run_once. MetadataReader1C получает engine —
+        # он же ведёт реестр объектов metadata_objects_1c (состояние полной выгрузки).
+        self.metadata = MetadataReader1C(self._odata_url, odata_auth=self._odata_auth,
+                                         request_timeout=self._request_timeout,
+                                         engine=self.engine, schema=self.db_schema)
         self.name_mapper = NameMapper1C()
+
+        # Фоновая полная выгрузка: пул потоков и защита от повторного сабмита одного объекта.
+        self._full_load_workers = full_load_workers
+        self._full_load_in_progress: set[str] = set()
+        self._in_progress_lock = threading.Lock()
         self.changes = ChangeReader1C(self._odata_url, self._exchange_name, self._queue_guid,
-                                      self.metadata, auth=self._auth,
+                                      self.metadata, odata_auth=self._odata_auth,
                                       request_timeout=self._request_timeout)
         self.writer = DBWriter1C(engine=self.engine, name_mapper=self.name_mapper,
                                  data_reader=self.changes, schema=self.db_schema)
@@ -68,14 +80,15 @@ class Replicator1C:
     def from_config(cls, config: Config) -> "Replicator1C":
         """Собирает оркестратор из Config: строит engine из db_url и маппит остальные поля."""
         engine = create_engine(config.db_url)
+        odata_auth = (config.odata_user, config.odata_password) if config.odata_user is not None else None
         return cls(
             odata_url=config.odata_url,
-            odata_user=config.odata_user,
-            odata_password=config.odata_password,
+            odata_auth=odata_auth,
             exchange_name=config.exchange_name,
             queue_guid=config.queue_guid,
             engine=engine,
             db_schema=config.db_schema,
+            full_load_workers=config.full_load_workers,
         )
 
     def run_once(self, notify_changes: bool = True) -> None:
@@ -99,6 +112,15 @@ class Replicator1C:
             self.metadata.get_metadata()
         self.changes.read_changes()
         self._save_changes()
+        # Объект пришёл в пакете → он в плане обмена. Если ни разу не выгружался целиком,
+        # помечаем на полную выгрузку (выполнит фоновый воркер в run_forever). Табличные части
+        # (object_key == ['Ref_Key']) пропускаем — у них нет отдельной OData-сущности, они
+        # догружаются вместе с владельцем при его full_load.
+        for object_name in self.changes:
+            metadata_obj = self.metadata.get(object_name)
+            if metadata_obj is not None and metadata_obj.object_key == ['Ref_Key']:
+                continue
+            self.metadata.require_full_load_if_new(object_name)
         if notify_changes and len(self.changes) > 0:
             self.changes.notify_changes_received()
         else:
@@ -117,6 +139,73 @@ class Replicator1C:
             self.writer.save(object_name, data_object)
             self.replicator_log.finish(log_id)
 
+    def list_objects(self) -> list[str]:
+        """
+        Список имён объектов 1С, доступных для выгрузки (ключи метаданных: документы/справочники и
+        регистры). Метаданные при необходимости подгружаются (первый сетевой запрос). Удобно, чтобы
+        узнать, что передавать в full_load.
+        """
+        if not self.metadata.is_loaded:
+            self.metadata.get_metadata()
+        return list(self.metadata.keys())
+
+    def full_load(self, object_name: str, batch_size: int = 1000) -> None:
+        """
+        Полная постраничная выгрузка объекта 1С в целевую таблицу: по batch_size записей за запрос,
+        каждая страница сразу сохраняется upsert-ом (без удаления). Идемпотентно — повторный прогон
+        обновляет строки по ключу. Удаления не делаются: при постраничном чтении нельзя отличить
+        «строки нет в источнике» от «строка на другой странице», поэтому writer.save(delete=False).
+
+        Документ/справочник выгружается вместе с табличными частями — они приходят вложенно в той же
+        странице и сохраняются как отдельные объекты. Страницы берутся keyset-пагинацией (фильтр
+        «ключ больше последнего значения» вместо $skip — без перечитывания пропущенных строк на
+        больших объёмах): справочник/документ — по Ref_Key (guid), регистр — по Recorder (строка,
+        одна entry = целый набор записей регистратора). Один прогон = одна строка в replicator_1c_log
+        (message_no=NULL — это не пакет обмена); finished_at проставляется после успеха всех страниц.
+        """
+        if not self.metadata.is_loaded:
+            self.metadata.get_metadata()
+
+        # Ключ курсора: справочник/документ → Ref_Key (guid-литерал), регистр → Recorder (строковый).
+        key_field, key_is_guid = self._full_load_key(object_name)
+
+        reader = DataReader1C(self._odata_url, self.metadata, odata_auth=self._odata_auth,
+                              request_timeout=self._request_timeout)
+
+        log_id = self.replicator_log.start(self._exchange_name, object_name, None)
+        logger.info("Full load of %s started (batch_size=%s, key=%s)",
+                    object_name, batch_size, key_field)
+        last_key = None
+        total = 0
+        while True:
+            page = reader.read_object(object_name, top=batch_size, key_field=key_field,
+                                      after_key=last_key, key_is_guid=key_is_guid)
+            for obj_name, data_object in reader.items():
+                self.writer.save(obj_name, data_object, delete=False)
+            total += page
+            if page < batch_size:
+                break
+            # Курсор следующей страницы — ключ последней записи (порядок по ключу возрастающий).
+            last_key = reader[object_name].data[key_field][-1]
+        self.replicator_log.finish(log_id)
+        logger.info("Full load of %s finished (%s records)", object_name, total)
+
+    def _full_load_key(self, object_name: str) -> tuple[str, bool]:
+        """
+        Поле и тип литерала для keyset-курсора full_load по метаданным объекта:
+        - Ref_Key (справочник/документ) → ('Ref_Key', guid-литерал);
+        - Recorder (регистр) → ('Recorder', строковый литерал; Recorder в OData отдаётся строкой).
+        Иначе keyset неприменим (нет одиночного ключа курсора) → ValueError.
+        """
+        metadata_obj = self.metadata.get(object_name)
+        primary_key = metadata_obj.primary_key if metadata_obj else {}
+        if 'Ref_Key' in primary_key:
+            return 'Ref_Key', True
+        if 'Recorder' in primary_key:
+            return 'Recorder', False
+        raise ValueError(
+            f"full_load: no keyset cursor for {object_name} (need Ref_Key or Recorder in key)")
+
     def run_forever(self, interval: float = 60.0, max_iterations: int = 0) -> None:
         """
         Цикл run_once с паузой interval секунд. Упавший цикл логируется и не подтверждается —
@@ -129,28 +218,60 @@ class Replicator1C:
 
         Если таймаут запросов явно не задан в конструкторе, он берётся равным interval: запрос не
         должен висеть дольше периода опроса (иначе зависший сервер не даст циклу дойти до ретрая).
+
+        После каждого цикла фоном (пул потоков) запускаются полные выгрузки помеченных объектов —
+        диспетчеризация только здесь (одиночный run_once лишь взводит флаги).
         """
-        # Таймаут запросов по умолчанию = период опроса (см. докстринг).
-        if self._request_timeout is None:
+        # Таймаут запросов по умолчанию = период опроса (см. докстринг). interval=0 (без пауз,
+        # обычно в тестах) таймаутом быть не может — оставляем None (без таймаута).
+        if self._request_timeout is None and interval > 0:
             self._request_timeout = interval
 
         stop = _StopSignal()
         logger.info("Starting replication loop (interval=%ss, max_iterations=%s, timeout=%ss)",
                     interval, max_iterations, self._request_timeout)
         iterations = 0
-        while not stop.requested:
-            try:
-                self.run_once()
-            except Exception:
-                logger.exception("Replication cycle failed, will retry")
+        with ThreadPoolExecutor(max_workers=self._full_load_workers,
+                                thread_name_prefix='full_load') as executor:
+            while not stop.requested:
+                try:
+                    self.run_once()
+                    self._dispatch_full_loads(executor)
+                except Exception:
+                    logger.exception("Replication cycle failed, will retry")
 
-            iterations += 1
-            if max_iterations > 0 and iterations >= max_iterations:
-                logger.info("Reached max_iterations (%s), stopping", max_iterations)
-                break
+                iterations += 1
+                if max_iterations > 0 and iterations >= max_iterations:
+                    logger.info("Reached max_iterations (%s), stopping", max_iterations)
+                    break
 
-            stop.wait(interval)
+                stop.wait(interval)
+            logger.info("Replication loop stopping, waiting for full loads to finish")
         logger.info("Replication loop stopped")
+
+    def _dispatch_full_loads(self, executor: ThreadPoolExecutor) -> None:
+        """
+        Ставит в пул полные выгрузки объектов с full_load_is_required, кроме уже выполняющихся.
+        Защита от повторного сабмита — множество _full_load_in_progress (под локом).
+        """
+        for object_name in self.metadata.list_full_load_required():
+            with self._in_progress_lock:
+                if object_name in self._full_load_in_progress:
+                    continue
+                self._full_load_in_progress.add(object_name)
+            executor.submit(self._run_full_load, object_name)
+
+    def _run_full_load(self, object_name: str) -> None:
+        """Фоновая полная выгрузка одного объекта; на успехе фиксирует mark_full_loaded.
+        При ошибке флаг full_load_is_required остаётся → ретрай на следующем цикле."""
+        try:
+            self.full_load(object_name)
+            self.metadata.mark_full_loaded(object_name)
+        except Exception:
+            logger.exception("Background full_load of %s failed, will retry", object_name)
+        finally:
+            with self._in_progress_lock:
+                self._full_load_in_progress.discard(object_name)
 
 
 class _StopSignal:

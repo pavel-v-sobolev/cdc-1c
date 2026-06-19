@@ -29,16 +29,15 @@ CONFIGS = sorted(p for p in RESPONSES_DIR.iterdir() if (p / "manifest.json").exi
 
 @pytest.fixture
 def fake_server(request):
-    """Поднимает фейковый сервер для конфигурации request.param, отдаёт (base_url, fake)."""
-    with fake_1c.running_server(request.param) as (base_url, fake):
-        yield base_url, fake
+    """Поднимает фейковый сервер для конфигурации request.param, отдаёт (odata_url, fake)."""
+    with fake_1c.running_server(request.param) as (odata_url, fake):
+        yield odata_url, fake
 
 
-def _make_replicator(base_url, queue_guid, tmp_path):
+def _make_replicator(odata_url, queue_guid, tmp_path):
     return Replicator1C(
-        odata_url=base_url,
-        odata_user="ignored",       # фейковый сервер не проверяет auth
-        odata_password="ignored",
+        odata_url=odata_url,
+        odata_auth=None,                  # фейковый сервер не проверяет auth
         exchange_name="ДляODATA",   # сервер матчит ExchangePlan по пути, имя не важно
         queue_guid=queue_guid,
         engine=create_engine(f"sqlite:///{tmp_path / 'cdc.db'}"),
@@ -56,8 +55,8 @@ def _row_count(engine) -> int:
 
 @pytest.mark.parametrize("fake_server", CONFIGS, ids=[p.name for p in CONFIGS], indirect=True)
 def test_run_once_replay(fake_server, tmp_path):
-    base_url, fake = fake_server
-    repl = _make_replicator(base_url, fake.queue_guid, tmp_path)
+    odata_url, fake = fake_server
+    repl = _make_replicator(odata_url, fake.queue_guid, tmp_path)
 
     repl.run_once()
 
@@ -71,9 +70,9 @@ def test_run_once_replay(fake_server, tmp_path):
 
 @pytest.mark.parametrize("fake_server", CONFIGS, ids=[p.name for p in CONFIGS], indirect=True)
 def test_run_forever_replay(fake_server, tmp_path):
-    base_url, fake = fake_server
+    odata_url, fake = fake_server
     n_batches = len(fake.batches)
-    repl = _make_replicator(base_url, fake.queue_guid, tmp_path)
+    repl = _make_replicator(odata_url, fake.queue_guid, tmp_path)
 
     # interval=0 — без пауз; max_iterations=n_batches — обработать все записанные пакеты.
     repl.run_forever(interval=0, max_iterations=n_batches)

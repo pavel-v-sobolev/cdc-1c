@@ -5,6 +5,7 @@ import logging
 from typing import Any
 from collections import UserDict, UserList
 from datetime import datetime, date
+from urllib.parse import quote
 import uuid
 
 import xmltodict
@@ -130,19 +131,46 @@ class DataObject1C(UserDict):
 
 
 class DataReader1C(UserDict):
-    def __init__(self, base_url: str, metadata: MetadataReader1C,
-                 auth: tuple[str, str] | None = None,
+    def __init__(self, odata_url: str, metadata: MetadataReader1C,
+                 odata_auth: tuple[str, str] | None = None,
                  request_timeout: float | None = None):
         super().__init__()
-        self.base_url = base_url
+        self.odata_url = odata_url
         self.metadata = metadata
-        self.auth = auth
+        self.odata_auth = odata_auth
         self.request_timeout = request_timeout
         self.exchange_message_no = None  # номер пакета обмена, проставляется в записи при чтении изменений
 
-    def read_object(self, object_name: str):
-        url = f"{self.base_url}/{object_name}"
-        response = requests.get(url, auth=self.auth, timeout=self.request_timeout)
+    def read_object(self, object_name: str, top: int | None = None,
+                    key_field: str = 'Ref_Key', after_key: Any = None,
+                    key_is_guid: bool = True) -> int:
+        """
+        Читает объект 1С в reader (предыдущее содержимое очищается). Постраничная выгрузка —
+        keyset-пагинация по key_field: сортировка по ключу, лимит $top, а следующая страница берётся
+        фильтром «ключ больше последнего значения предыдущей страницы» (after_key). В отличие от $skip
+        это не заставляет 1С перечитывать пропущенные строки — каждая страница читается за один
+        проход по индексу.
+
+        key_field/key_is_guid:
+        - справочник/документ: Ref_Key, guid-литерал (Ref_Key gt guid'...');
+        - регистр: Recorder, строковый литерал (Recorder gt '...') — в OData Recorder отдаётся строкой,
+          а одна entry регистра = целый набор записей регистратора, поэтому keyset по Recorder не рвёт
+          набор между страницами.
+
+        Возвращает число прочитанных записей верхнего уровня (entry) — по нему вызывающий понимает,
+        что страница последняя (меньше top).
+        """
+        params = []
+        if top is not None:
+            params.append(f"$top={top}")
+        params.append(f"$orderby={key_field}")
+        if after_key is not None:
+            # URL собираем строкой — кодируем пробелы сами (requests строку не кодирует).
+            literal = f"guid'{after_key}'" if key_is_guid else f"'{after_key}'"
+            params.append("$filter=" + quote(f"{key_field} gt {literal}", safe="'"))
+        query = '?' + '&'.join(params)
+        url = f"{self.odata_url}/{object_name}{query}"
+        response = requests.get(url, auth=self.odata_auth, timeout=self.request_timeout)
         response.raise_for_status()
 
         object_data = xmltodict.parse(response.text, force_list=('d:element', 'entry'))
@@ -150,6 +178,7 @@ class DataReader1C(UserDict):
 
         self.clear()
         self.read_data_entries(object_entries)
+        return len(object_entries)
 
     def read_data_entries(self, object_entries: list):
         for object_entry in object_entries:

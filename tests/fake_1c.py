@@ -14,7 +14,7 @@ batches — упорядоченный список; индекс i соотве
 нумерацию, абсолютные номера исходной записи не важны).
 
 Использование:
-  - в тестах: `with running_server(config_dir) as (base_url, fake): ...`;
+  - в тестах: `with running_server(config_dir) as (odata_url, fake): ...`;
   - вручную:  `python tests/fake_1c.py tests/responses/trade_demo_8.5 --port 8080`
               (затем натравить на него реальный Replicator1C.run_forever).
 """
@@ -94,14 +94,14 @@ def _make_handler(fake: Fake1C):
 
 @contextlib.contextmanager
 def running_server(config_dir, port: int = 0):
-    """Поднимает фейковый сервер в фоне на 127.0.0.1:port (0 — эфемерный). Отдаёт (base_url, fake)."""
+    """Поднимает фейковый сервер в фоне на 127.0.0.1:port (0 — эфемерный). Отдаёт (odata_url, fake)."""
     fake = Fake1C(config_dir)
     httpd = ThreadingHTTPServer(("127.0.0.1", port), _make_handler(fake))
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
-    base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    odata_url = f"http://127.0.0.1:{httpd.server_address[1]}"
     try:
-        yield base_url, fake
+        yield odata_url, fake
     finally:
         httpd.shutdown()
         thread.join(timeout=5)

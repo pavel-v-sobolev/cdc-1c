@@ -23,7 +23,7 @@ from pathlib import Path
 import requests
 
 # Дефолты dev-контура (как в tests/test_cdc_run_once.py).
-DEFAULT_BASE_URL = "http://192.168.56.101/trade_demo/odata/standard.odata"
+DEFAULT_ODATA_URL = "http://192.168.56.101/trade_demo/odata/standard.odata"
 DEFAULT_USER = "admin"
 DEFAULT_PASSWORD = "admin"
 DEFAULT_EXCHANGE = "ДляODATA"
@@ -54,9 +54,9 @@ def _next_index(config_dir: Path) -> int:
     return (max(nums) + 1) if nums else 1
 
 
-def _last_received_no(args, auth) -> int:
-    resp = requests.get(f"{args.base_url}/ExchangePlan_{args.exchange}?$format=json",
-                        auth=auth, timeout=args.timeout)
+def _last_received_no(args, odata_auth) -> int:
+    resp = requests.get(f"{args.odata_url}/ExchangePlan_{args.exchange}?$format=json",
+                        auth=odata_auth, timeout=args.timeout)
     resp.raise_for_status()
     for queue in (resp.json().get("value") or []):
         if queue["Ref_Key"] == args.queue:
@@ -64,8 +64,8 @@ def _last_received_no(args, auth) -> int:
     return 0
 
 
-def record_metadata(args, config_dir: Path, auth) -> None:
-    resp = requests.get(f"{args.base_url}/$metadata", auth=auth, timeout=args.timeout)
+def record_metadata(args, config_dir: Path, odata_auth) -> None:
+    resp = requests.get(f"{args.odata_url}/$metadata", auth=odata_auth, timeout=args.timeout)
     resp.raise_for_status()
     (config_dir / METADATA_FILE).write_bytes(resp.content)
 
@@ -78,11 +78,11 @@ def record_metadata(args, config_dir: Path, auth) -> None:
     print(f"metadata -> {METADATA_FILE} ({len(resp.content)} bytes)")
 
 
-def record_batch(args, config_dir: Path, auth) -> None:
-    message_no = _last_received_no(args, auth) + 1
-    url = (f"{args.base_url}/SelectChanges?DataExchangePoint="
-           f"'{args.base_url}/ExchangePlan_{args.exchange}(guid'{args.queue}')'&MessageNo={message_no}")
-    resp = requests.post(url, auth=auth, timeout=args.timeout)
+def record_batch(args, config_dir: Path, odata_auth) -> None:
+    message_no = _last_received_no(args, odata_auth) + 1
+    url = (f"{args.odata_url}/SelectChanges?DataExchangePoint="
+           f"'{args.odata_url}/ExchangePlan_{args.exchange}(guid'{args.queue}')'&MessageNo={message_no}")
+    resp = requests.post(url, auth=odata_auth, timeout=args.timeout)
     resp.raise_for_status()
 
     fname = f"msg{_next_index(config_dir):03d}_{args.name}.xml"
@@ -97,9 +97,9 @@ def record_batch(args, config_dir: Path, auth) -> None:
     if args.no_notify:
         print("notify пропущен (--no-notify): очередь не продвинута")
         return
-    notify_url = (f"{args.base_url}/NotifyChangesReceived?DataExchangePoint="
-                  f"'{args.base_url}/ExchangePlan_{args.exchange}(guid'{args.queue}')'&MessageNo={message_no}")
-    notify = requests.post(notify_url, auth=auth, timeout=args.timeout)
+    notify_url = (f"{args.odata_url}/NotifyChangesReceived?DataExchangePoint="
+                  f"'{args.odata_url}/ExchangePlan_{args.exchange}(guid'{args.queue}')'&MessageNo={message_no}")
+    notify = requests.post(notify_url, auth=odata_auth, timeout=args.timeout)
     notify.raise_for_status()
     print(f"подтверждено MessageNo={message_no} (очередь продвинута)")
 
@@ -107,7 +107,7 @@ def record_batch(args, config_dir: Path, auth) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Запись ответов 1С для replay-тестов")
     parser.add_argument("--config-dir", default=DEFAULT_CONFIG_DIR)
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--odata-url", default=DEFAULT_ODATA_URL)
     parser.add_argument("--user", default=DEFAULT_USER)
     parser.add_argument("--password", default=DEFAULT_PASSWORD)
     parser.add_argument("--exchange", default=DEFAULT_EXCHANGE)
@@ -121,12 +121,12 @@ def main():
 
     config_dir = Path(args.config_dir)
     config_dir.mkdir(parents=True, exist_ok=True)
-    auth = (args.user, args.password)
+    odata_auth = (args.user, args.password)
 
     if args.metadata:
-        record_metadata(args, config_dir, auth)
+        record_metadata(args, config_dir, odata_auth)
     elif args.name:
-        record_batch(args, config_dir, auth)
+        record_batch(args, config_dir, odata_auth)
     else:
         parser.error("нужен либо --metadata, либо --name <описание>")
 
