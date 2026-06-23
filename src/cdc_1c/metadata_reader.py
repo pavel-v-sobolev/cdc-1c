@@ -11,6 +11,23 @@ from dbmerge import dbmerge
 
 logger = logging.getLogger(__name__)
 
+# Таймауты HTTP-запросов к 1С по умолчанию: (connect, read) в секундах. requests с timeout=None
+# висит бесконечно при недоступном сервере — именно поэтому процесс зависал на запросе метаданных.
+# connect ограничивает ожидание установки соединения, read — ожидание ответа.
+# Метаданные ($metadata) — небольшой и быстрый запрос: ждать долго смысла нет, лучше быстро упасть
+# на недоступной/зависшей 1С. Чтение данных/страниц выгрузки бывает объёмным — там read больше.
+# Применяется, когда request_timeout не задан явно (None).
+DEFAULT_METADATA_TIMEOUT: tuple[float, float] = (5, 30)
+DEFAULT_REQUEST_TIMEOUT: tuple[float, float] = (10, 300)
+
+
+def resolve_timeout(request_timeout: float | tuple[float, float] | None,
+                    default: float | tuple[float, float] = DEFAULT_REQUEST_TIMEOUT):
+    """request_timeout как есть, либо default, если он не задан (None).
+    Гарантирует, что ни один HTTP-запрос не уходит в requests с timeout=None (вечное ожидание)."""
+    return default if request_timeout is None else request_timeout
+
+
 # Таблица-реестр объектов 1С и состояния их полной выгрузки (см. MetadataReader1C).
 METADATA_OBJECTS_TABLE = 'metadata_objects_1c'
 MERGED_ON_FIELD = 'merged_on'
@@ -229,7 +246,8 @@ class MetadataReader1C(UserDict):
         logger.info('Requesting metadata from 1C ODATA')
         
         url = f'{self.odata_url}/$metadata'
-        response = requests.get(url,auth=self.odata_auth,timeout=self.request_timeout)
+        response = requests.get(url,auth=self.odata_auth,
+                                timeout=resolve_timeout(self.request_timeout, DEFAULT_METADATA_TIMEOUT))
         response.raise_for_status()
 
         metadata = xmltodict.parse(response.text,force_list=('Property','PropertyRef','ComplexType'))

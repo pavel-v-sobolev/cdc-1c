@@ -223,9 +223,13 @@ class Replicator1C:
         диспетчеризация только здесь (одиночный run_once лишь взводит флаги).
         """
         # Таймаут запросов по умолчанию = период опроса (см. докстринг). interval=0 (без пауз,
-        # обычно в тестах) таймаутом быть не может — оставляем None (без таймаута).
+        # обычно в тестах) таймаутом быть не может — оставляем None (ридеры подставят дефолт).
+        # Ридеры metadata/changes уже построены в __init__ со старым значением, поэтому обновляем
+        # их .request_timeout явно — иначе переопределение «= interval» до них не доходит.
         if self._request_timeout is None and interval > 0:
             self._request_timeout = interval
+            self.metadata.request_timeout = self._request_timeout
+            self.changes.request_timeout = self._request_timeout
 
         stop = _StopSignal()
         logger.info("Starting replication loop (interval=%ss, max_iterations=%s, timeout=%ss)",
