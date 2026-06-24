@@ -10,7 +10,7 @@ import uuid
 
 import xmltodict
 
-from cdc_1c.metadata_reader import MetadataReader1C
+from cdc_1c.metadata_reader import MetadataReader1C, resolve_timeout
 from cdc_1c.name_mapper import NameMapper1C
 
 logger = logging.getLogger(__name__)
@@ -170,7 +170,7 @@ class DataReader1C(UserDict):
             params.append("$filter=" + quote(f"{key_field} gt {literal}", safe="'"))
         query = '?' + '&'.join(params)
         url = f"{self.odata_url}/{object_name}{query}"
-        response = requests.get(url, auth=self.odata_auth, timeout=self.request_timeout)
+        response = requests.get(url, auth=self.odata_auth, timeout=resolve_timeout(self.request_timeout))
         response.raise_for_status()
 
         object_data = xmltodict.parse(response.text, force_list=('d:element', 'entry'))

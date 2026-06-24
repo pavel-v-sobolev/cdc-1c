@@ -16,7 +16,7 @@ engine = create_engine("postgresql+psycopg2://postgres:postgres@localhost:5432/c
 
 exchange_name = 'ДляODATA'
 queue_guid = 'a9bc23c5-3689-11f1-926c-0800270bc6cb'
-odata_url = "http://192.168.56.101/trade_demo/odata/standard.odata"
+odata_url = "http://192.168.56.102/trade_demo/odata/standard.odata"
 
 
 odata_auth=('admin', 'admin')
@@ -30,7 +30,7 @@ changes = ChangeReader1C(odata_url, exchange_name, queue_guid, metadata, odata_a
 writer = DBWriter1C(engine=engine, name_mapper=mapper, data_reader=changes, schema='cdc_1c_trade_demo')
 
 replicator = Replicator1C(engine=engine, odata_url=odata_url, exchange_name=exchange_name,
-                          queue_guid=queue_guid, metadata=metadata, odata_auth=odata_auth)
+                          queue_guid=queue_guid, odata_auth=odata_auth)
 
 replicator.list_objects()
 

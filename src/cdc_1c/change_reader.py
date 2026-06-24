@@ -4,7 +4,7 @@ import logging
 import xmltodict
 
 from cdc_1c.data_reader import DataReader1C
-from cdc_1c.metadata_reader import MetadataReader1C
+from cdc_1c.metadata_reader import MetadataReader1C, resolve_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ class ChangeReader1C(DataReader1C):
 
         url = f"{self.odata_url}/SelectChanges?DataExchangePoint='{self.odata_url}/ExchangePlan_{self.exchange_name}(guid'{self.queue_guid}')'&MessageNo={self.message_no}"
 
-        response = requests.post(url,auth=self.odata_auth,timeout=self.request_timeout)
+        response = requests.post(url,auth=self.odata_auth,timeout=resolve_timeout(self.request_timeout))
         response.raise_for_status()
 
         change_data = xmltodict.parse(response.text,force_list=('d:element','entry'))
@@ -41,7 +41,7 @@ class ChangeReader1C(DataReader1C):
         Подтвердить получение изменений, отправив запрос на сервер
         """
         url = f"{self.odata_url}/NotifyChangesReceived?DataExchangePoint='{self.odata_url}/ExchangePlan_{self.exchange_name}(guid'{self.queue_guid}')'&MessageNo={self.message_no}"
-        response = requests.post(url,auth=self.odata_auth,timeout=self.request_timeout)
+        response = requests.post(url,auth=self.odata_auth,timeout=resolve_timeout(self.request_timeout))
         # Не-2xx -> HTTPError. Подтверждение не прошло — изменения не списаны и придут снова
         # (в run_forever цикл повторится, save идемпотентен).
         response.raise_for_status()
@@ -53,7 +53,7 @@ class ChangeReader1C(DataReader1C):
         Получить номер последнего пакета обмена, который был получен и подтвержден
         """
         url = f"{self.odata_url}/ExchangePlan_{self.exchange_name}?$format=json"
-        response = requests.get(url,auth=self.odata_auth,timeout=self.request_timeout)
+        response = requests.get(url,auth=self.odata_auth,timeout=resolve_timeout(self.request_timeout))
         response.raise_for_status()
         queues_data = response.json()
 
