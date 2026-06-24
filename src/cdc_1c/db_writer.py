@@ -12,6 +12,19 @@ logger = logging.getLogger(__name__)
 MERGED_ON_FIELD = 'merged_on'
 INSERTED_ON_FIELD = 'inserted_on'
 
+# Порядок сохранения объектов: справочники → документы → регистры. Документы ссылаются на
+# справочники (по *_Key), регистры — на документы (Recorder), поэтому родителей сохраняем раньше.
+# Табличные части (Catalog_X_Y / Document_X_Y) попадают в группу своего владельца по префиксу.
+SAVE_ORDER_PREFIXES = ('Catalog', 'Document', 'InformationRegister', 'AccumulationRegister')
+
+
+def save_order_key(object_name: str) -> int:
+    """Приоритет объекта в порядке сохранения (см. SAVE_ORDER_PREFIXES); неизвестные типы — в конец."""
+    for i, prefix in enumerate(SAVE_ORDER_PREFIXES):
+        if object_name.startswith(prefix):
+            return i
+    return len(SAVE_ORDER_PREFIXES)
+
 
 class DBWriter1C:
     """
@@ -81,7 +94,7 @@ class DBWriter1C:
 
     def _ensure_merged_on_index(self, table_name: str) -> None:
         """
-        Индекс по merged_on (для быстрых сканов материализатора `merged_on > watermark`).
+        Индекс по merged_on (для быстрых сканов материализатора `merged_on > граница обработки`).
         Только средствами SQLAlchemy, идемпотентно (checkfirst). Таблицу уже создал dbmerge.
         """
         eff_schema = None if self.engine.dialect.name == 'sqlite' else self.schema
@@ -115,6 +128,10 @@ class DBWriter1C:
         Сохраняет все объекты data_reader по одному. Каждый объект мержится отдельным вызовом
         dbmerge (своя транзакция). Исключение пробрасывается, чтобы не подтверждать получение
         изменений при неполном сохранении.
+
+        Порядок сохранения — справочники → документы → регистры (save_order_key); внутри группы
+        исходный порядок (сортировка стабильна).
         """
-        for object_name, data_object in self.data_reader.items():
+        for object_name, data_object in sorted(self.data_reader.items(),
+                                               key=lambda kv: save_order_key(kv[0])):
             self.save(object_name, data_object)

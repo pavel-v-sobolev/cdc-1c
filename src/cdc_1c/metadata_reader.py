@@ -6,8 +6,11 @@ from collections import UserDict
 
 import xmltodict
 from sqlalchemy import (String, Uuid, BigInteger, SmallInteger, Numeric, Boolean, DateTime,
-                        Engine, func, insert, select, update)
+                        JSON, Engine, func, insert, select, update)
+from sqlalchemy.dialects.postgresql import JSONB
 from dbmerge import dbmerge
+
+from cdc_1c.name_mapper import NameMapper1C
 
 logger = logging.getLogger(__name__)
 
@@ -288,12 +291,29 @@ class MetadataReader1C(UserDict):
         # object_type (префикс имени) — неключевая колонка: без неё dbmerge рано выходит из
         # update-фазы и не снимает пометку у вернувшихся объектов. Колонки full_load передаём только
         # для создания таблицы/первой вставки и исключаем из UPDATE (skip_update_fields).
-        data = [{'object_name': name, 'object_type': name.split('_', 1)[0],
-                 'full_load_is_required': False, 'last_full_load_dt': None} for name in object_names]
+        # object_name_en — транслитерированное имя (= имя таблицы в БД); fields/fields_en — JSON-списки
+        # полей объекта: оригинальные имена 1С и их транслит (= имена колонок в БД). Для удобного
+        # просмотра состава объекта. Все три синхронизируются с $metadata.
+        mapper = NameMapper1C()
+        # На json-колонке dbmerge сравнивает значения через IS DISTINCT FROM; у Postgres-типа json
+        # нет оператора равенства — берём jsonb (у sqlite generic JSON хранится текстом, сравнение ок).
+        json_type = JSONB() if self.engine.dialect.name == 'postgresql' else JSON()
+        data = []
+        for name in object_names:
+            obj = self.get(name)
+            field_names = list(obj.keys()) if obj is not None else []
+            data.append({
+                'object_name': name, 'object_name_en': mapper.map_object_name(name),
+                'object_type': name.split('_', 1)[0],
+                'fields': field_names,
+                'fields_en': [mapper.map_field_name(f) for f in field_names],
+                'full_load_is_required': False, 'last_full_load_dt': None})
         with dbmerge(engine=self.engine, table_name=METADATA_OBJECTS_TABLE, data=data,
                      key=['object_name'], delete_mode='mark', delete_mark_field=IS_DELETED_FIELD,
                      merged_on_field=MERGED_ON_FIELD, schema=self.schema,
-                     data_types={'full_load_is_required': Boolean(), 'last_full_load_dt': DateTime()},
+                     data_types={'full_load_is_required': Boolean(), 'last_full_load_dt': DateTime(),
+                                 'object_name_en': String(), 'fields': json_type,
+                                 'fields_en': json_type},
                      skip_update_fields=list(FULL_LOAD_FIELDS)) as merge:
             merge.exec()
             self.objects_table = merge.table   # Table-описание созданной/существующей таблицы

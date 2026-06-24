@@ -12,7 +12,9 @@ SELECT
 	s."Recorder",
 	s."Recorder_Type",
 	s."LineNumber",
-	s."Zakazano" * (NOT s."is_deleted_or_empty")::int "Zakazano", --обнулим значение для удаленных строк
+	s."Zakazano" * (NOT s."is_deleted_or_empty")::int * --обнулим значение для удаленных строк
+		CASE WHEN "RecordType"='Receipt' THEN 1 ELSE -1 END) --проверим тип операции + или -
+    		"Zakazano",
 	n."Code" "Artikul",
 	s."merged_on",
 	s."is_deleted_or_empty"

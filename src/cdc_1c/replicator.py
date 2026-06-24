@@ -10,7 +10,7 @@ from cdc_1c.metadata_reader import MetadataReader1C
 from cdc_1c.data_reader import DataReader1C
 from cdc_1c.change_reader import ChangeReader1C
 from cdc_1c.name_mapper import NameMapper1C
-from cdc_1c.db_writer import DBWriter1C
+from cdc_1c.db_writer import DBWriter1C, save_order_key
 from cdc_1c.config import Config
 from cdc_1c.db_logs import Replicator1CLog
 from cdc_1c.logging_config import _ensure_handler
@@ -130,10 +130,15 @@ class Replicator1C:
         """
         Сохраняет объекты пакета по одному, записывая лог загрузки на каждый объект
         (replicator_1c_log). finish() — только после успешного save: упавший объект остаётся с
-        finished_at=NULL и не двигает watermark материализатора. Лог здесь, а не в DBWriter1C,
+        finished_at=NULL и не двигает границу обработки материализатора. Лог здесь, а не в DBWriter1C,
         потому что только тут есть контекст обмена (exchange_name/message_no).
+
+        Порядок сохранения — справочники → документы → регистры (save_order_key): документы ссылаются
+        на справочники, регистры — на документы, поэтому родителей пишем раньше. Внутри группы
+        исходный порядок пакета (сортировка стабильна).
         """
-        for object_name, data_object in self.changes.items():
+        for object_name, data_object in sorted(self.changes.items(),
+                                               key=lambda kv: save_order_key(kv[0])):
             log_id = self.replicator_log.start(
                 self.changes.exchange_name, object_name, self.changes.message_no)
             self.writer.save(object_name, data_object)
