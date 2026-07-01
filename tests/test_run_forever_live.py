@@ -19,14 +19,14 @@ from sqlalchemy import create_engine
 from cdc_1c import Replicator1C
 
 # Параметры из main.py — тестовый/dev-контур, не боевой.
-ODATA_URL = "http://192.168.56.101/trade_demo/odata/standard.odata"
+ODATA_URL = "http://192.168.56.102/trade_demo/odata/standard.odata"
 ODATA_USER = "admin"
 ODATA_PASSWORD = "admin"
 EXCHANGE_NAME = "ДляODATA"
 QUEUE_GUID = "a9bc23c5-3689-11f1-926c-0800270bc6cb"
 DB_URL = "postgresql+psycopg2://postgres:postgres@localhost:5432/cdc_1c"
 DB_SCHEMA = "cdc_1c_trade_demo"
-POLL_INTERVAL = 5.0
+POLL_INTERVAL = 60.0
 
 
 if __name__ == "__main__":

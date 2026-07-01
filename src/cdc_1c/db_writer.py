@@ -78,7 +78,7 @@ class DBWriter1C:
                          key=key, data_types=data_types,
                          merged_on_field=MERGED_ON_FIELD, inserted_on_field=INSERTED_ON_FIELD,
                          delete_mode='no', schema=self.schema) as merge:
-                merge.exec()
+                result = merge.exec()
         else:
             # Регистр/табличная часть: набор по object_key целиком заменяет существующий.
             # Удаляем строки только тех групп, что пришли в наборе, и которых больше нет в источнике.
@@ -88,9 +88,10 @@ class DBWriter1C:
                          merged_on_field=MERGED_ON_FIELD, inserted_on_field=INSERTED_ON_FIELD,
                          delete_mode='delete', schema=self.schema) as merge:
                 condition = self._scoped_delete_condition(merge.table, merge.temp_table, mapped_object_key)
-                merge.exec(delete_condition=condition)
+                result = merge.exec(delete_condition=condition)
 
         self._ensure_merged_on_index(table_name)
+        return result
 
     def _ensure_merged_on_index(self, table_name: str) -> None:
         """

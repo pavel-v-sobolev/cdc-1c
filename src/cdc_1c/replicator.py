@@ -113,14 +113,22 @@ class Replicator1C:
         self.changes.read_changes()
         self._save_changes()
         # Объект пришёл в пакете → он в плане обмена. Если ни разу не выгружался целиком,
-        # помечаем на полную выгрузку (выполнит фоновый воркер в run_forever). Табличные части
-        # (object_key == ['Ref_Key']) пропускаем — у них нет отдельной OData-сущности, они
+        # помечаем на полную выгрузку (выполнит фоновый воркер в run_forever). 
+        # Табличные части пропускаем — у них нет отдельной OData-сущности, они
         # догружаются вместе с владельцем при его full_load.
-        for object_name in self.changes:
-            metadata_obj = self.metadata.get(object_name)
-            if metadata_obj is not None and metadata_obj.object_key == ['Ref_Key']:
+        for object_full_name in self.changes:
+            metadata_obj = self.metadata.get(object_full_name)
+            if metadata_obj is None:
+                self.metadata.get_metadata()
+                metadata_obj = self.metadata.get(object_full_name)
+                if metadata_obj is None:
+                    raise f"No metadata object for {object_full_name}"
+
+            if metadata_obj.is_table_part:
                 continue
-            self.metadata.require_full_load_if_new(object_name)
+
+            self.metadata.require_full_load_if_new(object_full_name)
+        
         if notify_changes and len(self.changes) > 0:
             self.changes.notify_changes_received()
         else:
@@ -141,8 +149,8 @@ class Replicator1C:
                                                key=lambda kv: save_order_key(kv[0])):
             log_id = self.replicator_log.start(
                 self.changes.exchange_name, object_name, self.changes.message_no)
-            self.writer.save(object_name, data_object)
-            self.replicator_log.finish(log_id)
+            result = self.writer.save(object_name, data_object)
+            self.replicator_log.finish(log_id, result)
 
     def list_objects(self) -> list[str]:
         """

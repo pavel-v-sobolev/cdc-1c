@@ -12,6 +12,7 @@ import xmltodict
 
 from cdc_1c.metadata_reader import MetadataReader1C, resolve_timeout
 from cdc_1c.name_mapper import NameMapper1C
+from cdc_1c.common_functions import parse_object_full_name
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +185,7 @@ class DataReader1C(UserDict):
         for object_entry in object_entries:
 
             object_full_name = (object_entry.get('category') or {}).get('@term')
-            object_name, object_type = self._parse_object_full_name(object_full_name)
+            object_name, object_type = self.parse_object_full_name(object_full_name)
 
             logger.info(f'Parcing {object_name}')
 
@@ -201,30 +202,6 @@ class DataReader1C(UserDict):
             if object_type in ENTITY_TYPES:
                 self._get_entity_records(object_name, properties)
 
-    def _parse_object_full_name(self, object_full_name):
-        """
-        Очищаем имя объекта от разных префиксов, постфиксов и скобок.
-        Возвращает очищенное имя и тип объекта
-        """
-        if object_full_name is None:
-            logger.error(f'Object full name is None')
-            return None, None
-
-        object_name = object_full_name
-
-        if object_name.startswith('Collection'):
-            object_name = object_name.removeprefix('Collection(')
-            object_name = object_name.removesuffix(')')
-
-        object_name = object_name.removeprefix(ODATA_PREFIX)
-        object_name = object_name.removesuffix('_RowType')
-
-        if '_' in object_name:
-            object_type = object_name.split('_')[0]
-        else:
-            logger.error(f'Object type not found in object full name {object_full_name}')
-            return None, None
-        return object_name, object_type
 
     def _add_records(self, object_name, new_records: list):
         if new_records:
@@ -327,7 +304,7 @@ class DataReader1C(UserDict):
         record = {field: self._default_key_value(type_name)
                   for field, type_name in primary_key.items()}
 
-        recorder_name, _ = self._parse_object_full_name(recorder_type)
+        recorder_name, _ = self.parse_object_full_name(recorder_type)
         record['Recorder'] = recorder
         record['Recorder_Type'] = recorder_name
         record[IS_DELETED_OR_EMPTY_FIELD] = True
@@ -397,7 +374,7 @@ class DataReader1C(UserDict):
         for table_part_key, table_part in table_parts.items():
             table_part_full_name = table_part.get('@m:type')
             if table_part_full_name:
-                table_part_name, _ = self._parse_object_full_name(table_part_full_name)
+                table_part_name, _ = self.parse_object_full_name(table_part_full_name)
                 table_part_rows = table_part.get('d:element') or []
                 if table_part_rows:
                     for table_part_row in table_part_rows:
