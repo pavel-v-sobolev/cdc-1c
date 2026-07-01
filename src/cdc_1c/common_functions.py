@@ -4,7 +4,7 @@ ODATA_PREFIX = 'StandardODATA.'
 
 logger = logging.getLogger(__name__)
 
-def parse_object_full_name(self, object_full_name):
+def parse_object_full_name(object_full_name):
     """
     Очищаем имя объекта от разных префиксов, постфиксов и скобок.
     Возвращает очищенное имя и тип объекта

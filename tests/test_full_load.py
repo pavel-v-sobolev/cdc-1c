@@ -9,11 +9,15 @@ import uuid
 
 import pytest
 from sqlalchemy import create_engine, select
+from dbmerge import mergeResult
 
 from cdc_1c import DataObject1C
 from cdc_1c.data_reader import DataReader1C
 from cdc_1c.metadata_reader import MetadataObject1C, MetadataReader1C
 from cdc_1c.replicator import Replicator1C
+
+# Нулевой результат merge — writer.save в тестах замокан, но full_load агрегирует его результат.
+_ZERO_RESULT = mergeResult(0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 def _replicator():
@@ -22,8 +26,8 @@ def _replicator():
                        exchange_name="E", queue_guid="Q", engine=engine)
     # Метаданные «уже загружены» — full_load не пойдёт в сеть; primary_key даёт $orderby.
     rep.metadata.is_loaded = True
-    rep.metadata["Catalog_X"] = MetadataObject1C({"Ref_Key": "Guid"}, {"Ref_Key": "Guid"},
-                                                 object_key=None)
+    rep.metadata["Catalog_X"] = MetadataObject1C("Catalog_X", {"Ref_Key": "Guid"},
+                                                 {"Ref_Key": "Guid"}, object_key=None)
     return rep
 
 
@@ -52,7 +56,10 @@ def test_full_load_paging(monkeypatch):
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
 
     saved = []
-    rep.writer.save = lambda name, obj, delete=True: saved.append((name, obj.data_length, delete))
+    def fake_save(name, obj, delete=True):
+        saved.append((name, obj.data_length, delete))
+        return _ZERO_RESULT
+    rep.writer.save = fake_save
 
     rep.full_load("Catalog_X", batch_size=2)
 
@@ -78,7 +85,8 @@ def test_full_load_register_paging(monkeypatch):
     # Регистр: keyset по Recorder (строковый литерал), курсор — Recorder последней entry страницы.
     rep = _replicator()
     rep.metadata["AccumulationRegister_R"] = MetadataObject1C(
-        {"Recorder": "Guid"}, {"Recorder": "Guid", "LineNumber": "Int64", "Recorder_Type": "String"},
+        "AccumulationRegister_R", {"Recorder": "Guid"},
+        {"Recorder": "Guid", "LineNumber": "Int64", "Recorder_Type": "String"},
         object_key=["Recorder", "Recorder_Type"])
     meta = rep.metadata["AccumulationRegister_R"]
     pages = iter([2, 1])
@@ -102,7 +110,7 @@ def test_full_load_register_paging(monkeypatch):
         return n
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
-    rep.writer.save = lambda name, obj, delete=True: None
+    rep.writer.save = lambda name, obj, delete=True: _ZERO_RESULT
 
     rep.full_load("AccumulationRegister_R", batch_size=2)
 
@@ -120,7 +128,10 @@ def test_full_load_empty_object(monkeypatch):
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
     saved = []
-    rep.writer.save = lambda name, obj, delete=True: saved.append(name)
+    def fake_save(name, obj, delete=True):
+        saved.append(name)
+        return _ZERO_RESULT
+    rep.writer.save = fake_save
 
     rep.full_load("Catalog_X", batch_size=2)
     assert saved == []   # сохранять нечего, но лог-строка с finished_at должна появиться
@@ -133,7 +144,8 @@ def test_full_load_rejects_keyless_object():
     # Независимый регистр сведений: ключ без Ref_Key и Recorder → курсор keyset не выбрать.
     rep = _replicator()
     rep.metadata["InformationRegister_Indep"] = MetadataObject1C(
-        {"Period": "DateTime"}, {"Period": "DateTime", "Dim_Key": "Guid"}, object_key=None)
+        "InformationRegister_Indep", {"Period": "DateTime"},
+        {"Period": "DateTime", "Dim_Key": "Guid"}, object_key=None)
     with pytest.raises(ValueError, match="Ref_Key or Recorder"):
         rep.full_load("InformationRegister_Indep")
 

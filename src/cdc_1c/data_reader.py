@@ -185,7 +185,7 @@ class DataReader1C(UserDict):
         for object_entry in object_entries:
 
             object_full_name = (object_entry.get('category') or {}).get('@term')
-            object_name, object_type = self.parse_object_full_name(object_full_name)
+            object_name, object_type = parse_object_full_name(object_full_name)
 
             logger.info(f'Parcing {object_name}')
 
@@ -304,7 +304,7 @@ class DataReader1C(UserDict):
         record = {field: self._default_key_value(type_name)
                   for field, type_name in primary_key.items()}
 
-        recorder_name, _ = self.parse_object_full_name(recorder_type)
+        recorder_name, _ = parse_object_full_name(recorder_type)
         record['Recorder'] = recorder
         record['Recorder_Type'] = recorder_name
         record[IS_DELETED_OR_EMPTY_FIELD] = True
@@ -374,7 +374,7 @@ class DataReader1C(UserDict):
         for table_part_key, table_part in table_parts.items():
             table_part_full_name = table_part.get('@m:type')
             if table_part_full_name:
-                table_part_name, _ = self.parse_object_full_name(table_part_full_name)
+                table_part_name, _ = parse_object_full_name(table_part_full_name)
                 table_part_rows = table_part.get('d:element') or []
                 if table_part_rows:
                     for table_part_row in table_part_rows:

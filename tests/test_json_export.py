@@ -17,12 +17,13 @@ REC = uuid.UUID("33333333-3333-3333-3333-333333333333")
 
 
 def _doc_with_parts():
-    doc = DataObject1C(MetadataObject1C({}, {"Ref_Key": "Guid"}, object_key=None), [
+    doc = DataObject1C(MetadataObject1C("Document_Doc", {}, {"Ref_Key": "Guid"}, object_key=None), [
         {"Ref_Key": REF_A, "Дата": datetime(2026, 1, 1, 12, 0, 0)},
         {"Ref_Key": REF_B, "Дата": datetime(2026, 1, 2, 12, 0, 0)},
     ])
     part = DataObject1C(
-        MetadataObject1C({}, {"Ref_Key": "Guid", "LineNumber": "Int64"}, object_key=["Ref_Key"]), [
+        MetadataObject1C("Document_Doc_Товары", {}, {"Ref_Key": "Guid", "LineNumber": "Int64"},
+                         object_key=["Ref_Key"]), [
             {"Ref_Key": REF_A, "LineNumber": 1, "Товар": "X"},
             {"Ref_Key": REF_A, "LineNumber": 2, "Товар": "Y"},
             {"Ref_Key": REF_B, "LineNumber": 1, "Товар": "Z"},
@@ -44,7 +45,8 @@ def test_nested_records_raw():
 
 def test_flat_without_parts():
     reg = DataObject1C(
-        MetadataObject1C({}, {"Recorder": "Guid"}, object_key=["Recorder", "Recorder_Type"]),
+        MetadataObject1C("AccumulationRegister_Reg", {}, {"Recorder": "Guid"},
+                         object_key=["Recorder", "Recorder_Type"]),
         [{"Recorder": REC, "Сумма": 100}])
     records = reg.to_nested_records(json_safe=True)   # table_parts пуст → плоско
     assert records[0]["Сумма"] == 100 and "Товары" not in records[0]
@@ -60,12 +62,13 @@ def test_nested_records_mapped():
 
 def test_emptied_part_yields_empty_list():
     # У REF_B табличная часть опустела: пришла фиктивная запись is_deleted_or_empty=True.
-    doc = DataObject1C(MetadataObject1C({}, {"Ref_Key": "Guid"}, object_key=None), [
+    doc = DataObject1C(MetadataObject1C("Document_Doc", {}, {"Ref_Key": "Guid"}, object_key=None), [
         {"Ref_Key": REF_A},
         {"Ref_Key": REF_B},
     ])
     part = DataObject1C(
-        MetadataObject1C({}, {"Ref_Key": "Guid", "LineNumber": "Int64"}, object_key=["Ref_Key"]), [
+        MetadataObject1C("Document_Doc_Товары", {}, {"Ref_Key": "Guid", "LineNumber": "Int64"},
+                         object_key=["Ref_Key"]), [
             {"Ref_Key": REF_A, "LineNumber": 1, "Товар": "X"},
             {"Ref_Key": REF_B, "is_deleted_or_empty": True},
         ])

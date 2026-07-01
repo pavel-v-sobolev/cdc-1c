@@ -12,7 +12,7 @@ from cdc_1c.change_reader import ChangeReader1C
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.db_writer import DBWriter1C, save_order_key
 from cdc_1c.config import Config
-from cdc_1c.db_logs import Replicator1CLog
+from cdc_1c.db_logs import Replicator1CLog, LOAD_TYPE_CHANGES, LOAD_TYPE_FULL
 from cdc_1c.logging_config import _ensure_handler
 
 logger = logging.getLogger(__name__)
@@ -122,7 +122,7 @@ class Replicator1C:
                 self.metadata.get_metadata()
                 metadata_obj = self.metadata.get(object_full_name)
                 if metadata_obj is None:
-                    raise f"No metadata object for {object_full_name}"
+                    raise RuntimeError(f"No metadata object for {object_full_name}")
 
             if metadata_obj.is_table_part:
                 continue
@@ -148,9 +148,10 @@ class Replicator1C:
         for object_name, data_object in sorted(self.changes.items(),
                                                key=lambda kv: save_order_key(kv[0])):
             log_id = self.replicator_log.start(
-                self.changes.exchange_name, object_name, self.changes.message_no)
+                self.changes.exchange_name, object_name, self.changes.message_no, LOAD_TYPE_CHANGES)
             result = self.writer.save(object_name, data_object)
-            self.replicator_log.finish(log_id, result)
+            # Одно сохранение на строку лога: счётчики и завершение — одним запросом.
+            self.replicator_log.write_result(log_id, result, finish=True)
 
     def list_objects(self) -> list[str]:
         """
@@ -185,7 +186,7 @@ class Replicator1C:
         reader = DataReader1C(self._odata_url, self.metadata, odata_auth=self._odata_auth,
                               request_timeout=self._request_timeout)
 
-        log_id = self.replicator_log.start(self._exchange_name, object_name, None)
+        log_id = self.replicator_log.start(self._exchange_name, object_name, None, LOAD_TYPE_FULL)
         logger.info("Full load of %s started (batch_size=%s, key=%s)",
                     object_name, batch_size, key_field)
         last_key = None
@@ -194,13 +195,15 @@ class Replicator1C:
             page = reader.read_object(object_name, top=batch_size, key_field=key_field,
                                       after_key=last_key, key_is_guid=key_is_guid)
             for obj_name, data_object in reader.items():
-                self.writer.save(obj_name, data_object, delete=False)
+                # Много страниц/объектов пишутся в одну строку лога — счётчики суммируются в БД.
+                result = self.writer.save(obj_name, data_object, delete=False)
+                self.replicator_log.write_result(log_id, result)
             total += page
             if page < batch_size:
                 break
             # Курсор следующей страницы — ключ последней записи (порядок по ключу возрастающий).
             last_key = reader[object_name].data[key_field][-1]
-        self.replicator_log.finish(log_id)
+        self.replicator_log.write_result(log_id, finish=True)
         logger.info("Full load of %s finished (%s records)", object_name, total)
 
     def _full_load_key(self, object_name: str) -> tuple[str, bool]:
@@ -271,24 +274,24 @@ class Replicator1C:
         Ставит в пул полные выгрузки объектов с full_load_is_required, кроме уже выполняющихся.
         Защита от повторного сабмита — множество _full_load_in_progress (под локом).
         """
-        for object_name in self.metadata.list_full_load_required():
+        for object_full_name in self.metadata.list_full_load_required():
             with self._in_progress_lock:
-                if object_name in self._full_load_in_progress:
+                if object_full_name in self._full_load_in_progress:
                     continue
-                self._full_load_in_progress.add(object_name)
-            executor.submit(self._run_full_load, object_name)
+                self._full_load_in_progress.add(object_full_name)
+            executor.submit(self._run_full_load, object_full_name)
 
-    def _run_full_load(self, object_name: str) -> None:
+    def _run_full_load(self, object_full_name: str) -> None:
         """Фоновая полная выгрузка одного объекта; на успехе фиксирует mark_full_loaded.
         При ошибке флаг full_load_is_required остаётся → ретрай на следующем цикле."""
         try:
-            self.full_load(object_name)
-            self.metadata.mark_full_loaded(object_name)
+            self.full_load(object_full_name)
+            self.metadata.mark_full_loaded(object_full_name)
         except Exception:
-            logger.exception("Background full_load of %s failed, will retry", object_name)
+            logger.exception("Background full_load of %s failed, will retry", object_full_name)
         finally:
             with self._in_progress_lock:
-                self._full_load_in_progress.discard(object_name)
+                self._full_load_in_progress.discard(object_full_name)
 
 
 class _StopSignal:

@@ -1,7 +1,8 @@
 """
 Оффлайн-тесты реестра объектов metadata_objects_1c (внутри MetadataReader1C, на sqlite).
-Проверяют синхронизацию с $metadata (dbmerge mark), пометку/снятие is_deleted, возврат объекта
-и флаги полной выгрузки (require/list/mark). Без 1С/Postgres.
+Проверяют синхронизацию с $metadata (dbmerge delete — пропавшие объекты удаляются из реестра)
+и флаги полной выгрузки (require/list/mark). Ключ реестра — полное имя объекта (object_full_name).
+Без 1С/Postgres.
 """
 
 import sqlite3
@@ -19,45 +20,27 @@ def _reader(tmp_path):
     return MetadataReader1C("http://x", engine=engine)
 
 
-def _row(reader, name):
+def _row(reader, object_full_name):
     t = reader.objects_table
     with reader.engine.connect() as c:
-        return c.execute(select(t).where(t.c.object_name == name)).mappings().first()
+        return c.execute(select(t).where(t.c.object_full_name == object_full_name)).mappings().first()
 
 
-def test_sync_marks_and_unmarks_deleted(tmp_path):
+def test_sync_inserts_and_deletes(tmp_path):
     reader = _reader(tmp_path)
     reader._sync_objects(["Catalog_A", "Document_B"])
-    assert _row(reader, "Catalog_A")["is_deleted"] in (False, 0)
     assert _row(reader, "Catalog_A")["object_type"] == "Catalog"
+    assert _row(reader, "Document_B") is not None
 
-    # Document_B пропал из метаданных → помечен удалённым.
+    # Document_B пропал из метаданных → строка удаляется из реестра (delete_mode='delete').
     reader._sync_objects(["Catalog_A"])
-    assert _row(reader, "Document_B")["is_deleted"] in (True, 1)
-
-
-def test_reappear_requires_new_full_load(tmp_path):
-    reader = _reader(tmp_path)
-    reader._sync_objects(["Catalog_A", "Document_B"])
-    reader.mark_full_loaded("Document_B")          # был выгружен: dt стоит, флаг снят
-    assert _row(reader, "Document_B")["last_full_load_dt"] is not None
-
-    reader._sync_objects(["Catalog_A"])            # пропал → is_deleted
-    reader._sync_objects(["Catalog_A", "Document_B"])  # вернулся
-
-    row = _row(reader, "Document_B")
-    assert row["is_deleted"] in (False, 0)          # пометка снята (dbmerge)
-    assert row["last_full_load_dt"] is None          # сброшен → считается «не выгружался»
-    assert row["full_load_is_required"] in (True, 1) # нужен новый full_load
+    assert _row(reader, "Document_B") is None
+    assert _row(reader, "Catalog_A") is not None
 
 
 def test_require_full_load_if_new(tmp_path):
     reader = _reader(tmp_path)
     reader._sync_objects(["Catalog_A"])             # первая sync создаёт таблицу
-
-    # Объект из пакета, которого ещё нет в реестре (пришёл раньше, чем sync его увидела) → INSERT.
-    reader.require_full_load_if_new("Catalog_New")
-    assert _row(reader, "Catalog_New")["full_load_is_required"] in (True, 1)
 
     # Существующий, ещё не выгружавшийся → флаг ставится.
     reader.require_full_load_if_new("Catalog_A")
@@ -71,13 +54,40 @@ def test_require_full_load_if_new(tmp_path):
     assert row["last_full_load_dt"] is not None
 
 
-def test_list_full_load_required_excludes_deleted_and_done(tmp_path):
+def test_require_full_load_if_new_reloads_unknown(tmp_path, monkeypatch):
+    reader = _reader(tmp_path)
+    reader._sync_objects(["Catalog_A"])
+
+    # Объект пришёл в пакете, но его ещё нет в реестре → require_full_load_if_new перечитывает
+    # метаданные (здесь стаб вместо сети: sync заводит строку), затем помечает на выгрузку.
+    monkeypatch.setattr(reader, "get_metadata",
+                        lambda: reader._sync_objects(["Catalog_A", "Catalog_New"]))
+
+    reader.require_full_load_if_new("Catalog_New")
+    assert _row(reader, "Catalog_New")["full_load_is_required"] in (True, 1)
+
+
+def test_mark_full_loaded_keyed_by_full_name(tmp_path):
+    # Отметка и список полной выгрузки работают по полному имени (object_full_name).
+    reader = _reader(tmp_path)
+    reader._sync_objects(["Document_Sales", "AccumulationRegister_Sales"])
+    reader.require_full_load_if_new("Document_Sales")
+    reader.require_full_load_if_new("AccumulationRegister_Sales")
+
+    reader.mark_full_loaded("Document_Sales")       # выгружен только документ
+
+    assert _row(reader, "Document_Sales")["full_load_is_required"] in (False, 0)
+    assert _row(reader, "AccumulationRegister_Sales")["full_load_is_required"] in (True, 1)
+    assert reader.list_full_load_required() == ["AccumulationRegister_Sales"]
+
+
+def test_list_full_load_required_excludes_done_and_deleted(tmp_path):
     reader = _reader(tmp_path)
     reader._sync_objects(["Catalog_A", "Document_B", "Catalog_C"])
     reader.require_full_load_if_new("Catalog_A")    # требуется
     reader.require_full_load_if_new("Document_B")   # требуется, но станет удалённым
     reader.mark_full_loaded("Catalog_C")            # уже выгружен → не требуется
 
-    reader._sync_objects(["Catalog_A", "Catalog_C"])  # Document_B удалён
+    reader._sync_objects(["Catalog_A", "Catalog_C"])  # Document_B удалён из реестра
 
     assert reader.list_full_load_required() == ["Catalog_A"]

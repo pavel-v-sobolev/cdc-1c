@@ -1,7 +1,7 @@
 import logging
 
 from sqlalchemy import Engine, Index, MetaData, Table, tuple_, select
-from dbmerge import dbmerge
+from dbmerge import dbmerge, mergeResult
 
 from cdc_1c.data_reader import DataReader1C, DataObject1C
 from cdc_1c.name_mapper import NameMapper1C
@@ -45,21 +45,24 @@ class DBWriter1C:
         self.data_reader = data_reader
         self.schema = schema
 
-    def save(self, object_name: str, data_object: DataObject1C, delete: bool = True) -> None:
+    def save(self, object_name: str, data_object: DataObject1C, delete: bool = True) -> mergeResult | None:
         """
         Сохраняет один объект через dbmerge. delete=True (по умолчанию, режим изменений): для
         регистров/табличных частей делает scoped-удаление по object_key (набор группы заменяется
         целиком). delete=False — чистый upsert без удаления (для полной постраничной выгрузки, где
         группа может быть разрезана между страницами и удалять отсутствующее на странице нельзя).
+
+        Возвращает mergeResult, либо None на ранних выходах (пустой набор / нет метаданных) —
+        лог загрузки принимает None (write_result тогда просто не прибавляет счётчики).
         """
         if data_object.data_length == 0:
-            return
+            return None
 
         logger.info(f"Saving {data_object.data_length} records of {object_name}")
         metadata_obj = data_object.metadata_obj
         if metadata_obj is None or not metadata_obj.primary_key:
             logger.warning(f'No metadata/primary key for {object_name}, skipping save')
-            return
+            return None
 
         table_name = self.name_mapper.map_object_name(object_name)
 

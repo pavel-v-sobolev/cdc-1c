@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 REPLICATOR_LOG = "replicator_1c_log"
 
+# Тип строки лога: обработка пакета изменений или полная выгрузка.
+LOAD_TYPE_CHANGES = 'changes'
+LOAD_TYPE_FULL = 'full'
+
 
 def _check_create_schema(engine: Engine, schema_name: str | None) -> str | None:
     if engine.dialect.name not in ['sqlite']:
@@ -37,6 +41,7 @@ def _replicator_log_table(metadata: MetaData, schema_name: str | None) -> Table:
         Column("id", Integer, primary_key=True, autoincrement=True),
         Column("exchange", String),
         Column("object", String),
+        Column("type", String),
         Column("message_no", Integer),
         Column("started_at", DateTime),
         Column("finished_at", DateTime, nullable=True),
@@ -49,7 +54,8 @@ def _replicator_log_table(metadata: MetaData, schema_name: str | None) -> Table:
 
 
 class Replicator1CLog:
-    """Лог загрузки (replicator_1c_log): start() при начале объекта, finish() при успехе."""
+    """Лог загрузки (replicator_1c_log): start() при начале, write_result() накапливает счётчики
+    и/или завершает строку (finish=True)."""
 
     def __init__(self, engine: Engine, schema_name: str | None = None):
         self.engine = engine
@@ -57,19 +63,37 @@ class Replicator1CLog:
         self.table = _replicator_log_table(MetaData(), self.schema_name)
         self.table.create(engine, checkfirst=True)
 
-    def start(self, exchange: str, obj: str, message_no: int | None) -> int:
+    def start(self, exchange: str, obj: str, message_no: int | None, load_type: str) -> int:
+        # Счётчики стартуют с нуля — их наращивает write_result (col = col + n) по мере сохранений.
         with self.engine.begin() as conn:
             res = conn.execute(insert(self.table).values(
-                exchange=exchange, object=obj, message_no=message_no,
-                started_at=func.now()))
+                exchange=exchange, object=obj, type=load_type, message_no=message_no,
+                started_at=func.now(),
+                inserted_row_count=0, updated_row_count=0, deleted_row_count=0, total_time=0))
             return res.inserted_primary_key[0]
 
-    def finish(self, log_id: int, result: mergeResult) -> None:
+    def write_result(self, log_id: int, result: mergeResult | None = None,
+                     finish: bool = False) -> None:
+        """
+        Один UPDATE строки лога: прибавляет счётчики merge в БД (col = col + n, если задан result)
+        и/или проставляет finished_at (при finish=True).
+
+        Для изменений (одно сохранение на строку) хватает одного write_result(result, finish=True) —
+        счётчики и завершение за один запрос. Полная выгрузка накапливает страницы вызовами без
+        finish, а в конце ставит завершение отдельным write_result(finish=True).
+        """
+        t = self.table
+        values = {}
+        if result is not None:
+            values = {
+                'inserted_row_count': t.c.inserted_row_count + result.inserted_row_count,
+                'updated_row_count': t.c.updated_row_count + result.updated_row_count,
+                'deleted_row_count': t.c.deleted_row_count + result.deleted_row_count,
+                'total_time': t.c.total_time + result.total_time,
+            }
+        if finish:
+            values['finished_at'] = func.now()
+        if not values:
+            return
         with self.engine.begin() as conn:
-            conn.execute(update(self.table)
-                         .where(self.table.c.id == log_id)
-                         .values(finished_at=func.now(), 
-                                 inserted_row_count = result.inserted_row_count,
-                                 updated_row_count = result.updated_row_count,
-                                 deleted_row_count = result.deleted_row_count,
-                                 total_time = result.total_time))
+            conn.execute(update(t).where(t.c.id == log_id).values(**values))

@@ -79,11 +79,15 @@ def _classify_register_fields(base_name: str, properties: dict, complextypes: di
     функциями на лету — здесь они нужны ТОЛЬКО как описание типов для классификации.
 
     Возвращает (dimensions, resources, attributes). Если функции для регистра не опубликованы
-    (нет _Balance/_Turnover) — ([], [], [], None).
+    (нет ни _Balance, ни _Turnover) — ([], [], []). Регистр может иметь и остатки, и обороты,
+    поэтому обе таблицы обрабатываются независимо.
     """
     prop_names = set(properties)
     balance = complextypes.get(base_name + '_Balance')
     turnover = complextypes.get(base_name + '_Turnover')
+
+    if balance is None and turnover is None:
+        return [], [], []
 
     dimensions: list[str] = []
     resources: list[str] = []
@@ -103,8 +107,6 @@ def _classify_register_fields(base_name: str, properties: dict, complextypes: di
                 continue
             else:
                 dimensions.append(f)
-    else:
-        return [], [], []
 
     # Оставляем только реально присутствующие в движениях поля, без дублей (порядок сохраняем).
     dimensions = [d for d in dict.fromkeys(dimensions) if d in prop_names]
@@ -158,7 +160,8 @@ class MetadataReader1C(UserDict):
         # Реестр объектов и состояния полной выгрузки (metadata_objects_1c). Ведётся, только если
         # передан engine (в библиотечном/тестовом сценарии без БД метаданные читаются как раньше).
         # Членство в плане обмена определяется эмпирически — по приходу объекта в пакете SelectChanges
-        # (require_full_load_if_new); is_deleted/merged_on ведёт dbmerge синхронизацией с $metadata.
+        # (require_full_load_if_new). Состав реестра синхронизируется с $metadata через dbmerge
+        # (delete: пропавшие объекты удаляются, merged_on ведёт dbmerge).
         # Таблицу создаёт сам dbmerge при первой sync; objects_table — её Table-описание оттуда же.
         self.engine = engine
         self.schema = None if (engine is not None and engine.dialect.name == 'sqlite') else schema
@@ -258,8 +261,8 @@ class MetadataReader1C(UserDict):
         metadata_schema = ((metadata.get('edmx:Edmx') or {}).get('edmx:DataServices') or {}).get('Schema') or {}
         metadata_entity_types = metadata_schema.get('EntityType') or []
         # Виртуальные таблицы регистров (_Balance/_Turnover) приходят как ComplexType — нужны для
-        # Табличные части документов и справочников также приходят как ComplexType
         # классификации полей регистра на измерения/ресурсы/реквизиты (см. _classify_register_fields).
+        # Табличные части документов и справочников также приходят как ComplexType.
         complextypes = {ct.get('@Name'): [p.get('@Name') for p in (ct.get('Property') or [])]
                         for ct in (metadata_schema.get('ComplexType') or [])}
 
@@ -297,8 +300,7 @@ class MetadataReader1C(UserDict):
     def _sync_objects(self, object_names: list[str]) -> None:
         """
         Синхронизирует реестр с актуальным составом $metadata через dbmerge (delete): новые объекты
-        вставляются , пропавшие помечаются удаляются.
-        Если объект пропал из метаданных, то он будет удален в таблице. 
+        вставляются, пропавшие из метаданных — удаляются из таблицы реестра.
         """
         if not object_names:
             return
@@ -324,7 +326,7 @@ class MetadataReader1C(UserDict):
                 'object_type': object_type,
                 'fields': field_names,
                 'fields_en': [mapper.map_field_name(f) for f in field_names],
-                # эти значения устранавливаются только при insert, из update они исключены
+                # эти значения устанавливаются только при insert, из update они исключены
                 'full_load_is_required': False, 'last_full_load_dt': None})
             
         with dbmerge(engine=self.engine, table_name=METADATA_OBJECTS_TABLE, data=data,
@@ -347,31 +349,42 @@ class MetadataReader1C(UserDict):
         """
         Помечает объект как требующий полной выгрузки, если он ещё ни разу не выгружался целиком
         (last_full_load_dt IS NULL). Вызывается на каждый объект пакета SelectChanges — это и есть
-        признак членства в плане обмена. Если строки ещё нет (объект пришёл в пакете раньше, чем его
-        увидела sync) — вставляем.
+        признак членства в плане обмена. Ключ реестра — полное имя (object_full_name): регистр и
+        документ могут иметь одинаковое короткое имя. Если строки ещё нет (объект пришёл в пакете
+        раньше, чем его увидела sync) — перечитываем метаданные (sync заведёт строку) и помечаем.
         """
-        table = self.objects_table
-        with self.engine.begin() as conn:
-            row = conn.execute(select(table.c.last_full_load_dt)
-                               .where(table.c.object_full_name == object_full_name)).first()
-            if row is None:
-                logger.info('reloading metadata')
-                self.get_metadata()
-            elif row.last_full_load_dt is None:
+        def _last_full_load_dt():
+            table = self.objects_table
+            with self.engine.begin() as conn:
+                return conn.execute(select(table.c.last_full_load_dt)
+                                    .where(table.c.object_full_name == object_full_name)).first()
+
+        row = _last_full_load_dt()
+        if row is None:
+            # Объект ещё не в реестре — перечитываем метаданные (get_metadata → _sync_objects
+            # вставит строку). Вне транзакции: get_metadata сам открывает соединения через dbmerge.
+            logger.info('Object %s not in registry yet, reloading metadata', object_full_name)
+            self.get_metadata()
+            row = _last_full_load_dt()
+
+        if row is not None and row.last_full_load_dt is None:
+            table = self.objects_table
+            with self.engine.begin() as conn:
                 conn.execute(update(table).where(table.c.object_full_name == object_full_name)
                              .values(full_load_is_required=True))
 
     def list_full_load_required(self) -> list[str]:
-        """Объекты, ожидающие полной выгрузки (требуется и не удалён из метаданных)."""
+        """Полные имена объектов, ожидающих полной выгрузки (full_load_is_required)."""
         table = self.objects_table
         with self.engine.connect() as conn:
             return list(conn.execute(
-                select(table.c.object_name)
+                select(table.c.object_full_name)
                 .where(table.c.full_load_is_required)).scalars())
 
-    def mark_full_loaded(self, object_name: str) -> None:
-        """Фиксирует успешную полную выгрузку: ставит last_full_load_dt=now(), снимает требование."""
+    def mark_full_loaded(self, object_full_name: str) -> None:
+        """Фиксирует успешную полную выгрузку: ставит last_full_load_dt=now(), снимает требование.
+        Ключ — полное имя (object_full_name), а не короткое: имена регистра и документа могут совпасть."""
         table = self.objects_table
         with self.engine.begin() as conn:
-            conn.execute(update(table).where(table.c.object_name == object_name)
+            conn.execute(update(table).where(table.c.object_full_name == object_full_name)
                          .values(last_full_load_dt=func.now(), full_load_is_required=False))
