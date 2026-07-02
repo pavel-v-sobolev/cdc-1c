@@ -172,7 +172,7 @@ class MetadataReader1C(UserDict):
         """
         Читаем поля объекта метаданных
         """
-        item_properties = item.get('Property')
+        item_properties = item.get('Property') or []
 
         properties = {}
         for item_property in item_properties:
@@ -184,7 +184,7 @@ class MetadataReader1C(UserDict):
             if GUESS_UUID_TYPES:
                 if property_name=='Recorder':
                     # Принудительно ставим Uuid для регистраторов, т.к. 1С почему-то присылает String
-                    property_type='Guid'            
+                    property_type='Guid'
 
             if property_type in type_mapping:
                 properties[property_name] = property_type
@@ -197,8 +197,8 @@ class MetadataReader1C(UserDict):
         if GUESS_UUID_TYPES:
             for property_name in properties.keys():
                 # Если мы видим что есть поле с постфиксом Type, то значит
-                # ищем такое же поле без постфикса, т.к. в этом случае это составной тип и нужно 
-                # изменить поле на Uuid т.к. 1С полчему-то присылает String          
+                # ищем такое же поле без постфикса, т.к. в этом случае это составной тип и нужно
+                # изменить поле на Uuid т.к. 1С почему-то присылает String
                 if property_name.endswith('_Type'):
                     uuid_property_name = property_name.removesuffix('_Type')
                     if uuid_property_name in properties.keys():
@@ -211,15 +211,13 @@ class MetadataReader1C(UserDict):
         """
         Читаем список ключевых полей объекта метаданных
         """
-        key = {}
         item_key = (item.get('Key') or {}).get('PropertyRef')
+        # Ключа может не быть (например, у сущности без объявленного Key) — тогда пустой список,
+        # иначе обращение к key_fields ниже упало бы с UnboundLocalError.
+        key_fields = ([k.get('@Name') for k in item_key if k.get('@Name') is not None]
+                      if item_key else [])
 
-        if item_key:
-            key_fields = [k.get('@Name') for k in item_key if k.get('@Name') is not None]
-
-        key = {k: properties[k] for k in key_fields if k in properties}
-
-        return key
+        return {k: properties[k] for k in key_fields if k in properties}
 
 
     def _get_object_key(self, item_name: str, properties: dict, primary_key: dict):

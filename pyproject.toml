@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
-    "dbmerge>=1.0.18",
+    "dbmerge>=1.0.20",
     "polars>=1.41.2",
     "psycopg2>=2.9.12",
     "requests>=2.33.0",

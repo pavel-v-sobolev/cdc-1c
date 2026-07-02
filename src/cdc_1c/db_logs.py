@@ -1,11 +1,14 @@
 """
 Лог-таблицы пайплайна в БД (общие хелперы на SQLAlchemy Core).
 
-- `replicator_1c_log` — лог загрузки: строка на объект (exchange, object, message_no) с временами
-  начала/окончания (серверное `func.now()`). finished_at=NULL у незавершённой/упавшей загрузки.
+- `replicator_1c_log` — лог загрузки: строка на каждую загрузку объекта. `type` — вид загрузки
+  (`changes` — пакет изменений, `full` — полная выгрузка); `message_no` — номер пакета обмена
+  (NULL для полной выгрузки); `started_at`/`finished_at` (серверное `func.now()`,
+  finished_at=NULL у незавершённой/упавшей); счётчики строк merge и `total_time` наращиваются
+  в БД по мере сохранений (см. Replicator1CLog.write_result).
 
 Время берётся серверным `func.now()` (на sqlite SQLAlchemy компилирует в CURRENT_TIMESTAMP).
-Схема на sqlite не поддерживается — приводится к None (как в dbmerge).
+Схема на sqlite не поддерживается (и schema=None) — приводится к None (как в dbmerge).
 """
 
 import logging
@@ -24,14 +27,15 @@ LOAD_TYPE_FULL = 'full'
 
 
 def _check_create_schema(engine: Engine, schema_name: str | None) -> str | None:
-    if engine.dialect.name not in ['sqlite']:
-        with engine.begin() as conn:
-            if not conn.dialect.has_schema(conn, schema_name):
-                logger.info(f"""Creating schema "{schema_name}".""")
-                conn.execute(schema.CreateSchema(schema_name))
-            return schema_name
-    else:
+    # sqlite схемы не поддерживает; schema_name=None — работаем в схеме БД по умолчанию (создавать
+    # нечего). В обоих случаях возвращаем None, не дёргая has_schema/CreateSchema с None.
+    if engine.dialect.name == 'sqlite' or schema_name is None:
         return None
+    with engine.begin() as conn:
+        if not conn.dialect.has_schema(conn, schema_name):
+            logger.info(f"""Creating schema "{schema_name}".""")
+            conn.execute(schema.CreateSchema(schema_name))
+    return schema_name
 
 
 

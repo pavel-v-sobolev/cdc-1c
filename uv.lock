@@ -37,7 +37,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "dbmerge", specifier = ">=1.0.18" },
+    { name = "dbmerge", specifier = ">=1.0.20" },
     { name = "polars", specifier = ">=1.41.2" },
     { name = "psycopg2", specifier = ">=2.9.12" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
@@ -172,15 +172,15 @@ wheels = [
 
 [[package]]
 name = "dbmerge"
-version = "1.0.19"
+version = "1.0.20"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "alembic" },
     { name = "sqlalchemy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a7/8e/caa02c6ec894d1c97f3bab61170365b72b67e5cf0c8d74d1573d0aa59766/dbmerge-1.0.19.tar.gz", hash = "sha256:e5ee212f1a1a638abc4c7ef3b1f6a961f154345486779d19c4a8ae206dbaaf53", size = 22859, upload-time = "2026-06-12T18:57:33.428Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/26/b8/ca996902809d8598663c99cb592091e424b452c16ea0b1c5e69f61ce777f/dbmerge-1.0.20.tar.gz", hash = "sha256:9df6a4823d1c849aa49de12eab5b50fa3fbd05dea290719532e7df5e1d3ca3b7", size = 25608, upload-time = "2026-07-02T10:07:56.288Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/23/16/de352344ca47f5d7455f47e4f96aa9747f1c7a30da2468a76206ec957db8/dbmerge-1.0.19-py3-none-any.whl", hash = "sha256:5e09ffa452fbd3c424ed8bacd5de8fa9627859174152ea6cffb3356901941526", size = 17262, upload-time = "2026-06-12T18:57:32.011Z" },
+    { url = "https://files.pythonhosted.org/packages/10/87/17fb932efc444d63fe765e21efe5abada36a6dd09d0e01b9e0242b0e9e64/dbmerge-1.0.20-py3-none-any.whl", hash = "sha256:3aed5995a41a0e9796256e72e570d1ad949052d3f2f075c7875226b0d79558d4", size = 19051, upload-time = "2026-07-02T10:07:54.96Z" },
 ]
 
 [[package]]

@@ -59,11 +59,19 @@ class ChangeReader1C(DataReader1C):
 
         queues = queues_data.get('value') or []
         receive_no = 0
+        found = False
 
         for queue in queues:
             if self.queue_guid == queue['Ref_Key']:
                 receive_no = int(queue['ReceivedNo'])
-        
+                found = True
+
+        if not found:
+            # Очередь по guid не нашлась — вернём 0 (запросится пакет №1), но это почти наверняка
+            # неверный queue_guid или план обмена: без предупреждения ошибку конфигурации не видно.
+            logger.warning("Exchange queue %s not found in plan %s (check queue_guid/exchange_name)",
+                           self.queue_guid, self.exchange_name)
+
         return receive_no
     
 

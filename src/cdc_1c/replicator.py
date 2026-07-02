@@ -3,6 +3,7 @@ import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import Engine, create_engine
 
@@ -70,7 +71,7 @@ class Replicator1C:
                                       self.metadata, odata_auth=self._odata_auth,
                                       request_timeout=self._request_timeout)
         self.writer = DBWriter1C(engine=self.engine, name_mapper=self.name_mapper,
-                                 data_reader=self.changes, schema=self.db_schema)
+                                 schema=self.db_schema)
         # Лог загрузки (строка на объект) пишет оркестратор: только здесь есть контекст обмена
         # (exchange_name/message_no), а writer универсален и может делать и полную перевыгрузку.
         self.replicator_log = Replicator1CLog(self.engine, self.db_schema)
@@ -94,7 +95,7 @@ class Replicator1C:
     def run_once(self, notify_changes: bool = True) -> None:
         """
         Один цикл: (load metadata при первом вызове) → read → save → notify. Подтверждение
-        получения отправляется только после успешного сохранения — если save_all упадёт, изменения
+        получения отправляется только после успешного сохранения — если save упадёт, изменения
         не подтверждаются и придут снова.
 
         Метаданные грузятся при первом вызове (первый сетевой запрос). В run_forever его падение
@@ -155,72 +156,135 @@ class Replicator1C:
 
     def list_objects(self) -> list[str]:
         """
-        Список имён объектов 1С, доступных для выгрузки (ключи метаданных: документы/справочники и
-        регистры). Метаданные при необходимости подгружаются (первый сетевой запрос). Удобно, чтобы
-        узнать, что передавать в full_load.
+        Список имён объектов 1С, доступных для выгрузки (документы/справочники и регистры). Табличные
+        части исключаются — у них нет отдельной OData-сущности, их нельзя выгрузить напрямую (они
+        приходят вложенно с владельцем). Метаданные при необходимости подгружаются (первый сетевой
+        запрос). Удобно, чтобы узнать, что передавать в full_load.
         """
         if not self.metadata.is_loaded:
             self.metadata.get_metadata()
-        return list(self.metadata.keys())
+        return [name for name, obj in self.metadata.items() if not obj.is_table_part]
 
-    def full_load(self, object_name: str, batch_size: int = 1000) -> None:
+    def full_load(self, object_name: str, batch_size: int = 1000,
+                  date_field: str | None = None,
+                  date_from: date | datetime | str | None = None,
+                  date_to: date | datetime | str | None = None) -> None:
         """
         Полная постраничная выгрузка объекта 1С в целевую таблицу: по batch_size записей за запрос,
-        каждая страница сразу сохраняется upsert-ом (без удаления). Идемпотентно — повторный прогон
-        обновляет строки по ключу. Удаления не делаются: при постраничном чтении нельзя отличить
-        «строки нет в источнике» от «строка на другой странице», поэтому writer.save(delete=False).
+        каждая страница сразу сохраняется через writer.save(full_load=True). Идемпотентно — повторный
+        прогон обновляет строки по ключу. Документ/справочник — чистый upsert; регистр/табличная часть —
+        own-or-skip группы целиком (группа умещается на одной странице), см. DBWriter1C.save.
 
         Документ/справочник выгружается вместе с табличными частями — они приходят вложенно в той же
         странице и сохраняются как отдельные объекты. Страницы берутся keyset-пагинацией (фильтр
-        «ключ больше последнего значения» вместо $skip — без перечитывания пропущенных строк на
-        больших объёмах): справочник/документ — по Ref_Key (guid), регистр — по Recorder (строка,
-        одна entry = целый набор записей регистратора). Один прогон = одна строка в replicator_1c_log
+        «ключ больше последней строки» вместо $skip — без перечитывания на больших объёмах): по
+        Ref_Key (справочник/документ), Recorder (регистраторный регистр) или составному первичному
+        ключу (независимый регистр) — см. _full_load_key. Один прогон = одна строка в replicator_1c_log
         (message_no=NULL — это не пакет обмена); finished_at проставляется после успеха всех страниц.
+
+        Версия и гонка с изменениями: строки выгрузки штампуются exchange_message_no=0, а save идёт с
+        full_load=True — с version-guard'ами по emn, чтобы устаревший снимок не затирал более свежие
+        изменения (emn>0) и не воскрешал удалённые строки групп (регистр/ТЧ). См. DBWriter1C.save.
+
+        Необязательный фильтр по периоду: date_field — имя поля даты/времени объекта (Date у
+        документов, Period у регистров), date_from/date_to — границы (datetime/date/ISO-строка,
+        включительно). Транслируется в OData $filter `date_field ge …[ and date_field le …]` и
+        объединяется с keyset-курсором по AND. Полезно для ручной догрузки за нужный период.
         """
         if not self.metadata.is_loaded:
             self.metadata.get_metadata()
 
-        # Ключ курсора: справочник/документ → Ref_Key (guid-литерал), регистр → Recorder (строковый).
-        key_field, key_is_guid = self._full_load_key(object_name)
+        # Ключ курсора: справочник/документ → [Ref_Key], регистраторный → [Recorder],
+        # независимый регистр → весь первичный ключ (составной keyset).
+        key_fields, key_types = self._full_load_key(object_name)
+        date_filter = self._build_date_filter(date_field, date_from, date_to)
 
         reader = DataReader1C(self._odata_url, self.metadata, odata_auth=self._odata_auth,
                               request_timeout=self._request_timeout)
+        # Полная выгрузка = базовая версия: emn=0 (ниже любого номера пакета изменений >=1).
+        reader.exchange_message_no = 0
 
         log_id = self.replicator_log.start(self._exchange_name, object_name, None, LOAD_TYPE_FULL)
-        logger.info("Full load of %s started (batch_size=%s, key=%s)",
-                    object_name, batch_size, key_field)
-        last_key = None
+        logger.info("Full load of %s started (batch_size=%s, key=%s, date_filter=%s)",
+                    object_name, batch_size, key_fields, date_filter)
+        after_values = None
         total = 0
         while True:
-            page = reader.read_object(object_name, top=batch_size, key_field=key_field,
-                                      after_key=last_key, key_is_guid=key_is_guid)
+            page = reader.read_object(object_name, top=batch_size, key_fields=key_fields,
+                                      after_values=after_values, key_types=key_types,
+                                      extra_filter=date_filter)
             for obj_name, data_object in reader.items():
                 # Много страниц/объектов пишутся в одну строку лога — счётчики суммируются в БД.
-                result = self.writer.save(obj_name, data_object, delete=False)
+                result = self.writer.save(obj_name, data_object, full_load=True)
                 self.replicator_log.write_result(log_id, result)
             total += page
             if page < batch_size:
                 break
-            # Курсор следующей страницы — ключ последней записи (порядок по ключу возрастающий).
-            last_key = reader[object_name].data[key_field][-1]
+            # Курсор следующей страницы — значения ключевых полей последней записи (порядок по ключу).
+            data = reader[object_name].data
+            after_values = [data[f][-1] for f in key_fields]
         self.replicator_log.write_result(log_id, finish=True)
         logger.info("Full load of %s finished (%s records)", object_name, total)
 
-    def _full_load_key(self, object_name: str) -> tuple[str, bool]:
+    @staticmethod
+    def _odata_datetime(value: date | datetime | str) -> str:
+        """OData-литерал datetime'YYYY-MM-DDTHH:MM:SS' из datetime/date (date → полночь) или строки.
+        1С хранит дату-время с точностью до секунды (без миллисекунд), поэтому формат — до секунд;
+        доли секунды у переданного datetime усекаются (для 1С безопасно)."""
+        if isinstance(value, (datetime, date)):
+            value = value.strftime('%Y-%m-%dT%H:%M:%S')
+        return f"datetime'{value}'"
+
+    @staticmethod
+    def _build_date_filter(date_field: str | None,
+                           date_from: date | datetime | str | None,
+                           date_to: date | datetime | str | None) -> str | None:
         """
-        Поле и тип литерала для keyset-курсора full_load по метаданным объекта:
-        - Ref_Key (справочник/документ) → ('Ref_Key', guid-литерал);
-        - Recorder (регистр) → ('Recorder', строковый литерал; Recorder в OData отдаётся строкой).
-        Иначе keyset неприменим (нет одиночного ключа курсора) → ValueError.
+        OData $filter по периоду (границы включительно). Возвращает None, если границы не заданы;
+        требует date_field, если задана хотя бы одна граница.
+
+        Верхняя граница date_to:
+        - чистая дата (date без времени) → включаем весь день целиком, даже если поле хранит
+          дату-время: `date_field lt <дата+1 день, полночь>` (иначе `le 2026-06-30T00:00:00`
+          отсекло бы все записи этого дня, кроме полуночи);
+        - дата-время или строка → используем как есть: `date_field le <to>`.
+        Нижняя граница date_from всегда включительна (`ge`); чистая дата = с начала дня (полночь).
+        """
+        if date_from is None and date_to is None:
+            return None
+        if not date_field:
+            raise ValueError("full_load: date_from/date_to require date_field")
+        clauses = []
+        if date_from is not None:
+            clauses.append(f"{date_field} ge {Replicator1C._odata_datetime(date_from)}")
+        if date_to is not None:
+            if isinstance(date_to, date) and not isinstance(date_to, datetime):
+                next_day = date_to + timedelta(days=1)
+                clauses.append(f"{date_field} lt {Replicator1C._odata_datetime(next_day)}")
+            else:
+                clauses.append(f"{date_field} le {Replicator1C._odata_datetime(date_to)}")
+        return " and ".join(clauses)
+
+    def _full_load_key(self, object_name: str) -> tuple[list[str], list[str]]:
+        """
+        Поля и их типы для keyset-курсора full_load по метаданным объекта (списки — для составного
+        ключа, см. read_object):
+        - Ref_Key (справочник/документ) → (['Ref_Key'], ['Guid']);
+        - Recorder (регистраторный регистр) → (['Recorder'], ['String']; Recorder в OData отдаётся
+          строкой, одна entry = набор регистратора);
+        - иначе (независимый регистр сведений) → весь первичный ключ: (список полей, список типов) —
+          составной лексикографический keyset, т.к. одиночного уникального курсора нет.
+        Пустой первичный ключ → ValueError.
         """
         metadata_obj = self.metadata.get(object_name)
         primary_key = metadata_obj.primary_key if metadata_obj else {}
         if 'Ref_Key' in primary_key:
-            return 'Ref_Key', True
+            return ['Ref_Key'], ['Guid']
         if 'Recorder' in primary_key:
-            return 'Recorder', False
-        raise ValueError(
-            f"full_load: no keyset cursor for {object_name} (need Ref_Key or Recorder in key)")
+            return ['Recorder'], ['String']
+        if primary_key:
+            return list(primary_key.keys()), list(primary_key.values())
+        raise ValueError(f"full_load: no primary key for {object_name}")
 
     def run_forever(self, interval: float = 60.0, max_iterations: int = 0) -> None:
         """

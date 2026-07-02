@@ -3,7 +3,7 @@ from __future__ import annotations
 import requests
 import logging
 from typing import Any
-from collections import UserDict, UserList
+from collections import UserDict
 from datetime import datetime, date
 from urllib.parse import quote
 import uuid
@@ -37,6 +37,39 @@ DELETION_MARK_FIELD = 'DeletionMark'
 IS_DELETED_OR_EMPTY_FIELD = 'is_deleted_or_empty'
 # Спец-поле: номер пакета обмена (message_no), проставляется во все записи при чтении изменений.
 EXCHANGE_MESSAGE_NO_FIELD = 'exchange_message_no'
+
+
+def _odata_literal(value: Any, type_name: str) -> str:
+    """
+    OData-литерал значения по типу поля (для keyset-фильтра): Guid → guid'…', DateTime → datetime'…',
+    числа — как есть, Boolean → true/false, остальное (String и пр.) — строка в кавычках (кавычка
+    внутри экранируется удвоением). value приходит уже сконвертированным (_convert_value): UUID/datetime.
+    """
+    if type_name == 'Guid':
+        return f"guid'{value}'"
+    if type_name == 'DateTime':
+        v = value.strftime('%Y-%m-%dT%H:%M:%S') if isinstance(value, (datetime, date)) else str(value)
+        return f"datetime'{v}'"
+    if type_name in ('Int64', 'Int16', 'Double'):
+        return str(value)
+    if type_name == 'Boolean':
+        return 'true' if value else 'false'
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _keyset_filter(key_fields: list[str], after_values: list, key_types: list[str]) -> str:
+    """
+    Лексикографический keyset-фильтр «строка ключа > последней строки предыдущей страницы» для
+    составного ключа (key_fields, порядок = порядок $orderby):
+        (k1 gt v1) or (k1 eq v1 and k2 gt v2) or (k1 eq v1 and k2 eq v2 and k3 gt v3) ...
+    Для одиночного ключа сводится к «k1 gt v1». Литералы — по типам key_types (_odata_literal).
+    """
+    terms = []
+    for i in range(len(key_fields)):
+        conj = [f"{key_fields[j]} eq {_odata_literal(after_values[j], key_types[j])}" for j in range(i)]
+        conj.append(f"{key_fields[i]} gt {_odata_literal(after_values[i], key_types[i])}")
+        terms.append(" and ".join(conj))
+    return " or ".join(f"({t})" if " and " in t else t for t in terms)
 
 
 class DataObject1C(UserDict):
@@ -143,32 +176,47 @@ class DataReader1C(UserDict):
         self.exchange_message_no = None  # номер пакета обмена, проставляется в записи при чтении изменений
 
     def read_object(self, object_name: str, top: int | None = None,
-                    key_field: str = 'Ref_Key', after_key: Any = None,
-                    key_is_guid: bool = True) -> int:
+                    key_fields: list[str] | None = None, after_values: list | None = None,
+                    key_types: list[str] | None = None, extra_filter: str | None = None) -> int:
         """
         Читает объект 1С в reader (предыдущее содержимое очищается). Постраничная выгрузка —
-        keyset-пагинация по key_field: сортировка по ключу, лимит $top, а следующая страница берётся
-        фильтром «ключ больше последнего значения предыдущей страницы» (after_key). В отличие от $skip
-        это не заставляет 1С перечитывать пропущенные строки — каждая страница читается за один
-        проход по индексу.
+        keyset-пагинация по составному ключу key_fields: сортировка по ключу ($orderby), лимит $top,
+        а следующая страница берётся лексикографическим фильтром «ключ больше последней строки
+        предыдущей страницы» (after_values). В отличие от $skip это не заставляет 1С перечитывать
+        пропущенные строки — каждая страница читается за один проход по индексу.
 
-        key_field/key_is_guid:
-        - справочник/документ: Ref_Key, guid-литерал (Ref_Key gt guid'...');
-        - регистр: Recorder, строковый литерал (Recorder gt '...') — в OData Recorder отдаётся строкой,
-          а одна entry регистра = целый набор записей регистратора, поэтому keyset по Recorder не рвёт
-          набор между страницами.
+        key_fields/key_types (порядок = порядок сортировки; типы — для литералов, см. _odata_literal):
+        - справочник/документ: ['Ref_Key'] / ['Guid'] (Ref_Key gt guid'...');
+        - регистраторный регистр: ['Recorder'] / ['String'] — в OData Recorder отдаётся строкой,
+          одна entry = целый набор записей регистратора, поэтому keyset по Recorder не рвёт набор;
+        - независимый регистр (нет Ref_Key/Recorder): весь первичный ключ (Period + измерения) —
+          составной keyset, т.к. одиночного уникального курсора нет.
+
+        extra_filter — дополнительный OData-фрагмент $filter (например, диапазон по дате), который
+        объединяется с keyset-условием по AND (составной keyset содержит OR — оборачиваем в скобки).
 
         Возвращает число прочитанных записей верхнего уровня (entry) — по нему вызывающий понимает,
         что страница последняя (меньше top).
         """
+        key_fields = key_fields or ['Ref_Key']
+        key_types = key_types or ['Guid'] * len(key_fields)
         params = []
         if top is not None:
             params.append(f"$top={top}")
-        params.append(f"$orderby={key_field}")
-        if after_key is not None:
-            # URL собираем строкой — кодируем пробелы сами (requests строку не кодирует).
-            literal = f"guid'{after_key}'" if key_is_guid else f"'{after_key}'"
-            params.append("$filter=" + quote(f"{key_field} gt {literal}", safe="'"))
+        params.append("$orderby=" + ','.join(key_fields))
+        # keyset-курсор и extra_filter объединяем по AND в один $filter.
+        filters = []
+        if after_values is not None:
+            keyset = _keyset_filter(key_fields, after_values, key_types)
+            # составной keyset содержит верхнеуровневый OR — оборачиваем в скобки, чтобы AND с
+            # extra_filter не исказил приоритет; одиночный ключ (без OR) оставляем как есть.
+            filters.append(f"({keyset})" if ' or ' in keyset else keyset)
+        if extra_filter:
+            filters.append(extra_filter)
+        if filters:
+            # URL собираем строкой — кодируем пробелы сами (requests строку не кодирует); двоеточия
+            # в datetime-литералах оставляем как есть (safe).
+            params.append("$filter=" + quote(" and ".join(filters), safe="':"))
         query = '?' + '&'.join(params)
         url = f"{self.odata_url}/{object_name}{query}"
         response = requests.get(url, auth=self.odata_auth, timeout=resolve_timeout(self.request_timeout))
@@ -187,7 +235,7 @@ class DataReader1C(UserDict):
             object_full_name = (object_entry.get('category') or {}).get('@term')
             object_name, object_type = parse_object_full_name(object_full_name)
 
-            logger.info(f'Parcing {object_name}')
+            logger.info(f'Parsing {object_name}')
 
             if object_name and self.metadata.get(object_name) is None:
                 self.metadata.get_metadata()
@@ -237,7 +285,7 @@ class DataReader1C(UserDict):
             logger.warning(f'Failed to convert value {value!r} to type {type_name}: {e}')
         return value
 
-    def _get_record_fields(self, properties: dict, object_name: str = None) -> dict:
+    def _get_record_fields(self, properties: dict, object_name: str | None = None) -> dict:
         if object_name not in self.metadata.keys():
             self.metadata.get_metadata()
             if object_name not in self.metadata.keys():
@@ -327,7 +375,13 @@ class DataReader1C(UserDict):
 
     def _get_register_records(self, object_name: str, properties: dict):
         """
-        Функция забирает записи регистра, которые приходят по одному регистратору. Записей может быть несколько.
+        Функция забирает записи регистра.
+
+        Регистраторный регистр приходит набором по одному регистратору (d:RecordSet с движениями);
+        пустой набор = набор удалён (фиктивная запись). Независимый регистр сведений приходит плоско —
+        поля прямо в properties, без Recorder/RecordSet, как у справочника/документа (форма прямого
+        чтения GET /InformationRegister_X — проверить на живой 1С).
+
         Текущий объект это словарь, в котором ключом является объект 1С, например "Document_ЗаказКлиента",
         значения содержат массив записей в виде list of dict.
         """
@@ -336,14 +390,17 @@ class DataReader1C(UserDict):
 
         records = (properties.get('d:RecordSet') or {}).get('d:element') or []
 
-        new_records = [self._get_record_fields(record, object_name) for record in records]
-
-        if not new_records:
-            # Если записей нет, то значит набор записей удален.
-            if recorder and recorder_type:
-                new_records = [self._make_deleted_register_record(object_name, recorder, recorder_type)]
-            else:
-                logger.error(f'No recorder or recorder type for {object_name}')
+        if records:
+            new_records = [self._get_record_fields(record, object_name) for record in records]
+        elif recorder and recorder_type:
+            # Регистраторный регистр с пустым набором — набор записей удалён.
+            new_records = [self._make_deleted_register_record(object_name, recorder, recorder_type)]
+        elif recorder is None:
+            # Независимый регистр сведений: одна плоская запись, поля прямо в properties.
+            new_records = [self._get_record_fields(properties, object_name)]
+        else:
+            logger.error(f'No recorder or recorder type for {object_name}')
+            new_records = []
 
         self._add_records(object_name, new_records)
 
