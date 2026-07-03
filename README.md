@@ -22,11 +22,14 @@ It engages standard ODATA mechanism and standard 1C exchange plan mechanism to e
 
 ```bash
 pip install cdc-1c
+
+# c драйвером PostgreSQL (тестовая СУБД):
+pip install "cdc-1c[postgres]"
 ```
 
-Поддерживается Python 3.10+. Модуль тестировался на PostgreSQL (`psycopg2` уже входит в зависимости),
-но целевой может быть любая БД из числа поддерживаемых модулем `dbmerge` — через него идёт запись;
-драйвер под свою СУБД ставите сами.
+Поддерживается Python 3.10+. Модуль тестировался на PostgreSQL, но целевой может быть любая БД из
+числа поддерживаемых модулем `dbmerge` (через него идёт запись). Сама библиотека драйвер БД не
+импортирует — его ставите под свою СУБД (для PostgreSQL — extra `[postgres]` выше).
 
 ## Быстрый старт
 

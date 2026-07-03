@@ -11,8 +11,6 @@ requires-python = ">=3.10"
 
 dependencies = [
     "dbmerge>=1.0.20",
-    "polars>=1.41.2",
-    "psycopg2>=2.9.12",
     "requests>=2.33.0",
     "sqlalchemy>=2.0.49",
     "xmltodict>=1.0.4",
@@ -30,7 +28,7 @@ license = "MIT"
 license-files = ["LICEN[CS]E*"]
 
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: MIT License",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
@@ -49,12 +47,23 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+# Драйвер PostgreSQL (сама библиотека его не импортирует — нужен пользовательскому engine).
+postgres = [
+    "psycopg2-binary>=2.9.12",
+]
 dev = [
     "pytest>=8",
 ]
 
+[project.urls]
+Homepage = "https://github.com/pavel-v-sobolev/cdc_1C"
+Repository = "https://github.com/pavel-v-sobolev/cdc_1C"
+Issues = "https://github.com/pavel-v-sobolev/cdc_1C/issues"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# По умолчанию гоняем только офлайн-тесты; live-тесты 1С/Postgres — под маркером integration.
+addopts = "-m 'not integration'"
 markers = [
     "integration: требует живого сервера 1С и Postgres (параметры из main.py)",
 ]
