@@ -158,6 +158,6 @@ rep.full_load("Document_РеализацияТоваровУслуг",
 В тоже время для задач DWH часто нужны данные с менее строгой нормализацией. 
 Поэтому тут предложены примеры кода, как сделать инкрементное обновление последующей целевой таблицы с денормализованными данными:
 
-Вариант с сохранением guid ключа в таблице фактов (materialize_example.py)
-Вариант с изменение ключа, использующий GROUP BY, но все равно быстрый и инкрементный (materialize_example_other_key.py)
+[Вариант с сохранением guid ключа в таблице фактов](https://github.com/pavel-v-sobolev/cdc-1c/blob/main/materialize_example.py)
+[Вариант с изменение ключа, использующий GROUP BY, но все равно оптимизированный и инкрементный](https://github.com/pavel-v-sobolev/cdc-1c/blob/main/materialize_example_other_key.py)
 
