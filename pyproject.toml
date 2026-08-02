@@ -47,13 +47,15 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# Драйвер PostgreSQL (сама библиотека его не импортирует — нужен пользовательскому engine).
 postgres = [
     "psycopg2-binary>=2.9.12",
 ]
 dev = [
     "pytest>=8",
 ]
+
+[project.scripts]
+cdc-1c = "cdc_1c.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/pavel-v-sobolev/cdc_1C"

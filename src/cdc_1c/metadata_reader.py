@@ -16,12 +16,12 @@ from cdc_1c.common_functions import parse_object_full_name
 logger = logging.getLogger(__name__)
 
 # Таймауты HTTP-запросов к 1С по умолчанию: (connect, read) в секундах. requests с timeout=None
-# висит бесконечно при недоступном сервере — именно поэтому процесс зависал на запросе метаданных.
+# висит бесконечно при недоступном сервере.
 # connect ограничивает ожидание установки соединения, read — ожидание ответа.
-# Метаданные ($metadata) — небольшой и быстрый запрос: ждать долго смысла нет, лучше быстро упасть
+# Метаданные ($metadata) — небольшой и быстрый запрос: ждать долго смысла нет.
 # на недоступной/зависшей 1С. Чтение данных/страниц выгрузки бывает объёмным — там read больше.
 # Применяется, когда request_timeout не задан явно (None).
-DEFAULT_METADATA_TIMEOUT: tuple[float, float] = (60, 120)
+DEFAULT_METADATA_TIMEOUT: tuple[float, float] = (60, 360)
 
 
 def resolve_timeout(request_timeout: float | tuple[float, float] | None):

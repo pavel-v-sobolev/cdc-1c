@@ -97,7 +97,7 @@ class DBWriter1C:
                          merged_on_field=MERGED_ON_FIELD, inserted_on_field=INSERTED_ON_FIELD,
                          delete_mode='no', schema=self.schema) as merge:
                 result = merge.exec(
-                    update_condition=self._version_guard(merge, emn) if full_load else None)
+                    update_condition=self._update_version_guard(merge, emn) if full_load else None)
         else:
             # Регистр/табличная часть: набор по object_key целиком заменяет существующий.
             # Удаляем строки только тех групп, что пришли в наборе, и которых больше нет в источнике.
@@ -110,32 +110,36 @@ class DBWriter1C:
                 if full_load:
                     # own-or-skip группы: не трогаем группы с более свежей версией (emn>0).
                     result = merge.exec(
-                        delete_condition=and_(scoped, self._not_newer(merge, emn)),
-                        update_condition=self._version_guard(merge, emn),
-                        insert_condition=self._group_not_newer(merge, mapped_object_key, emn))
+                        delete_condition=and_(scoped, self._delete_version_guard(merge, emn)),
+                        update_condition=self._update_version_guard(merge, emn),
+                        insert_condition=self._insert_version_guard(merge, mapped_object_key, emn))
                 else:
                     result = merge.exec(delete_condition=scoped)
 
         self._ensure_merged_on_index(table_name)
         return result
 
+    # Version-guard'ы полной выгрузки по exchange_message_no (emn): у изменений emn>=1, у полной
+    # выгрузки emn=0. Каждый передаётся в своё условие dbmerge (update/delete/insert).
+
     @staticmethod
-    def _version_guard(merge, emn: str):
-        """update только если целевая строка пустая по версии или не новее входящей (emn)."""
+    def _update_version_guard(merge, emn: str):
+        """update_condition: перезаписывать целевую строку, только если у неё ещё нет версии или
+        входящая версия не старше сохранённой (temp.emn >= target.emn) — свежее не затираем."""
         return or_(merge.table.c[emn].is_(None), merge.temp_table.c[emn] >= merge.table.c[emn])
 
     @staticmethod
-    def _not_newer(merge, emn: str):
-        """строку можно удалить полной выгрузкой, только если она не новее снимка (emn NULL или <=0)."""
+    def _delete_version_guard(merge, emn: str):
+        """delete_condition: полная выгрузка удаляет целевую строку, только если та не новее снимка —
+        т.е. это базовая строка выгрузки, а не строка от изменения (emn NULL или <=0)."""
         return or_(merge.table.c[emn].is_(None), merge.table.c[emn] <= 0)
 
     @staticmethod
-    def _group_not_newer(merge, mapped_object_key: list[str], emn: str):
-        """
-        Не вставлять строку в группу (по object_key), где уже есть строка от изменения (emn>0):
-        коррелированный NOT EXISTS по отдельному алиасу целевой таблицы (в insert-фазе строка
-        целевой таблицы по PK отсутствует, поэтому смотрим на группу через alias).
-        """
+    def _insert_version_guard(merge, mapped_object_key: list[str], emn: str):
+        """insert_condition: не вставлять строку в группу (по object_key), где уже есть строка от
+        изменения (emn>0) — иначе полная выгрузка воскресила бы удалённую изменением строку. В
+        insert-фазе строки по PK нет, поэтому «новизну» проверяем на уровне группы коррелированным
+        NOT EXISTS по отдельному алиасу целевой таблицы."""
         g = merge.table.alias()
         conds = [g.c[col] == merge.temp_table.c[col] for col in mapped_object_key]
         conds.append(g.c[emn] > 0)
