@@ -1,3 +1,7 @@
+[![PyPI version](https://img.shields.io/pypi/v/cdc-1c.svg)](https://pypi.org/project/cdc-1c/)
+[![Python versions](https://img.shields.io/pypi/pyversions/cdc-1c.svg)](https://pypi.org/project/cdc-1c/)
+
+
 **cdc-1c** is a docker container and a Python library, that provides 1C system data loading to data warehouse using Change Data Capture apporach. \
 It engages standard ODATA mechanism and standard 1C exchange plan mechanism to extract data from 1C system and upsert changes to the target DB.
 
