@@ -180,8 +180,8 @@ def test_read_object_keyset_url(monkeypatch):
     captured = {}
 
     class _Resp:
+        ok = True
         text = '<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
-        def raise_for_status(self): pass
 
     def fake_get(url, **kwargs):
         captured["url"] = url
@@ -308,8 +308,8 @@ def test_read_object_combines_keyset_and_extra_filter(monkeypatch):
     captured = {}
 
     class _Resp:
+        ok = True
         text = '<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
-        def raise_for_status(self): pass
 
     monkeypatch.setattr("cdc_1c.data_reader.requests.get",
                         lambda url, **kw: captured.__setitem__("url", url) or _Resp())

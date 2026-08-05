@@ -5,6 +5,7 @@ import xmltodict
 
 from cdc_1c.data_reader import DataReader1C
 from cdc_1c.metadata_reader import MetadataReader1C, resolve_timeout
+from cdc_1c.common_functions import raise_for_status
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ class ChangeReader1C(DataReader1C):
         url = f"{self.odata_url}/SelectChanges?DataExchangePoint='{self.odata_url}/ExchangePlan_{self.exchange_name}(guid'{self.queue_guid}')'&MessageNo={self.message_no}"
 
         response = requests.post(url,auth=self.odata_auth,timeout=resolve_timeout(self.request_timeout))
-        response.raise_for_status()
+        raise_for_status(response, f'SelectChanges (message {self.message_no})')
 
         change_data = xmltodict.parse(response.text,force_list=('d:element','entry'))
         change_entries = (change_data.get('feed') or {}).get('entry') or []
@@ -44,7 +45,7 @@ class ChangeReader1C(DataReader1C):
         response = requests.post(url,auth=self.odata_auth,timeout=resolve_timeout(self.request_timeout))
         # Не-2xx -> HTTPError. Подтверждение не прошло — изменения не списаны и придут снова
         # (в run_forever цикл повторится, save идемпотентен).
-        response.raise_for_status()
+        raise_for_status(response, f'NotifyChangesReceived (message {self.message_no})')
         logger.info(f"Changes confirmed for queue {self.queue_guid} (message {self.message_no})")
 
 
@@ -54,7 +55,7 @@ class ChangeReader1C(DataReader1C):
         """
         url = f"{self.odata_url}/ExchangePlan_{self.exchange_name}?$format=json"
         response = requests.get(url,auth=self.odata_auth,timeout=resolve_timeout(self.request_timeout))
-        response.raise_for_status()
+        raise_for_status(response, f'ExchangePlan_{self.exchange_name}')
         queues_data = response.json()
 
         queues = queues_data.get('value') or []

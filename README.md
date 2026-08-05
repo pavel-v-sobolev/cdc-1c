@@ -49,7 +49,7 @@ rep = Replicator1C(
     queue_guid="a9bc23c5-3689-11f1-926c-0800270bc6cb",  # Ref_Key узла обмена (очереди)
     engine=engine,
     db_schema="cdc_1c",                    # None → схема БД по умолчанию (public у Postgres)
-    request_timeout=60,                    # таймаут HTTP-запросов к 1С, сек (по умолчанию = interval)
+    request_timeout=60,                    # таймаут HTTP-запросов к 1С, сек (по умолчанию 60 на коннект, 900 на ответ)
     full_load_workers=2,                   # число фоновых потоков полной выгрузки
 )
 

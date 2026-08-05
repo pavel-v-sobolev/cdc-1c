@@ -12,7 +12,7 @@ import xmltodict
 
 from cdc_1c.metadata_reader import MetadataReader1C, resolve_timeout
 from cdc_1c.name_mapper import NameMapper1C
-from cdc_1c.common_functions import parse_object_full_name
+from cdc_1c.common_functions import parse_object_full_name, raise_for_status
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +223,7 @@ class DataReader1C(UserDict):
         query = '?' + '&'.join(params)
         url = f"{self.odata_url}/{object_name}{query}"
         response = requests.get(url, auth=self.odata_auth, timeout=resolve_timeout(self.request_timeout))
-        response.raise_for_status()
+        raise_for_status(response, f'read {object_name}{query}')
 
         object_data = xmltodict.parse(response.text, force_list=('d:element', 'entry'))
         object_entries = (object_data.get('feed') or {}).get('entry') or []

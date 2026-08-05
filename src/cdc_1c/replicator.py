@@ -18,6 +18,25 @@ from cdc_1c.logging_config import _ensure_handler
 
 logger = logging.getLogger(__name__)
 
+# Ретрай упавшего цикла (run_forever): экспоненциальная пауза вместо слепого повтора каждые
+# interval секунд. Неудачный SelectChanges — это не бесплатная попытка: 1С успевает отработать
+# минуты на таблице регистрации изменений, и повторы начинают накладываться друг на друга,
+# порождая уже конфликты блокировок. Пауза удваивается до потолка и сбрасывается после успеха.
+BACKOFF_FACTOR = 2.0
+DEFAULT_MAX_BACKOFF = 1800.0
+
+# HTTP-коды, при которых повтор того же запроса бессмысленен: права, адрес, состав запроса.
+# Такие ошибки сразу уводят паузу на потолок — процесс живёт (перезапуск ничего не чинит),
+# но 1С не долбим. Всё остальное (таймаут, обрыв, 5xx, конфликт блокировок) считаем временным.
+PERMANENT_HTTP_CODES = frozenset((400, 401, 403, 404, 405, 501))
+
+
+def _is_permanent_error(exc: BaseException) -> bool:
+    """Ошибка, которую ретрай не исправит (см. PERMANENT_HTTP_CODES)."""
+    response = getattr(exc, 'response', None)
+    status = getattr(response, 'status_code', None)
+    return status in PERMANENT_HTTP_CODES
+
 
 class Replicator1C:
     """
@@ -51,8 +70,7 @@ class Replicator1C:
         self._queue_guid = queue_guid
         # odata_auth — кортеж (user, password) либо None, как в ридерах (передаётся им как есть).
         self._odata_auth = odata_auth
-        # None → таймаут не задан явно: run_forever возьмёт его равным interval; одиночный
-        # run_once без явного значения работает без таймаута (поведение requests по умолчанию).
+        # None → таймаут не задан явно: ридеры подставят DEFAULT_REQUEST_TIMEOUT (metadata_reader).
         self._request_timeout = request_timeout
 
         # Компоненты строятся сразу, но в сеть не ходят: MetadataReader1C создаётся пустым,
@@ -286,50 +304,59 @@ class Replicator1C:
             return list(primary_key.keys()), list(primary_key.values())
         raise ValueError(f"full_load: no primary key for {object_name}")
 
-    def run_forever(self, interval: float = 60.0, max_iterations: int = 0) -> None:
+    def run_forever(self, interval: float = 60.0, max_iterations: int = 0,
+                    max_backoff: float = DEFAULT_MAX_BACKOFF) -> None:
         """
         Цикл run_once с паузой interval секунд. Упавший цикл логируется и не подтверждается —
         повтор на следующей итерации. Корректно завершается по SIGTERM/SIGINT.
+
+        Повтор после падения — с экспоненциальной паузой (BACKOFF_FACTOR, потолок max_backoff),
+        которая сбрасывается до interval после успешного цикла. Ошибки прав/адреса
+        (PERMANENT_HTTP_CODES) уводят паузу на потолок сразу: повтор их не исправит.
+        При interval=0 (тесты, прогон без пауз) backoff не применяется.
 
         max_iterations ограничивает число итераций (0 — бесконечно). Итерацией считается каждый
         вызов run_once, включая упавший на коннекте: ретрай подключения к недоступной 1С — это
         и есть итерация (внутри run_once своих ретраев нет), поэтому max_iterations ограничивает
         и число попыток подключения. Полезно для отладки/тестов.
 
-        Если таймаут запросов явно не задан в конструкторе, он берётся равным interval: запрос не
-        должен висеть дольше периода опроса (иначе зависший сервер не даст циклу дойти до ретрая).
+        Таймаут запросов с interval не связан: пакет изменений обрабатывается сколько нужно,
+        а не «не дольше периода опроса». Если он не задан в конструкторе, ридеры подставляют
+        DEFAULT_REQUEST_TIMEOUT (см. metadata_reader).
 
         После каждого цикла фоном (пул потоков) запускаются полные выгрузки помеченных объектов —
         диспетчеризация только здесь (одиночный run_once лишь взводит флаги).
         """
-        # Таймаут запросов по умолчанию = период опроса (см. докстринг). interval=0 (без пауз,
-        # обычно в тестах) таймаутом быть не может — оставляем None (ридеры подставят дефолт).
-        # Ридеры metadata/changes уже построены в __init__ со старым значением, поэтому обновляем
-        # их .request_timeout явно — иначе переопределение «= interval» до них не доходит.
-        if self._request_timeout is None and interval > 0:
-            self._request_timeout = interval
-            self.metadata.request_timeout = self._request_timeout
-            self.changes.request_timeout = self._request_timeout
-
         stop = _StopSignal()
         logger.info("Starting replication loop (interval=%ss, max_iterations=%s, timeout=%ss)",
                     interval, max_iterations, self._request_timeout)
         iterations = 0
+        delay = interval
         with ThreadPoolExecutor(max_workers=self._full_load_workers,
                                 thread_name_prefix='full_load') as executor:
             while not stop.requested:
                 try:
                     self.run_once()
                     self._dispatch_full_loads(executor)
-                except Exception:
-                    logger.exception("Replication cycle failed, will retry")
+                    delay = interval
+                except Exception as exc:
+                    if interval <= 0:
+                        logger.exception("Replication cycle failed, will retry")
+                    elif _is_permanent_error(exc):
+                        delay = max_backoff
+                        logger.exception(
+                            "Replication cycle failed with a permanent error (check credentials, "
+                            "rights and exchange plan settings), retry in %ss", delay)
+                    else:
+                        delay = min(max(delay, interval) * BACKOFF_FACTOR, max_backoff)
+                        logger.exception("Replication cycle failed, retry in %ss", delay)
 
                 iterations += 1
                 if max_iterations > 0 and iterations >= max_iterations:
                     logger.info("Reached max_iterations (%s), stopping", max_iterations)
                     break
 
-                stop.wait(interval)
+                stop.wait(delay)
             logger.info("Replication loop stopping, waiting for full loads to finish")
         logger.info("Replication loop stopped")
 

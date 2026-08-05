@@ -11,23 +11,24 @@ from sqlalchemy.dialects.postgresql import JSONB
 from dbmerge import dbmerge
 
 from cdc_1c.name_mapper import NameMapper1C
-from cdc_1c.common_functions import parse_object_full_name
+from cdc_1c.common_functions import parse_object_full_name, raise_for_status
 
 logger = logging.getLogger(__name__)
 
 # Таймауты HTTP-запросов к 1С по умолчанию: (connect, read) в секундах. requests с timeout=None
 # висит бесконечно при недоступном сервере.
 # connect ограничивает ожидание установки соединения, read — ожидание ответа.
-# Метаданные ($metadata) — небольшой и быстрый запрос: ждать долго смысла нет.
-# на недоступной/зависшей 1С. Чтение данных/страниц выгрузки бывает объёмным — там read больше.
+# Read — 15 минут: пакет изменений или страница полной выгрузки бывает реально большой,
+# и 1С формирует его долго; таймаут должен ловить зависший сервер, а не медленный ответ.
+# С периодом опроса это не связано: цикл опроса может быть заметно короче обработки пакета.
 # Применяется, когда request_timeout не задан явно (None).
-DEFAULT_METADATA_TIMEOUT: tuple[float, float] = (60, 360)
+DEFAULT_REQUEST_TIMEOUT: tuple[float, float] = (60, 900)
 
 
 def resolve_timeout(request_timeout: float | tuple[float, float] | None):
     """request_timeout как есть, либо default, если он не задан (None).
     Гарантирует, что ни один HTTP-запрос не уходит в requests с timeout=None (вечное ожидание)."""
-    return DEFAULT_METADATA_TIMEOUT if request_timeout is None else request_timeout
+    return DEFAULT_REQUEST_TIMEOUT if request_timeout is None else request_timeout
 
 
 # Таблица-реестр объектов 1С и состояния их полной выгрузки (см. MetadataReader1C).
@@ -265,7 +266,7 @@ class MetadataReader1C(UserDict):
         url = f'{self.odata_url}/$metadata'
         response = requests.get(url,auth=self.odata_auth,
                                 timeout=resolve_timeout(self.request_timeout))
-        response.raise_for_status()
+        raise_for_status(response, '$metadata')
 
         metadata = xmltodict.parse(response.text,force_list=('Property','PropertyRef','ComplexType'))
         metadata_schema = ((metadata.get('edmx:Edmx') or {}).get('edmx:DataServices') or {}).get('Schema') or {}
