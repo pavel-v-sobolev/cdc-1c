@@ -174,6 +174,9 @@ class DataReader1C(UserDict):
         self.odata_auth = odata_auth
         self.request_timeout = request_timeout
         self.exchange_message_no = None  # номер пакета обмена, проставляется в записи при чтении изменений
+        # Объекты, ради неизвестного поля которых метаданные уже перечитывались (см. _get_record_fields).
+        # Без этого каждая запись с полем вне $metadata давала бы свой полный GET $metadata + dbmerge.
+        self._metadata_refreshed_for: set[str] = set()
 
     def read_object(self, object_name: str, top: int | None = None,
                     key_fields: list[str] | None = None, after_values: list | None = None,
@@ -309,12 +312,17 @@ class DataReader1C(UserDict):
                     value = v
 
                 if field_name not in metadata_obj.keys():
-                    # поле не найдено в метаданных, пробуем их перечитать.
-                    self.metadata.get_metadata()
-                    metadata_obj = self.metadata[object_name]
+                    # поле не найдено в метаданных, пробуем их перечитать — но не более одного раза
+                    # на объект, иначе поле, которого в $metadata нет вовсе (например, отброшенный
+                    # по неизвестному типу реквизит), даёт по запросу метаданных на каждую запись.
+                    if object_name not in self._metadata_refreshed_for:
+                        self._metadata_refreshed_for.add(object_name)
+                        self.metadata.get_metadata()
+                        metadata_obj = self.metadata[object_name]
                     if field_name not in metadata_obj.keys():
                         logger.warning(f'Metadata field {field_name} not found for object {object_name}')
-                        
+
+
                 type_name = metadata_obj.get(field_name) or 'String'
 
                 converted = self._convert_value(value, type_name)

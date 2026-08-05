@@ -38,8 +38,18 @@ type_mapping = {'Guid':Uuid(),
                 'Int16':SmallInteger(),
                 'String':String(),
                 'Double':Numeric(),
-                'Boolean':Boolean(), 
-                'DateTime':DateTime()}
+                'Boolean':Boolean(),
+                'DateTime':DateTime(),
+                # ХранилищеЗначения публикуется парой полей: <Имя> (Edm.Stream, см. IGNORED_TYPES)
+                # и <Имя>_Base64Data (Edm.Binary). Binary реально приходит в теле ответа
+                # base64-строкой (в ней бывает JSON или XML-сериализация 1С), поэтому храним как текст.
+                'Binary':String()}
+
+# Типы, которых нет в данных: их нельзя отобразить в колонку, но это не ошибка метаданных.
+# Collection — табличная часть, читается отдельным объектом.
+# Stream — media-link (ХранилищеЗначения): в m:properties не приходит никогда,
+# значение доступно только отдельным GET по ссылке.
+IGNORED_TYPES = ('Collection', 'Stream')
 
 GUESS_UUID_TYPES = True
 # Проблема в том, что 1С часть GUID полей присылает как строки в описании метаданных.
@@ -168,10 +178,11 @@ class MetadataReader1C(UserDict):
         self.objects_table = None
 
 
-    def _read_metadata_item_properties(self, item:dict):
+    def _read_metadata_item_properties(self, item:dict, item_name: str | None = None):
         """
         Читаем поля объекта метаданных
         """
+        item_name = item_name or item.get('@Name')
         item_properties = item.get('Property') or []
 
         properties = {}
@@ -188,11 +199,12 @@ class MetadataReader1C(UserDict):
 
             if property_type in type_mapping:
                 properties[property_name] = property_type
+            elif property_type.startswith(IGNORED_TYPES):
+                # ожидаемо не отображается в колонку (табличная часть / media-link), не ошибка
+                logger.debug(f'Property {item_name}.{property_name} of type {property_type} '
+                             f'is not stored as a column')
             else:
-                if not property_type.startswith('Collection'):
-                # если это collection, то значит это просто табличная часть, она будет отдельно
-                # если нет, то показываем ошибку, т.к. это похоже на неизвестный тип
-                    logger.error(f'Property {property_name} has unknown type {property_type}')
+                logger.error(f'Property {item_name}.{property_name} has unknown type {property_type}')
             
         if GUESS_UUID_TYPES:
             for property_name in properties.keys():
@@ -272,7 +284,7 @@ class MetadataReader1C(UserDict):
             if item_name.startswith(REGISTER_TYPES) and item_name.endswith("_RecordType"):
             # регистр с постфиксом RecordType содержит описание полей регистра и описание ключа
                 item_name = item_name.removesuffix("_RecordType")
-                properties = self._read_metadata_item_properties(item)
+                properties = self._read_metadata_item_properties(item, item_name)
                 primary_key = self._read_metadata_item_key(item,properties)
                 object_key = self._get_object_key(item_name, properties, primary_key)
                 dimensions, resources, attributes = _classify_register_fields(
@@ -284,7 +296,7 @@ class MetadataReader1C(UserDict):
             # если документ или справочник без постфикса, то
             # читаем его описание полей и ключ
             # (также может быть табличная часть документа или справочника)
-                properties = self._read_metadata_item_properties(item)
+                properties = self._read_metadata_item_properties(item, item_name)
                 primary_key = self._read_metadata_item_key(item,properties)
                 object_key = self._get_object_key(item_name, properties, primary_key)
                 is_table_part = _check_object_is_table_part(item_name, complextypes)
