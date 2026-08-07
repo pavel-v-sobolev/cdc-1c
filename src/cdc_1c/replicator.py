@@ -290,6 +290,8 @@ class Replicator1C:
         - Ref_Key (справочник/документ) → (['Ref_Key'], ['Guid']);
         - Recorder (регистраторный регистр) → (['Recorder'], ['String']; Recorder в OData отдаётся
           строкой, одна entry = набор регистратора);
+        - Recorder_Key (тот же регистраторный регистр, но с единственным типом регистратора — 1С
+          отдаёт поле как Guid и без Recorder_Type) → (['Recorder_Key'], ['Guid']);
         - иначе (независимый регистр сведений) → весь первичный ключ: (список полей, список типов) —
           составной лексикографический keyset, т.к. одиночного уникального курсора нет.
         Пустой первичный ключ → ValueError.
@@ -300,6 +302,8 @@ class Replicator1C:
             return ['Ref_Key'], ['Guid']
         if 'Recorder' in primary_key:
             return ['Recorder'], ['String']
+        if 'Recorder_Key' in primary_key:
+            return ['Recorder_Key'], ['Guid']
         if primary_key:
             return list(primary_key.keys()), list(primary_key.values())
         raise ValueError(f"full_load: no primary key for {object_name}")

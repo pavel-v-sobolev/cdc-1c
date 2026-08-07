@@ -119,6 +119,17 @@ def test_full_load_register_paging(monkeypatch):
     assert [c["after_values"] for c in calls] == [None, page_last_key[0]]
 
 
+def test_full_load_key_recorder_key():
+    # Регистр с единственным типом регистратора: 1С отдаёт Recorder_Key (Guid) вместо
+    # Recorder/Recorder_Type — курсор всё равно должен быть по регистратору, а не составной.
+    rep = _replicator()
+    rep.metadata["InformationRegister_R"] = MetadataObject1C(
+        "InformationRegister_R", {"Recorder_Key": "Guid", "Period": "DateTime"},
+        {"Recorder_Key": "Guid", "Period": "DateTime"}, object_key=["Recorder_Key"])
+
+    assert rep._full_load_key("InformationRegister_R") == (["Recorder_Key"], ["Guid"])
+
+
 def test_full_load_empty_object(monkeypatch):
     rep = _replicator()
 

@@ -38,6 +38,17 @@ IS_DELETED_OR_EMPTY_FIELD = 'is_deleted_or_empty'
 # Спец-поле: номер пакета обмена (message_no), проставляется во все записи при чтении изменений.
 EXCHANGE_MESSAGE_NO_FIELD = 'exchange_message_no'
 
+# Поля регистратора в OData. 1С называет их по-разному в зависимости от того, сколько типов
+# документов может быть регистратором регистра:
+# - несколько типов (составная ссылка) -> Recorder (строка) + Recorder_Type (имя типа);
+# - единственный тип -> Recorder_Key (Guid), без Recorder_Type.
+RECORDER_FIELDS = ('Recorder', 'Recorder_Key')
+RECORDER_TYPE_FIELD = 'Recorder_Type'
+# Набор записей регистра в entry регистраторного регистра (у независимого регистра его нет).
+RECORD_SET_FIELD = 'd:RecordSet'
+# Пустая ссылка 1С — нулевой GUID (в данных 1С отдаёт именно его).
+EMPTY_UUID = uuid.UUID(int=0)
+
 
 def _odata_literal(value: Any, type_name: str) -> str:
     """
@@ -327,6 +338,12 @@ class DataReader1C(UserDict):
 
                 converted = self._convert_value(value, type_name)
 
+                if converted is None and field_name in metadata_obj.primary_key:
+                    # Поля первичного ключа в целевой таблице NOT NULL, а пустую ссылку 1С
+                    # (нулевой GUID) _convert_value превращает в None — для ключа оставляем
+                    # дефолт по типу (нулевой GUID), иначе строка не вставится.
+                    converted = self._default_key_value(type_name)
+
                 fields[field_name] = converted
 
         # Спец-поле: для документов/справочников True по пометке удаления,
@@ -338,8 +355,9 @@ class DataReader1C(UserDict):
 
     @staticmethod
     def _default_key_value(type_name: str) -> Any:
-        # Дефолтное значение поля ключа для удаленной записи регистра:
-        # '' для строк, 0 для чисел, чтобы получить непустой составной ключ.
+        # Дефолтное значение поля ключа (удаленная запись регистра, пустая ссылка в ключе):
+        # '' для строк, 0 для чисел, нулевой GUID для ссылок — чтобы получить непустой
+        # составной ключ (в целевой таблице поля ключа NOT NULL).
         if type_name == 'String':
             return ''
         if type_name in ('Int64', 'Int16', 'Double'):
@@ -348,21 +366,39 @@ class DataReader1C(UserDict):
             return False
         if type_name == 'DateTime':
             return datetime(1, 1, 1)  # пустая дата 1С
-        return None  # Guid (Recorder перекрывается ниже) и прочее
+        if type_name == 'Guid':
+            return EMPTY_UUID  # пустая ссылка 1С
+        return None
 
-    def _make_deleted_register_record(self, object_name: str, recorder: str, recorder_type: str) -> dict:
+    def _make_deleted_register_record(self, object_name: str, properties: dict) -> dict | None:
         """
         Создает запись для удаленного набора записей регистра (пришел пустой RecordSet).
-        Заполняет полный первичный ключ из метаданных дефолтами по типу поля
-        и проставляет реальные Recorder и Recorder_Type.
-        """
-        primary_key = self.metadata[object_name].primary_key
-        record = {field: self._default_key_value(type_name)
-                  for field, type_name in primary_key.items()}
+        Заполняет полный первичный ключ из метаданных дефолтами по типу поля и проставляет
+        реальные поля регистратора из entry: Recorder + Recorder_Type (составной регистратор)
+        либо Recorder_Key (единственный тип регистратора, см. RECORDER_FIELDS).
 
-        recorder_name, _ = parse_object_full_name(recorder_type)
-        record['Recorder'] = recorder
-        record['Recorder_Type'] = recorder_name
+        Возвращает None, если полей регистратора в entry нет — тогда непонятно, чей набор
+        удалять, и фиктивную запись создавать нельзя (ключ остался бы пустым).
+        """
+        metadata_obj = self.metadata[object_name]
+        record = {field: self._default_key_value(type_name)
+                  for field, type_name in metadata_obj.primary_key.items()}
+
+        recorder_found = False
+        for field in RECORDER_FIELDS:
+            value = properties.get('d:' + field)
+            if isinstance(value, str):
+                record[field] = self._convert_value(value, metadata_obj.get(field) or 'Guid')
+                recorder_found = True
+
+        recorder_type = properties.get('d:' + RECORDER_TYPE_FIELD)
+        if isinstance(recorder_type, str):
+            record[RECORDER_TYPE_FIELD], _ = parse_object_full_name(recorder_type)
+
+        if not recorder_found:
+            logger.error(f'No recorder field in empty record set of {object_name}')
+            return None
+
         record[IS_DELETED_OR_EMPTY_FIELD] = True
         record[EXCHANGE_MESSAGE_NO_FIELD] = self.exchange_message_no
         return record
@@ -387,28 +423,29 @@ class DataReader1C(UserDict):
 
         Регистраторный регистр приходит набором по одному регистратору (d:RecordSet с движениями);
         пустой набор = набор удалён (фиктивная запись). Независимый регистр сведений приходит плоско —
-        поля прямо в properties, без Recorder/RecordSet, как у справочника/документа (форма прямого
-        чтения GET /InformationRegister_X — проверить на живой 1С).
+        поля прямо в properties, без RecordSet, как у справочника/документа (форма прямого
+        чтения GET /InformationRegister_X).
+
+        Признак регистраторного регистра — наличие RecordSet, а не Recorder: поле регистратора 1С
+        называет то Recorder (+Recorder_Type), то Recorder_Key — см. RECORDER_FIELDS.
 
         Текущий объект это словарь, в котором ключом является объект 1С, например "Document_ЗаказКлиента",
         значения содержат массив записей в виде list of dict.
         """
-        recorder = properties.get('d:Recorder')
-        recorder_type = properties.get('d:Recorder_Type')
+        if RECORD_SET_FIELD not in properties:
+            # Независимый регистр сведений: одна плоская запись, поля прямо в properties.
+            self._add_records(object_name, [self._get_record_fields(properties, object_name)])
+            return
 
-        records = (properties.get('d:RecordSet') or {}).get('d:element') or []
+        record_set = properties.get(RECORD_SET_FIELD)
+        records = (record_set.get('d:element') or []) if isinstance(record_set, dict) else []
 
         if records:
             new_records = [self._get_record_fields(record, object_name) for record in records]
-        elif recorder and recorder_type:
-            # Регистраторный регистр с пустым набором — набор записей удалён.
-            new_records = [self._make_deleted_register_record(object_name, recorder, recorder_type)]
-        elif recorder is None:
-            # Независимый регистр сведений: одна плоская запись, поля прямо в properties.
-            new_records = [self._get_record_fields(properties, object_name)]
         else:
-            logger.error(f'No recorder or recorder type for {object_name}')
-            new_records = []
+            # Регистраторный регистр с пустым набором — набор записей удалён.
+            deleted_record = self._make_deleted_register_record(object_name, properties)
+            new_records = [deleted_record] if deleted_record is not None else []
 
         self._add_records(object_name, new_records)
 

@@ -67,9 +67,12 @@ METADATA_POSTFIXES = ('_RecordType','_RowType','_Balance','_Turnover','_BalanceA
 ODATA_PREFIX = 'StandardODATA.'
 TYPE_PREFIX = 'Edm.'
 
+# Поля регистратора в OData: Recorder (+Recorder_Type), если регистратором может быть несколько
+# типов документов, и Recorder_Key (Guid, без Recorder_Type), если тип регистратора единственный.
+RECORDER_FIELDS = ('Recorder', 'Recorder_Key', 'Recorder_Type')
 # Системные поля движений регистра (не измерения/ресурсы/реквизиты).
 SYSTEM_REGISTER_FIELDS = frozenset(
-    ('Recorder', 'Period', 'LineNumber', 'Active', 'RecordType', 'Recorder_Type'))
+    ('Period', 'LineNumber', 'Active', 'RecordType') + RECORDER_FIELDS)
 # Поля period-спайна в виртуальной таблице _Turnover (агрегаты по периодам, не измерения).
 TURNOVER_PERIOD_FIELDS = frozenset(
     ('Period', 'SecondPeriod', 'MinutePeriod', 'HourPeriod', 'DayPeriod', 'WeekPeriod',
@@ -237,12 +240,13 @@ class MetadataReader1C(UserDict):
         """
         Ключ для scoped-удаления при merge (delete_condition в dbmerge).
         Изменения приходят группами, которые целиком заменяют существующие строки:
-        - регистр: набор записей одного регистратора -> Recorder (+ Recorder_Type);
+        - регистр: набор записей одного регистратора -> Recorder (+ Recorder_Type) либо
+          Recorder_Key, смотря как 1С назвала поле регистратора (см. RECORDER_FIELDS);
         - табличная часть (ключ Ref_Key + ещё поля) -> Ref_Key владельца;
         - документ/справочник (единственная запись по Ref_Key) -> None, удаление не нужно.
         """
         if item_name.startswith(REGISTER_TYPES):
-            return [c for c in ('Recorder', 'Recorder_Type') if c in properties]
+            return [c for c in RECORDER_FIELDS if c in properties]
         if 'Ref_Key' in primary_key and len(primary_key) > 1:
             return ['Ref_Key']
         return None
