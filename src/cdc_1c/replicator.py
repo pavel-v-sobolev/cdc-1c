@@ -5,6 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 
+import requests
 from sqlalchemy import Engine, create_engine
 
 from cdc_1c.metadata_reader import MetadataReader1C
@@ -29,6 +30,25 @@ DEFAULT_MAX_BACKOFF = 1800.0
 # Такие ошибки сразу уводят паузу на потолок — процесс живёт (перезапуск ничего не чинит),
 # но 1С не долбим. Всё остальное (таймаут, обрыв, 5xx, конфликт блокировок) считаем временным.
 PERMANENT_HTTP_CODES = frozenset((400, 401, 403, 404, 405, 501))
+
+# Полная выгрузка: во сколько раз уменьшать страницу, если 1С не осилила запрос, и нижний предел.
+# Страницу объекта 1С собирает целиком во временных файлах на сервере приложений, а её объём
+# зависит не от batch_size, а от того, сколько строк тянется вместе с одной записью: у документа
+# с табличными частями entry — это сотни строк, у регистраторного регистра — весь набор движений
+# регистратора, а он бывает и в мегабайт. Универсального batch_size поэтому нет: при отказе
+# уменьшаем страницу и повторяем, вплоть до одной записи за запрос — меньше уже некуда, entry
+# неделима. Найденный размер запоминается на объект (_full_load_page_size), чтобы повторный
+# прогон не начинал снова с batch_size и не жёг сервер заведомо провальными попытками.
+FULL_LOAD_BATCH_DIVISOR = 4
+FULL_LOAD_MIN_BATCH = 1
+
+# Целевой вес страницы полной выгрузки и размер первой («пробной») страницы, пока вес entry
+# неизвестен. Размер страницы подбирается по факту: после каждой страницы известен её вес и
+# число entry, отсюда — сколько entry укладывается в бюджет. batch_size остаётся верхней
+# границей. Просить у 1С сразу batch_size нельзя: у толстого объекта это гигабайты временных
+# файлов на сервере приложений, и запрос падает ещё до того, как мы узнаем вес entry.
+FULL_LOAD_TARGET_BYTES = 32 * 1024 * 1024
+FULL_LOAD_PROBE_BATCH = 20
 
 
 def _is_permanent_error(exc: BaseException) -> bool:
@@ -84,6 +104,9 @@ class Replicator1C:
         # Фоновая полная выгрузка: пул потоков и защита от повторного сабмита одного объекта.
         self._full_load_workers = full_load_workers
         self._full_load_in_progress: set[str] = set()
+        # Размер страницы, который 1С реально осилила по этому объекту (см. FULL_LOAD_MIN_BATCH).
+        # Пишет только поток самой выгрузки, а он на объект один (_full_load_in_progress).
+        self._full_load_page_size: dict[str, int] = {}
         self._in_progress_lock = threading.Lock()
         self.changes = ChangeReader1C(self._odata_url, self._exchange_name, self._queue_guid,
                                       self.metadata, odata_auth=self._odata_auth,
@@ -200,6 +223,11 @@ class Replicator1C:
         Один прогон = одна строка в replicator_1c_log (message_no=NULL — это не пакет обмена);
         finished_at проставляется после успеха всех страниц.
 
+        batch_size — верхняя граница, а не жёсткий размер. Реальный размер страницы подбирается по
+        её весу (см. _next_page_size): первая страница пробная, дальше столько записей, сколько
+        укладывается в FULL_LOAD_TARGET_BYTES. Если 1С всё же не осилила страницу (500), размер
+        уменьшается и запрос повторяется с того же места (см. FULL_LOAD_BATCH_DIVISOR).
+
         Версия и гонка с изменениями: строки выгрузки штампуются exchange_message_no=0, а save идёт с
         full_load=True — с version-guard'ами по emn, чтобы устаревший снимок не затирал более свежие
         изменения (emn>0) и не воскрешал удалённые строки групп (регистр/ТЧ). См. DBWriter1C.save.
@@ -230,17 +258,31 @@ class Replicator1C:
         after_values = None
         skip = 0
         total = 0
+        # Начинаем с размера, подобранного по этому объекту раньше, иначе — с пробной страницы.
+        page_size = min(batch_size,
+                        self._full_load_page_size.get(object_name, FULL_LOAD_PROBE_BATCH))
         while True:
-            page = reader.read_object(object_name, top=batch_size, key_fields=key_fields,
-                                      after_values=after_values, key_types=key_types,
-                                      extra_filter=date_filter,
-                                      skip=None if use_keyset else skip)
+            try:
+                page = reader.read_object(object_name, top=page_size, key_fields=key_fields,
+                                          after_values=after_values, key_types=key_types,
+                                          extra_filter=date_filter,
+                                          skip=None if use_keyset else skip)
+            except requests.HTTPError as exc:
+                # Страница не по зубам серверу 1С (упирается в память/временные файлы) —
+                # уменьшаем её и повторяем с того же места. Курсор/смещение не сдвигались.
+                if _is_permanent_error(exc) or page_size <= FULL_LOAD_MIN_BATCH:
+                    raise
+                page_size = max(FULL_LOAD_MIN_BATCH, page_size // FULL_LOAD_BATCH_DIVISOR)
+                self._full_load_page_size[object_name] = page_size
+                logger.warning("Full load of %s: page failed, retrying with batch_size=%s",
+                               object_name, page_size)
+                continue
             for obj_name, data_object in reader.items():
                 # Много страниц/объектов пишутся в одну строку лога — счётчики суммируются в БД.
                 result = self.writer.save(obj_name, data_object, full_load=True)
                 self.replicator_log.write_result(log_id, result)
             total += page
-            if page < batch_size:
+            if page < page_size:
                 break
             if use_keyset:
                 # Курсор следующей страницы — значения ключевых полей последней записи.
@@ -248,6 +290,8 @@ class Replicator1C:
                 after_values = [data[f][-1] for f in key_fields]
             else:
                 skip += page
+            page_size = self._next_page_size(object_name, page_size, page,
+                                             reader.last_response_bytes, batch_size)
         self.replicator_log.write_result(log_id, finish=True)
         logger.info("Full load of %s finished (%s records)", object_name, total)
 
@@ -289,6 +333,23 @@ class Replicator1C:
             else:
                 clauses.append(f"{date_field} le {Replicator1C._odata_datetime(date_to)}")
         return " and ".join(clauses)
+
+    def _next_page_size(self, object_name: str, page_size: int, entries: int,
+                        response_bytes: int, batch_size: int) -> int:
+        """
+        Размер следующей страницы по фактическому весу выданной: сколько entry укладывается в
+        FULL_LOAD_TARGET_BYTES. Вес entry у разных объектов различается на порядки (строка
+        справочника — килобайты, документ с табличными частями или набор движений регистратора —
+        мегабайты), поэтому единый batch_size либо гоняет лишние запросы, либо просит у 1С
+        страницу в гигабайты. batch_size — верхняя граница, FULL_LOAD_MIN_BATCH — нижняя.
+        """
+        if not entries or not response_bytes:
+            return page_size
+        per_entry = response_bytes / entries
+        fits = max(FULL_LOAD_MIN_BATCH, int(FULL_LOAD_TARGET_BYTES / per_entry))
+        page_size = min(batch_size, fits)
+        self._full_load_page_size[object_name] = page_size
+        return page_size
 
     def _supports_keyset(self, object_name: str, key_fields: list[str]) -> bool:
         """

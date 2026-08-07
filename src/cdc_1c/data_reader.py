@@ -185,6 +185,9 @@ class DataReader1C(UserDict):
         self.odata_auth = odata_auth
         self.request_timeout = request_timeout
         self.exchange_message_no = None  # номер пакета обмена, проставляется в записи при чтении изменений
+        # Размер последнего ответа 1С в байтах — по нему вызывающий подбирает размер страницы
+        # (вес одной entry у разных объектов различается на порядки, см. Replicator1C.full_load).
+        self.last_response_bytes = 0
         # Объекты, ради неизвестного поля которых метаданные уже перечитывались (см. _get_record_fields).
         # Без этого каждая запись с полем вне $metadata давала бы свой полный GET $metadata + dbmerge.
         self._metadata_refreshed_for: set[str] = set()
@@ -243,6 +246,7 @@ class DataReader1C(UserDict):
         url = f"{self.odata_url}/{object_name}{query}"
         response = requests.get(url, auth=self.odata_auth, timeout=resolve_timeout(self.request_timeout))
         raise_for_status(response, f'read {object_name}{query}')
+        self.last_response_bytes = len(response.content)
 
         object_data = xmltodict.parse(response.text, force_list=('d:element', 'entry'))
         object_entries = (object_data.get('feed') or {}).get('entry') or []

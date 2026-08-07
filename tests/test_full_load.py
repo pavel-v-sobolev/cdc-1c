@@ -9,6 +9,7 @@ import uuid
 from datetime import date, datetime
 
 import pytest
+import requests
 from sqlalchemy import create_engine, select
 from dbmerge import mergeResult
 
@@ -19,6 +20,13 @@ from cdc_1c.replicator import Replicator1C
 
 # Нулевой результат merge — writer.save в тестах замокан, но full_load агрегирует его результат.
 _ZERO_RESULT = mergeResult(0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+def _response(status_code: int):
+    """Минимальный requests.Response с нужным кодом — для HTTPError в стабах read_object."""
+    response = requests.Response()
+    response.status_code = status_code
+    return response
 
 
 def _replicator():
@@ -130,6 +138,78 @@ def test_full_load_key_recorder_key():
     assert rep._full_load_key("InformationRegister_R") == (["Recorder_Key"], ["Guid"])
 
 
+def _failing_above(limit, calls):
+    """Стаб read_object: страницы больше limit сервер не отдаёт, остальные — пустые."""
+    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
+                         key_types=None, extra_filter=None, skip=None):
+        calls.append({"top": top, "skip": skip})
+        if top > limit:
+            raise requests.HTTPError("500", response=_response(500))
+        self.clear()
+        return 0
+    return fake_read_object
+
+
+def test_full_load_shrinks_to_single_entry(monkeypatch):
+    # entry неделима (набор движений регистратора — мегабайты), поэтому уменьшаем вплоть до 1.
+    # Смещение при этом не сдвигается: повторяем ту же страницу, а не следующую.
+    rep = _replicator()
+    calls = []
+    monkeypatch.setattr(DataReader1C, "read_object", _failing_above(1, calls))
+    rep.writer.save = lambda name, obj, full_load=False: _ZERO_RESULT
+
+    rep.full_load("Catalog_X", batch_size=1000)
+
+    # старт — пробная страница (не batch_size), дальше деление на FULL_LOAD_BATCH_DIVISOR.
+    assert [c["top"] for c in calls] == [20, 5, 1]
+    assert all(c["skip"] == 0 for c in calls)
+
+
+def test_full_load_remembers_reduced_page_size(monkeypatch):
+    # Повторный прогон объекта начинает с уже подобранного размера, а не с пробной страницы.
+    rep = _replicator()
+    calls = []
+    monkeypatch.setattr(DataReader1C, "read_object", _failing_above(4, calls))
+    rep.writer.save = lambda name, obj, full_load=False: _ZERO_RESULT
+
+    rep.full_load("Catalog_X", batch_size=1000)
+    rep.full_load("Catalog_X", batch_size=1000)
+
+    assert [c["top"] for c in calls] == [20, 5, 1, 1]
+
+
+def test_next_page_size_follows_response_weight():
+    # Размер следующей страницы считается из фактического веса выданной: сколько entry
+    # укладывается в бюджет FULL_LOAD_TARGET_BYTES (32 МБ).
+    rep = _replicator()
+
+    # запись ~1 МБ (набор движений регистратора) → 32 записи на страницу
+    assert rep._next_page_size("O", 20, 20, 20 * 1024 * 1024, 1000) == 32
+    # килобайтные записи справочника → упираемся в batch_size как в верхнюю границу
+    assert rep._next_page_size("O", 20, 20, 20 * 1024, 1000) == 1000
+    # одна запись тяжелее всего бюджета → берём по одной, ниже уже нельзя
+    assert rep._next_page_size("O", 20, 1, 64 * 1024 * 1024, 1000) == 1
+    # подобранный размер запоминается на объект
+    assert rep._full_load_page_size["O"] == 1
+    # пустая страница/неизвестный вес — размер не трогаем
+    assert rep._next_page_size("O", 7, 0, 0, 1000) == 7
+
+
+def test_full_load_reraises_permanent_error(monkeypatch):
+    # 400/403/404 уменьшением страницы не лечатся — пробрасываем сразу, без повторов.
+    rep = _replicator()
+
+    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
+                         key_types=None, extra_filter=None, skip=None):
+        raise requests.HTTPError("403", response=_response(403))
+
+    monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
+    rep.writer.save = lambda name, obj, full_load=False: _ZERO_RESULT
+
+    with pytest.raises(requests.HTTPError):
+        rep.full_load("Catalog_X", batch_size=1000)
+
+
 def test_full_load_empty_object(monkeypatch):
     rep = _replicator()
 
@@ -222,6 +302,7 @@ def test_read_object_keyset_url(monkeypatch):
     class _Resp:
         ok = True
         text = '<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
+        content = text.encode()
 
     def fake_get(url, **kwargs):
         captured["url"] = url
@@ -359,6 +440,7 @@ def test_read_object_combines_keyset_and_extra_filter(monkeypatch):
     class _Resp:
         ok = True
         text = '<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
+        content = text.encode()
 
     monkeypatch.setattr("cdc_1c.data_reader.requests.get",
                         lambda url, **kw: captured.__setitem__("url", url) or _Resp())
