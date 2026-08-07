@@ -191,20 +191,26 @@ class DataReader1C(UserDict):
 
     def read_object(self, object_name: str, top: int | None = None,
                     key_fields: list[str] | None = None, after_values: list | None = None,
-                    key_types: list[str] | None = None, extra_filter: str | None = None) -> int:
+                    key_types: list[str] | None = None, extra_filter: str | None = None,
+                    skip: int | None = None) -> int:
         """
-        Читает объект 1С в reader (предыдущее содержимое очищается). Постраничная выгрузка —
-        keyset-пагинация по составному ключу key_fields: сортировка по ключу ($orderby), лимит $top,
-        а следующая страница берётся лексикографическим фильтром «ключ больше последней строки
-        предыдущей страницы» (after_values). В отличие от $skip это не заставляет 1С перечитывать
-        пропущенные строки — каждая страница читается за один проход по индексу.
+        Читает объект 1С в reader (предыдущее содержимое очищается). Страница — сортировка по ключу
+        ($orderby key_fields) и лимит $top; следующая страница берётся одним из двух способов:
+
+        - keyset (after_values): лексикографический фильтр «ключ больше последней строки предыдущей
+          страницы». Не заставляет 1С перечитывать пропущенные строки, но применим, только если в
+          $orderby нет ссылочных полей (см. skip);
+        - $skip: смещение от начала выборки. 1С перечитывает пропущенные строки, зато работает для
+          любого ключа.
+
+        skip и after_values взаимоисключающи; способ выбирает вызывающий (см. Replicator1C.full_load).
 
         key_fields/key_types (порядок = порядок сортировки; типы — для литералов, см. _odata_literal):
-        - справочник/документ: ['Ref_Key'] / ['Guid'] (Ref_Key gt guid'...');
-        - регистраторный регистр: ['Recorder'] / ['String'] — в OData Recorder отдаётся строкой,
-          одна entry = целый набор записей регистратора, поэтому keyset по Recorder не рвёт набор;
+        - справочник/документ: ['Ref_Key'] / ['Guid'];
+        - регистраторный регистр: ['Recorder'] / ['String'] либо ['Recorder_Key'] / ['Guid'] —
+          одна entry = целый набор записей регистратора, поэтому страница не рвёт набор;
         - независимый регистр (нет Ref_Key/Recorder): весь первичный ключ (Period + измерения) —
-          составной keyset, т.к. одиночного уникального курсора нет.
+          составной ключ, т.к. одиночного уникального курсора нет.
 
         extra_filter — дополнительный OData-фрагмент $filter (например, диапазон по дате), который
         объединяется с keyset-условием по AND (составной keyset содержит OR — оборачиваем в скобки).
@@ -217,6 +223,8 @@ class DataReader1C(UserDict):
         params = []
         if top is not None:
             params.append(f"$top={top}")
+        if skip:
+            params.append(f"$skip={skip}")
         params.append("$orderby=" + ','.join(key_fields))
         # keyset-курсор и extra_filter объединяем по AND в один $filter.
         filters = []

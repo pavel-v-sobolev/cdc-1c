@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta
 from sqlalchemy import Engine, create_engine
 
 from cdc_1c.metadata_reader import MetadataReader1C
-from cdc_1c.data_reader import DataReader1C
+from cdc_1c.data_reader import DataReader1C, RECORDER_FIELDS
 from cdc_1c.change_reader import ChangeReader1C
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.db_writer import DBWriter1C, save_order_key
@@ -194,11 +194,11 @@ class Replicator1C:
         own-or-skip группы целиком (группа умещается на одной странице), см. DBWriter1C.save.
 
         Документ/справочник выгружается вместе с табличными частями — они приходят вложенно в той же
-        странице и сохраняются как отдельные объекты. Страницы берутся keyset-пагинацией (фильтр
-        «ключ больше последней строки» вместо $skip — без перечитывания на больших объёмах): по
-        Ref_Key (справочник/документ), Recorder (регистраторный регистр) или составному первичному
-        ключу (независимый регистр) — см. _full_load_key. Один прогон = одна строка в replicator_1c_log
-        (message_no=NULL — это не пакет обмена); finished_at проставляется после успеха всех страниц.
+        странице и сохраняются как отдельные объекты. Сортировка страниц — по первичному ключу
+        (см. _full_load_key), а способ перехода к следующей странице зависит от ключа: keyset-фильтр
+        «ключ больше последней строки» там, где он корректен, иначе $skip (см. _supports_keyset).
+        Один прогон = одна строка в replicator_1c_log (message_no=NULL — это не пакет обмена);
+        finished_at проставляется после успеха всех страниц.
 
         Версия и гонка с изменениями: строки выгрузки штампуются exchange_message_no=0, а save идёт с
         full_load=True — с version-guard'ами по emn, чтобы устаревший снимок не затирал более свежие
@@ -212,9 +212,10 @@ class Replicator1C:
         if not self.metadata.is_loaded:
             self.metadata.get_metadata()
 
-        # Ключ курсора: справочник/документ → [Ref_Key], регистраторный → [Recorder],
-        # независимый регистр → весь первичный ключ (составной keyset).
+        # Ключ курсора: справочник/документ → [Ref_Key], регистраторный → [Recorder]/[Recorder_Key],
+        # независимый регистр → весь первичный ключ (составной ключ).
         key_fields, key_types = self._full_load_key(object_name)
+        use_keyset = self._supports_keyset(object_name, key_fields)
         date_filter = self._build_date_filter(date_field, date_from, date_to)
 
         reader = DataReader1C(self._odata_url, self.metadata, odata_auth=self._odata_auth,
@@ -223,14 +224,17 @@ class Replicator1C:
         reader.exchange_message_no = 0
 
         log_id = self.replicator_log.start(self._exchange_name, object_name, None, LOAD_TYPE_FULL)
-        logger.info("Full load of %s started (batch_size=%s, key=%s, date_filter=%s)",
-                    object_name, batch_size, key_fields, date_filter)
+        logger.info("Full load of %s started (batch_size=%s, key=%s, paging=%s, date_filter=%s)",
+                    object_name, batch_size, key_fields,
+                    'keyset' if use_keyset else 'skip', date_filter)
         after_values = None
+        skip = 0
         total = 0
         while True:
             page = reader.read_object(object_name, top=batch_size, key_fields=key_fields,
                                       after_values=after_values, key_types=key_types,
-                                      extra_filter=date_filter)
+                                      extra_filter=date_filter,
+                                      skip=None if use_keyset else skip)
             for obj_name, data_object in reader.items():
                 # Много страниц/объектов пишутся в одну строку лога — счётчики суммируются в БД.
                 result = self.writer.save(obj_name, data_object, full_load=True)
@@ -238,9 +242,12 @@ class Replicator1C:
             total += page
             if page < batch_size:
                 break
-            # Курсор следующей страницы — значения ключевых полей последней записи (порядок по ключу).
-            data = reader[object_name].data
-            after_values = [data[f][-1] for f in key_fields]
+            if use_keyset:
+                # Курсор следующей страницы — значения ключевых полей последней записи.
+                data = reader[object_name].data
+                after_values = [data[f][-1] for f in key_fields]
+            else:
+                skip += page
         self.replicator_log.write_result(log_id, finish=True)
         logger.info("Full load of %s finished (%s records)", object_name, total)
 
@@ -282,6 +289,28 @@ class Replicator1C:
             else:
                 clauses.append(f"{date_field} le {Replicator1C._odata_datetime(date_to)}")
         return " and ".join(clauses)
+
+    def _supports_keyset(self, object_name: str, key_fields: list[str]) -> bool:
+        """
+        Можно ли листать объект keyset-курсором (фильтр «ключ больше последней строки») — или
+        придётся платить за $skip. Ссылочное поле в ключе запрещает keyset по двум причинам:
+
+        - сравнение: `Ref_Key gt guid'...'` 1С отдаёт 500 «Нельзя сравнивать поля неограниченной
+          длины и поля несовместимых типов» (в запрос уходит `sourceAlias.Ref > &param`). Строковый
+          литерал 500 не даёт, но сравнивает не то, что нужно;
+        - сортировка: `$orderby` по ссылке 1С разворачивает в АВТОУПОРЯДОЧИВАНИЕ — сортирует по
+          полям представления объекта (наименование/код у справочника, дата+номер у документа),
+          а не по GUID. Курсор «GUID больше предыдущего» такой порядок не продолжает: страницы
+          пересекаются и теряют строки.
+
+        Ссылочность определяем по типу из метаданных (Guid) и по имени поля — `Ref_Key`,
+        `Recorder`/`Recorder_Key`, измерения `*_Key`. Имя нужно потому, что часть ссылочных полей
+        1С описывает в $metadata как String (это и чинит GUESS_UUID_TYPES, но флаг отключаемый).
+        Period/LineNumber и прочие скаляры ссылками не считаются — по ним keyset корректен.
+        """
+        properties = self.metadata.get(object_name) or {}
+        return not any(properties.get(field) == 'Guid' or field.endswith('_Key')
+                       or field in RECORDER_FIELDS for field in key_fields)
 
     def _full_load_key(self, object_name: str) -> tuple[list[str], list[str]]:
         """
