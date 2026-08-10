@@ -11,13 +11,14 @@
 Схема на sqlite не поддерживается (и schema=None) — приводится к None (как в dbmerge).
 """
 
-import logging
 from dbmerge import mergeResult
 
 from sqlalchemy import (Column, DateTime, Engine, Integer, MetaData, String,
                         Table, func, insert, update, schema, Numeric)
 
-logger = logging.getLogger(__name__)
+from cdc_1c.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 REPLICATOR_LOG = "replicator_1c_log"
 

@@ -1,14 +1,28 @@
-import logging
-
 import requests
+
+from cdc_1c.logging_config import get_logger
 
 ODATA_PREFIX = 'StandardODATA.'
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Сколько символов тела ответа попадает в текст ошибки. 1С отдаёт описание ошибки (в т.ч. текст
 # исключения и стек модуля) в теле; полный дамп в лог не нужен, но обрезать до пары строк мало.
 MAX_ERROR_BODY_CHARS = 2000
+
+BYTE_UNITS = ('B', 'KB', 'MB', 'GB', 'TB')
+
+
+def format_bytes(size: float) -> str:
+    """
+    Размер ответа для лога в удобной единице: байты для мелочи, дальше КБ/МБ/ГБ. Ответы 1С
+    различаются на порядки (страница справочника — килобайты, набор движений — мегабайты),
+    и в сырых байтах разницу глазом не поймать.
+    """
+    for unit in BYTE_UNITS:
+        if size < 1024 or unit == BYTE_UNITS[-1]:
+            return f'{size:.0f} {unit}' if unit == BYTE_UNITS[0] else f'{size:.1f} {unit}'
+        size /= 1024
 
 
 def raise_for_status(response: requests.Response, context: str = '') -> None:

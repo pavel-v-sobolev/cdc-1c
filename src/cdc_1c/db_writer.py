@@ -1,12 +1,12 @@
-import logging
 
 from sqlalchemy import Engine, Index, MetaData, Table, tuple_, select, or_, and_, exists
 from dbmerge import dbmerge, mergeResult
 
 from cdc_1c.data_reader import DataObject1C, EXCHANGE_MESSAGE_NO_FIELD
 from cdc_1c.name_mapper import NameMapper1C
+from cdc_1c.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Служебные поля, которыми управляет dbmerge (момент merge/первой вставки строки).
 MERGED_ON_FIELD = 'merged_on'

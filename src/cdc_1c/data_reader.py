@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import requests
-import logging
 from typing import Any
-from collections import UserDict
+from collections import Counter, UserDict
 from datetime import datetime, date
 from urllib.parse import quote
 import uuid
@@ -12,9 +11,10 @@ import xmltodict
 
 from cdc_1c.metadata_reader import MetadataReader1C, resolve_timeout
 from cdc_1c.name_mapper import NameMapper1C
-from cdc_1c.common_functions import parse_object_full_name, raise_for_status
+from cdc_1c.common_functions import format_bytes, parse_object_full_name, raise_for_status
+from cdc_1c.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _json_safe(value: Any) -> Any:
@@ -253,15 +253,28 @@ class DataReader1C(UserDict):
 
         self.clear()
         self.read_data_entries(object_entries)
+        logger.info('Read %s: %s entries, %s rows, %s', object_name, len(object_entries),
+                    self.rows_read(), format_bytes(self.last_response_bytes))
         return len(object_entries)
 
-    def read_data_entries(self, object_entries: list):
+    def rows_read(self) -> int:
+        """Сколько строк дали прочитанные entry — с учётом табличных частей и наборов записей
+        (одна entry регистра/документа разворачивается в сотни и тысячи строк)."""
+        return sum(data_object.data_length for data_object in self.values())
+
+    def read_data_entries(self, object_entries: list) -> Counter:
+        """
+        Разбирает entry ответа 1С в объекты reader. Возвращает счётчик entry по объектам —
+        вызывающий логирует итог одной строкой: entry в ответе бывают тысячами, и лог на каждую
+        забивает вывод (см. read_object / ChangeReader1C.read_changes).
+        """
+        parsed: Counter = Counter()
         for object_entry in object_entries:
 
             object_full_name = (object_entry.get('category') or {}).get('@term')
             object_name, object_type = parse_object_full_name(object_full_name)
 
-            logger.info(f'Parsing {object_name}')
+            parsed[object_name] += 1
 
             if object_name and self.metadata.get(object_name) is None:
                 self.metadata.get_metadata()
@@ -275,6 +288,8 @@ class DataReader1C(UserDict):
 
             if object_type in ENTITY_TYPES:
                 self._get_entity_records(object_name, properties)
+
+        return parsed
 
 
     def _add_records(self, object_name, new_records: list):

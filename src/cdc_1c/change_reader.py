@@ -1,13 +1,13 @@
 import requests
-import logging
 
 import xmltodict
 
 from cdc_1c.data_reader import DataReader1C
 from cdc_1c.metadata_reader import MetadataReader1C, resolve_timeout
-from cdc_1c.common_functions import raise_for_status
+from cdc_1c.common_functions import format_bytes, raise_for_status
+from cdc_1c.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class ChangeReader1C(DataReader1C):
@@ -31,11 +31,18 @@ class ChangeReader1C(DataReader1C):
 
         response = requests.post(url,auth=self.odata_auth,timeout=resolve_timeout(self.request_timeout))
         raise_for_status(response, f'SelectChanges (message {self.message_no})')
+        self.last_response_bytes = len(response.content)
 
         change_data = xmltodict.parse(response.text,force_list=('d:element','entry'))
         change_entries = (change_data.get('feed') or {}).get('entry') or []
 
-        self.read_data_entries(change_entries)
+        parsed = self.read_data_entries(change_entries)
+        # Одна строка на пакет: что пришло, сколько строк и сколько весил ответ. Раньше лог писался
+        # на каждую entry, и один пакет давал сотни одинаковых строк.
+        logger.info("Read changes (message %s): %s entries, %s rows, %s%s",
+                    self.message_no, len(change_entries), self.rows_read(),
+                    format_bytes(self.last_response_bytes),
+                    ''.join(f'\n    {name}: {n} entries' for name, n in parsed.items()))
 
     def notify_changes_received(self):
         """

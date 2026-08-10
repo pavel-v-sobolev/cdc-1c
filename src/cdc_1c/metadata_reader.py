@@ -1,5 +1,4 @@
 import requests
-import logging
 import threading
 from typing import Any
 from collections import UserDict
@@ -11,9 +10,10 @@ from sqlalchemy.dialects.postgresql import JSONB
 from dbmerge import dbmerge
 
 from cdc_1c.name_mapper import NameMapper1C
-from cdc_1c.common_functions import parse_object_full_name, raise_for_status
+from cdc_1c.common_functions import format_bytes, parse_object_full_name, raise_for_status
+from cdc_1c.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Таймауты HTTP-запросов к 1С по умолчанию: (connect, read) в секундах. requests с timeout=None
 # висит бесконечно при недоступном сервере.
@@ -271,6 +271,7 @@ class MetadataReader1C(UserDict):
         response = requests.get(url,auth=self.odata_auth,
                                 timeout=resolve_timeout(self.request_timeout))
         raise_for_status(response, '$metadata')
+        logger.info('Metadata received (%s)', format_bytes(len(response.content)))
 
         metadata = xmltodict.parse(response.text,force_list=('Property','PropertyRef','ComplexType'))
         metadata_schema = ((metadata.get('edmx:Edmx') or {}).get('edmx:DataServices') or {}).get('Schema') or {}

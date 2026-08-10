@@ -1,4 +1,4 @@
-import logging
+import functools
 import signal
 import threading
 import time
@@ -15,9 +15,9 @@ from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.db_writer import DBWriter1C, save_order_key
 from cdc_1c.config import Config
 from cdc_1c.db_logs import Replicator1CLog, LOAD_TYPE_CHANGES, LOAD_TYPE_FULL
-from cdc_1c.logging_config import _ensure_handler
+from cdc_1c.logging_config import _ensure_handler, get_logger, load_mode, LOAD_MODE_CHANGES, LOAD_MODE_FULL
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Ретрай упавшего цикла (run_forever): экспоненциальная пауза вместо слепого повтора каждые
 # interval секунд. Неудачный SelectChanges — это не бесплатная попытка: 1С успевает отработать
@@ -56,6 +56,21 @@ def _is_permanent_error(exc: BaseException) -> bool:
     response = getattr(exc, 'response', None)
     status = getattr(response, 'status_code', None)
     return status in PERMANENT_HTTP_CODES
+
+
+def _load_mode_tag(mode: str):
+    """
+    Помечает режимом загрузки все сообщения лога cdc_1c, выданные внутри метода: полная выгрузка
+    идёт фоновыми потоками параллельно с чтением изменений, и в общем логе иначе не разобрать, к
+    чему относится строка. Декоратором, а не блоком with — чтобы не заворачивать тело целиком.
+    """
+    def decorator(method):
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            with load_mode(mode):
+                return method(self, *args, **kwargs)
+        return wrapper
+    return decorator
 
 
 class Replicator1C:
@@ -133,6 +148,7 @@ class Replicator1C:
             full_load_workers=config.full_load_workers,
         )
 
+    @_load_mode_tag(LOAD_MODE_CHANGES)
     def run_once(self, notify_changes: bool = True) -> None:
         """
         Один цикл: (load metadata при первом вызове) → read → save → notify. Подтверждение
@@ -206,6 +222,7 @@ class Replicator1C:
             self.metadata.get_metadata()
         return [name for name, obj in self.metadata.items() if not obj.is_table_part]
 
+    @_load_mode_tag(LOAD_MODE_FULL)
     def full_load(self, object_name: str, batch_size: int = 1000,
                   date_field: str | None = None,
                   date_from: date | datetime | str | None = None,
@@ -466,6 +483,7 @@ class Replicator1C:
                 self._full_load_in_progress.add(object_full_name)
             executor.submit(self._run_full_load, object_full_name)
 
+    @_load_mode_tag(LOAD_MODE_FULL)
     def _run_full_load(self, object_full_name: str) -> None:
         """Фоновая полная выгрузка одного объекта; на успехе фиксирует mark_full_loaded.
         При ошибке флаг full_load_is_required остаётся → ретрай на следующем цикле."""

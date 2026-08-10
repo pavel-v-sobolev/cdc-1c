@@ -1,8 +1,48 @@
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 # Пакетный логгер. Логгеры модулей (getLogger(__name__) → cdc_1c.replicator и т.п.) — его потомки,
 # поэтому хендлер/уровень, выставленные здесь, действуют на весь пакет.
 logger = logging.getLogger("cdc_1c")
+
+# Пометка режима загрузки в сообщениях лога: полная выгрузка идёт фоновыми потоками параллельно
+# с чтением изменений, и без пометки в общем логе не разобрать, к чему относится строка.
+LOAD_MODE_CHANGES = 'CHANGES'
+LOAD_MODE_FULL = 'FULL RELOAD'
+
+# ContextVar, а не глобальная переменная: у каждого потока свой контекст, поэтому режим фоновой
+# полной выгрузки не протекает в основной цикл и в соседние выгрузки.
+_load_mode: ContextVar[str] = ContextVar('cdc_1c_load_mode', default='')
+
+
+@contextmanager
+def load_mode(mode: str):
+    """Помечает режимом загрузки все сообщения лога cdc_1c, выданные внутри блока."""
+    token = _load_mode.set(mode)
+    try:
+        yield
+    finally:
+        _load_mode.reset(token)
+
+
+def log_prefix() -> str:
+    """Префикс сообщения: '[FULL RELOAD] ' / '[CHANGES] ', либо пусто вне режима загрузки."""
+    mode = _load_mode.get()
+    return f'[{mode}] ' if mode else ''
+
+
+class _LoadModeAdapter(logging.LoggerAdapter):
+    """Дописывает пометку режима в текст сообщения. Именно в текст, а не в поле записи лога:
+    формат вывода задаёт приложение-хозяин, и на своё поле оно ссылаться не станет."""
+
+    def process(self, msg, kwargs):
+        return f'{log_prefix()}{msg}', kwargs
+
+
+def get_logger(name: str) -> logging.LoggerAdapter:
+    """Логгер модуля cdc_1c: как logging.getLogger, но с пометкой режима загрузки."""
+    return _LoadModeAdapter(logging.getLogger(name), {})
 
 
 def _ensure_handler(level: int = logging.INFO) -> None:
