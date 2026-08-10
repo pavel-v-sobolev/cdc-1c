@@ -60,6 +60,37 @@ def test_record_set_with_recorder_key():
     assert data[EXCHANGE_MESSAGE_NO_FIELD] == [7]
 
 
+def test_recorder_key_taken_from_entry_when_absent_in_rows():
+    # Прямое чтение набора записей: Recorder_Key есть только на уровне entry, внутри строк
+    # набора 1С его не повторяет. Без подстановки строки уезжают в БД без ключа.
+    reader = _reader(_FIELDS)
+    row = _row()
+    del row["d:Recorder_Key"]
+    reader._get_register_records(REG, {
+        "d:Recorder_Key": REC,
+        "d:RecordSet": {"d:element": [row, dict(row, **{"d:LineNumber": "2"})]}})
+
+    data = reader[REG].data
+    assert data["Recorder_Key"] == [uuid.UUID(REC), uuid.UUID(REC)]
+    assert data["LineNumber"] == [1, 2]
+    assert data[IS_DELETED_OR_EMPTY_FIELD] == [False, False]
+
+
+def test_composite_recorder_taken_from_entry_when_absent_in_rows():
+    # То же для составного регистратора: в строки набора подставляются и Recorder, и Recorder_Type.
+    fields = {"Recorder": "Guid", "Recorder_Type": "String", "Period": "DateTime"}
+    reader = _reader(fields, primary_key={"Recorder": "Guid", "Recorder_Type": "String",
+                                          "Period": "DateTime"})
+    reader._get_register_records(REG, {
+        "d:Recorder": REC, "d:Recorder_Type": "StandardODATA.Document_Order",
+        "d:RecordSet": {"d:element": [{"d:Period": "2026-01-01T00:00:05"}]}})
+
+    data = reader[REG].data
+    assert data["Recorder"] == [uuid.UUID(REC)]
+    assert data["Recorder_Type"] == ["Document_Order"]
+    assert data["Period"] == [datetime(2026, 1, 1, 0, 0, 5)]
+
+
 @pytest.mark.parametrize("record_set", [
     {"@m:type": f"Collection(StandardODATA.{REG}_RowType)"},   # <d:RecordSet .../> без элементов
     {"@m:type": f"Collection(StandardODATA.{REG}_RowType)", "d:element": None},
