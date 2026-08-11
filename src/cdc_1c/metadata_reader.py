@@ -11,7 +11,7 @@ from dbmerge import dbmerge
 
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.common_functions import format_bytes, parse_object_full_name, raise_for_status
-from cdc_1c.logging_config import get_logger
+from cdc_1c.logging_config import get_logger, load_mode, LOAD_MODE_METADATA
 
 logger = get_logger(__name__)
 
@@ -257,8 +257,12 @@ class MetadataReader1C(UserDict):
         реестр metadata_objects_1c с актуальным составом $metadata.
         Можно вызывать повторно для обновления (при появлении нового объекта/поля — см. data_reader);
         под блокировкой, т.к. вызывается и из фоновых потоков full_load. В конце is_loaded=True.
+
+        В логе помечается своим режимом (METADATA), а не режимом вызвавшей операции: чтение
+        $metadata общее для пакета изменений и полной выгрузки, и метка CHANGES на нём вводила бы
+        в заблуждение.
         """
-        with self._lock:
+        with self._lock, load_mode(LOAD_MODE_METADATA):
             self._fetch_and_parse_metadata()
             self.is_loaded = True
             if self.engine is not None:

@@ -9,6 +9,7 @@ import requests
 from sqlalchemy import Engine, create_engine
 
 from cdc_1c.metadata_reader import MetadataReader1C
+from cdc_1c.common_functions import format_duration
 from cdc_1c.data_reader import DataReader1C, RECORDER_FIELDS
 from cdc_1c.change_reader import ChangeReader1C
 from cdc_1c.name_mapper import NameMapper1C
@@ -168,8 +169,14 @@ class Replicator1C:
         # при появлении нового объекта/поля (get_metadata держит is_loaded=True).
         if not self.metadata.is_loaded:
             self.metadata.get_metadata()
+        # Время пакета считаем от чтения из 1С и до конца всех merge — это то, что реально
+        # занимает цикл. Загрузка метаданных сюда не входит: она разовая и к пакету не относится.
+        started = time.monotonic()
         self.changes.read_changes()
         self._save_changes()
+        logger.info("Changes package %s processed in %s: %s rows",
+                    self.changes.message_no, format_duration(time.monotonic() - started),
+                    self.changes.rows_read())
         # Объект пришёл в пакете → он в плане обмена. Если ни разу не выгружался целиком,
         # помечаем на полную выгрузку (выполнит фоновый воркер в run_forever). 
         # Табличные части пропускаем — у них нет отдельной OData-сущности, они

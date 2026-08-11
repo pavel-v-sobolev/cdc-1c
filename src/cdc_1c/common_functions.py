@@ -25,6 +25,21 @@ def format_bytes(size: float) -> str:
         size /= 1024
 
 
+def format_duration(seconds: float) -> str:
+    """
+    Длительность для лога: секунды с десятой долей, от минуты — «1m 04s», от часа — «1h 05m 03s».
+    Обработка пакета занимает от долей секунды до десятков минут, и в сырых секундах такой разброс
+    читается плохо.
+    """
+    if seconds < 60:
+        return f'{seconds:.1f}s'
+    minutes, sec = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f'{hours}h {minutes:02d}m {sec:02d}s'
+    return f'{minutes}m {sec:02d}s'
+
+
 def raise_for_status(response: requests.Response, context: str = '') -> None:
     """
     Замена response.raise_for_status(): всё содержательное в ответе 1С лежит в теле, а штатный

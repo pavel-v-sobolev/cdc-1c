@@ -10,6 +10,14 @@ logger = logging.getLogger("cdc_1c")
 # с чтением изменений, и без пометки в общем логе не разобрать, к чему относится строка.
 LOAD_MODE_CHANGES = 'CHANGES'
 LOAD_MODE_FULL = 'FULL RELOAD'
+# Чтение $metadata не относится ни к пакету изменений, ни к полной выгрузке: оно общее и
+# вызывается из обоих (а также лениво при появлении нового объекта/поля).
+LOAD_MODE_METADATA = 'METADATA'
+
+# Чужие логгеры, которые при автонастройке логирования приглушаем до WARNING. alembic приходит
+# транзитом через dbmerge (MigrationContext/Operations при добавлении колонок) и на каждом merge
+# пишет INFO о диалекте и транзакционном DDL — к работе репликатора это отношения не имеет.
+NOISY_LOGGERS = ('alembic',)
 
 # ContextVar, а не глобальная переменная: у каждого потока свой контекст, поэтому режим фоновой
 # полной выгрузки не протекает в основной цикл и в соседние выгрузки.
@@ -55,9 +63,14 @@ def _ensure_handler(level: int = logging.INFO) -> None:
     моменту приложение, если хотело, уже сконфигурировало логирование, и hasHandlers() даёт
     корректный снимок. Идемпотентна — после первого вызова свой хендлер уже висит на cdc_1c,
     и hasHandlers() вернёт True.
+
+    Заодно приглушает шумные чужие логгеры (NOISY_LOGGERS) — но только когда настраиваем
+    логирование мы: если приложение настроило его само, его выбор уровней не трогаем.
     """
     if not logger.hasHandlers():
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
         logger.addHandler(handler)
         logger.setLevel(level)
+        for name in NOISY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.WARNING)
