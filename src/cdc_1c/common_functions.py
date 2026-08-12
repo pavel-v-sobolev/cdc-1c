@@ -1,3 +1,6 @@
+import json
+import re
+
 import requests
 
 from cdc_1c.logging_config import get_logger
@@ -6,9 +9,9 @@ ODATA_PREFIX = 'StandardODATA.'
 
 logger = get_logger(__name__)
 
-# Сколько символов тела ответа попадает в текст ошибки. 1С отдаёт описание ошибки (в т.ч. текст
-# исключения и стек модуля) в теле; полный дамп в лог не нужен, но обрезать до пары строк мало.
-MAX_ERROR_BODY_CHARS = 2000
+# Предел длины описания ошибки в логе — на случай, если распознать формат не удалось и в лог идёт
+# сырое тело. У распознанных ответов описание короткое, до предела не доходит.
+MAX_ERROR_BODY_CHARS = 500
 
 BYTE_UNITS = ('B', 'KB', 'MB', 'GB', 'TB')
 
@@ -40,21 +43,85 @@ def format_duration(seconds: float) -> str:
     return f'{minutes}m {sec:02d}s'
 
 
+def _one_line(text: str) -> str:
+    """Схлопывает переносы и лишние пробелы: описание ошибки должно занимать одну строку лога."""
+    text = re.sub(r'\s+', ' ', text).strip()
+    if len(text) > MAX_ERROR_BODY_CHARS:
+        return f'{text[:MAX_ERROR_BODY_CHARS]}... [+{len(text) - MAX_ERROR_BODY_CHARS} chars]'
+    return text
+
+
+def _exception_descriptions(payload: dict) -> list[str]:
+    """
+    Описания из цепочки exception -> inner в JSON-исключении сервера приложений 1С. Берём только
+    descr: рядом лежат creationStack (адреса в DLL) и base64-дамп на сотни строк, которые в логе
+    бесполезны. Вложенные описания часто повторяют друг друга — оставляем только те, что не
+    являются куском уже отобранного.
+
+    Внешнюю обёртку вида «HTTP: Forbidden. Ошибка при выполнении запроса GET к ресурсу …»
+    отбрасываем: код, метод и ресурс уже есть в нашем же сообщении. Но если она единственная —
+    оставляем, лучше так, чем пустая ошибка.
+    """
+    kept: list[str] = []
+    node = payload.get('exception') or payload
+    while isinstance(node, dict):
+        descr = _one_line(node.get('descr') or '')
+        if descr and not any(descr in text for text in kept):
+            kept = [text for text in kept if text not in descr]
+            kept.append(descr)
+        node = node.get('inner')
+
+    meaningful = [text for text in kept if not text.startswith('HTTP: ')]
+    return meaningful or kept
+
+
+def extract_error_text(body: str) -> str:
+    """
+    Человекочитаемое описание ошибки из ответа 1С. Отвечает она тремя разными способами:
+
+    - ошибка OData: XML `<m:error><m:message>…</m:message></m:error>`;
+    - исключение сервера приложений: JSON с цепочкой exception/inner, где полезен только descr;
+    - ошибка платформы/веб-сервера: HTML «1C:Enterprise 8 application error … by reason: …».
+
+    Если формат не распознан, отдаём тело как есть (обрезанное). В любом случае результат —
+    одна строка: полный дамп тела в лог не нужен, там мегабайты служебного мусора.
+    """
+    text = (body or '').lstrip('﻿').strip()
+    if not text:
+        return '<empty body>'
+
+    match = re.search(r'<m:message[^>]*>(.*?)</m:message>', text, re.S)
+    if match:
+        return _one_line(match.group(1))
+
+    if text.startswith('{'):
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            descriptions = _exception_descriptions(payload)
+            if descriptions:
+                return ' | '.join(descriptions)
+
+    match = re.search(r'by reason:\s*</b>\s*<br>(.*?)</body>', text, re.S | re.I)
+    if match:
+        return _one_line(re.sub(r'<[^>]+>', ' ', match.group(1)))
+
+    return _one_line(text)
+
+
 def raise_for_status(response: requests.Response, context: str = '') -> None:
     """
     Замена response.raise_for_status(): всё содержательное в ответе 1С лежит в теле, а штатный
     raise_for_status отдаёт наружу только «HTTPError: 500» и причину из логов не видно.
-    Тело (обрезанное) попадает и в лог, и в текст HTTPError.
+    В лог и в текст HTTPError идёт разобранное описание (см. extract_error_text), а не сырое тело.
     """
     if response.ok:
         return
 
-    body = (response.text or '').strip()
-    if len(body) > MAX_ERROR_BODY_CHARS:
-        body = f'{body[:MAX_ERROR_BODY_CHARS]}... [+{len(body) - MAX_ERROR_BODY_CHARS} chars]'
-
     message = (f'1C request failed: {response.status_code} {response.reason} '
-               f'for {context or response.url}: {body or "<empty body>"}')
+               f'for {context or response.url}: {extract_error_text(response.text)}')
     logger.error(message)
     raise requests.HTTPError(message, response=response)
 

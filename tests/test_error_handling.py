@@ -3,12 +3,16 @@
 а упавший run_forever ретраится с экспоненциальной паузой (см. replicator.BACKOFF_FACTOR).
 """
 
+import json
+import logging
+
 import pytest
 import requests
 from sqlalchemy import create_engine
 
 from cdc_1c import Replicator1C
-from cdc_1c.common_functions import MAX_ERROR_BODY_CHARS, raise_for_status
+from cdc_1c.common_functions import MAX_ERROR_BODY_CHARS, extract_error_text, raise_for_status
+from cdc_1c.replicator import _log_failure
 from cdc_1c.replicator import DEFAULT_MAX_BACKOFF
 
 
@@ -40,6 +44,103 @@ def test_raise_for_status_truncates_long_body():
         raise_for_status(_Resp(text='x' * (MAX_ERROR_BODY_CHARS + 500)), 'ctx')
 
     assert '[+500 chars]' in str(excinfo.value)
+
+
+def test_extract_error_text_odata_xml():
+    body = ('<m:error xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">'
+            '<m:code>-1</m:code><m:message>{(3, 23)}: Неверные параметры в операции\n'
+            ' сравнения.</m:message></m:error>')
+
+    assert extract_error_text(body) == '{(3, 23)}: Неверные параметры в операции сравнения.'
+
+
+def test_extract_error_text_application_exception_json():
+    # Реальный ответ 1С при запрете входа: полезен только descr, а рядом лежат creationStack
+    # с адресами в DLL и base64-дамп — в лог они не нужны.
+    body = '﻿' + json.dumps({
+        "#exception": "{http://v8.1c.ru/8.2/virtual-resource-system}Exception",
+        "exception": {
+            "reason": 403,
+            "descr": "HTTP: Forbidden\nОшибка при выполнении запроса GET к ресурсу /odata/x:",
+            "inner": {
+                "descr": "Начало сеанса с информационной базой запрещено.\n"
+                         "Ведутся технические работы",
+                "inner": {
+                    "descr": "Ведутся технические работы",
+                    "creationStack": "core83.dll:0x0000000000085928 " * 40,
+                    "data": "77u/ew0Ke2EwMWY0NjVjLWVkNzAtNDQyZS1hZGE1" * 30,
+                },
+            },
+        },
+    }, ensure_ascii=False)
+
+    text = extract_error_text(body)
+
+    assert text == 'Начало сеанса с информационной базой запрещено. Ведутся технические работы'
+    # внешняя HTTP-обёртка отброшена: код и ресурс и так есть в нашем сообщении
+    assert 'HTTP: Forbidden' not in text
+    assert 'creationStack' not in text and 'core83.dll' not in text
+    assert '77u/ew0K' not in text
+
+
+def test_extract_error_text_keeps_http_wrapper_when_alone():
+    # Если кроме обёртки ничего нет — оставляем её, лучше так, чем пустая ошибка.
+    body = json.dumps({"exception": {"descr": "HTTP: Forbidden\nОшибка запроса"}}, ensure_ascii=False)
+
+    assert extract_error_text(body) == 'HTTP: Forbidden Ошибка запроса'
+
+
+def test_extract_error_text_platform_html():
+    body = ('<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">\n<html><head>'
+            '<title>1C:Enterprise 8 application error</title></head><body>'
+            '<h2>1C:Enterprise 8 application error:</h2>Unrecoverable error<br>'
+            '<b>by reason: </b><br>The device is full &apos;/tmp/v8_x.tmp&apos;. '
+            '28(0x0000001C): No space left on device</body></html>')
+
+    text = extract_error_text(body)
+
+    assert 'No space left on device' in text
+    assert '<' not in text and '\n' not in text
+
+
+def test_extract_error_text_unknown_format_falls_back_to_body():
+    assert extract_error_text('  просто текст  ') == 'просто текст'
+    assert extract_error_text('') == '<empty body>'
+
+
+def test_log_failure_http_error_without_traceback_and_text(caplog):
+    # Описание от 1С уже вывел raise_for_status строкой выше — второй раз не повторяем,
+    # и traceback (внутренности requests) не тащим.
+    exc = requests.HTTPError('1C request failed: 403 Forbidden: Ведутся технические работы')
+    with caplog.at_level(logging.ERROR, logger='cdc_1c.replicator'):
+        _log_failure(exc, "Replication cycle failed, retry in %ss", 1800.0)
+
+    record = caplog.records[-1]
+    assert record.getMessage() == '[CHANGES] Replication cycle failed, retry in 1800.0s' \
+        or record.getMessage() == 'Replication cycle failed, retry in 1800.0s'
+    assert record.exc_info is None
+    assert 'Ведутся технические работы' not in record.getMessage()
+
+
+def test_log_failure_connection_error_keeps_text(caplog):
+    # Таймаут/обрыв нигде не логируется до этого — текст нужен, traceback по-прежнему нет.
+    with caplog.at_level(logging.ERROR, logger='cdc_1c.replicator'):
+        _log_failure(requests.ConnectTimeout('connect timed out'), "Cycle failed")
+
+    record = caplog.records[-1]
+    assert 'connect timed out' in record.getMessage()
+    assert record.exc_info is None
+
+
+def test_log_failure_keeps_traceback_for_code_errors(caplog):
+    # Не ошибка обмена — похоже на баг в коде, traceback оставляем.
+    with caplog.at_level(logging.ERROR, logger='cdc_1c.replicator'):
+        try:
+            raise ValueError('boom')
+        except ValueError as exc:
+            _log_failure(exc, "Cycle failed")
+
+    assert caplog.records[-1].exc_info is not None
 
 
 def test_raise_for_status_passes_ok_response():

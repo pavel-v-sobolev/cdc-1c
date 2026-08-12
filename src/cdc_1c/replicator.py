@@ -59,6 +59,23 @@ def _is_permanent_error(exc: BaseException) -> bool:
     return status in PERMANENT_HTTP_CODES
 
 
+def _log_failure(exc: BaseException, message: str, *args) -> None:
+    """
+    Пишет в лог падение цикла. Для ошибок обмена traceback не нужен: он целиком состоит из
+    внутренностей requests и ничего не добавляет к описанию, которое пришло от 1С.
+
+    - HTTPError: описание уже выведено raise_for_status строкой выше, не дублируем;
+    - прочие ошибки requests (таймаут, обрыв): traceback не нужен, но текст выводим — его нигде нет;
+    - остальное: это уже похоже на ошибку в коде, traceback оставляем.
+    """
+    if isinstance(exc, requests.HTTPError):
+        logger.error(message, *args)
+    elif isinstance(exc, requests.RequestException):
+        logger.error(f'{message}: %s', *args, exc)
+    else:
+        logger.exception(message, *args)
+
+
 def _load_mode_tag(mode: str):
     """
     Помечает режимом загрузки все сообщения лога cdc_1c, выданные внутри метода: полная выгрузка
@@ -459,15 +476,15 @@ class Replicator1C:
                     delay = interval
                 except Exception as exc:
                     if interval <= 0:
-                        logger.exception("Replication cycle failed, will retry")
+                        _log_failure(exc, "Replication cycle failed, will retry")
                     elif _is_permanent_error(exc):
                         delay = max_backoff
-                        logger.exception(
-                            "Replication cycle failed with a permanent error (check credentials, "
-                            "rights and exchange plan settings), retry in %ss", delay)
+                        _log_failure(
+                            exc, "Replication cycle failed with a permanent error (check "
+                            "credentials, rights and exchange plan settings), retry in %ss", delay)
                     else:
                         delay = min(max(delay, interval) * BACKOFF_FACTOR, max_backoff)
-                        logger.exception("Replication cycle failed, retry in %ss", delay)
+                        _log_failure(exc, "Replication cycle failed, retry in %ss", delay)
 
                 iterations += 1
                 if max_iterations > 0 and iterations >= max_iterations:
@@ -497,8 +514,8 @@ class Replicator1C:
         try:
             self.full_load(object_full_name)
             self.metadata.mark_full_loaded(object_full_name)
-        except Exception:
-            logger.exception("Background full_load of %s failed, will retry", object_full_name)
+        except Exception as exc:
+            _log_failure(exc, "Background full_load of %s failed, will retry", object_full_name)
         finally:
             with self._in_progress_lock:
                 self._full_load_in_progress.discard(object_full_name)
