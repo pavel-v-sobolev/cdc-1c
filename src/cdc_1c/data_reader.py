@@ -9,7 +9,8 @@ import uuid
 
 import xmltodict
 
-from cdc_1c.metadata_reader import MetadataReader1C, resolve_timeout
+from cdc_1c.metadata_reader import (ENTITY_TYPES, REGISTER_TYPES, SUPPORTED_TYPES,
+                                    MetadataReader1C, resolve_timeout)
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.common_functions import format_bytes, parse_object_full_name, raise_for_status
 from cdc_1c.logging_config import get_logger
@@ -25,18 +26,32 @@ def _json_safe(value: Any) -> Any:
         return value.isoformat()
     return value
 
-REGISTER_TYPES = ('InformationRegister','AccumulationRegister')
-ENTITY_TYPES = ('Catalog','Document')
+# REGISTER_TYPES / ENTITY_TYPES / SUPPORTED_TYPES импортируются из metadata_reader: список
+# поддерживаемых классов объектов должен быть один на всю библиотеку.
 METADATA_POSTFIXES = ('_RecordType','_RowType','_Balance','_Turnover','_BalanceAndTurnover')
 ODATA_PREFIX = 'StandardODATA.'
 
 # Поле 1С с пометкой удаления у документов и справочников.
 DELETION_MARK_FIELD = 'DeletionMark'
-# Спец-поле, заполняемое при загрузке: True для удаленных объектов (DeletionMark)
-# и для фиктивных записей (удаленный набор регистра, опустевшая табличная часть).
+# Поле 1С «признак активности строки» у записей регистров: неактивная запись не участвует
+# в итогах 1С, поэтому не должна участвовать и в наших расчетах.
+ACTIVE_FIELD = 'Active'
+# Поле 1С «версия данных» у ссылочных объектов. Меняется при КАЖДОЙ записи объекта, даже если
+# ни один реквизит не изменился, поэтому в сравнении строк не участвует (см. DBWriter1C.save).
+VERSION_FIELD = 'Version'
+# Спец-поле, заполняемое при загрузке. Универсальный признак «строку не учитывать»:
+# пометка удаления объекта (DeletionMark), неактивная запись регистра (Active=False)
+# и фиктивные записи (удаленный набор регистра, опустевшая табличная часть).
+# Полное описание логики — в README, раздел про is_deleted_or_empty.
 IS_DELETED_OR_EMPTY_FIELD = 'is_deleted_or_empty'
 # Спец-поле: номер пакета обмена (message_no), проставляется во все записи при чтении изменений.
 EXCHANGE_MESSAGE_NO_FIELD = 'exchange_message_no'
+
+# Номер строки внутри набора (табличная часть, набор движений регистратора). Входит в первичный
+# ключ обоих, и 1С нумерует строки подряд с единицы — на этом построен ключ фиктивной записи
+# (см. _make_deleted_register_record / _make_empty_table_part_record).
+LINE_NUMBER_FIELD = 'LineNumber'
+FIRST_LINE_NUMBER = 1
 
 # Поля регистратора в OData. 1С называет их по-разному в зависимости от того, сколько типов
 # документов может быть регистратором регистра:
@@ -61,7 +76,7 @@ def _odata_literal(value: Any, type_name: str) -> str:
     if type_name == 'DateTime':
         v = value.strftime('%Y-%m-%dT%H:%M:%S') if isinstance(value, (datetime, date)) else str(value)
         return f"datetime'{v}'"
-    if type_name in ('Int64', 'Int16', 'Double'):
+    if type_name in ('Int64', 'Int32', 'Int16', 'Double'):
         return str(value)
     if type_name == 'Boolean':
         return 'true' if value else 'false'
@@ -267,14 +282,23 @@ class DataReader1C(UserDict):
         Разбирает entry ответа 1С в объекты reader. Возвращает счётчик entry по объектам —
         вызывающий логирует итог одной строкой: entry в ответе бывают тысячами, и лог на каждую
         забивает вывод (см. read_object / ChangeReader1C.read_changes).
+
+        Объекты неподдерживаемых классов (см. SUPPORTED_TYPES) пропускаются с ошибкой в логе: пакет
+        изменений подтверждается целиком, поэтому такие изменения 1С больше не пришлёт — молчать
+        об этом нельзя. Лог один на пакет, а не на entry.
         """
         parsed: Counter = Counter()
+        unsupported: Counter = Counter()
         for object_entry in object_entries:
 
             object_full_name = (object_entry.get('category') or {}).get('@term')
             object_name, object_type = parse_object_full_name(object_full_name)
 
             parsed[object_name] += 1
+
+            if object_type not in SUPPORTED_TYPES:
+                unsupported[object_full_name] += 1
+                continue
 
             if object_name and self.metadata.get(object_name) is None:
                 self.metadata.get_metadata()
@@ -288,6 +312,12 @@ class DataReader1C(UserDict):
 
             if object_type in ENTITY_TYPES:
                 self._get_entity_records(object_name, properties)
+
+        if unsupported:
+            logger.error(
+                "Objects of unsupported classes were skipped and their changes are lost "
+                "(the exchange message is confirmed as a whole, 1C will not send them again): %s",
+                ', '.join(f'{name} ({n} entries)' for name, n in unsupported.items()))
 
         return parsed
 
@@ -311,7 +341,7 @@ class DataReader1C(UserDict):
         try:
             if type_name == 'Boolean':
                 return value.lower() == 'true'
-            if type_name in ('Int64', 'Int16'):
+            if type_name in ('Int64', 'Int32', 'Int16'):
                 return int(value)
             if type_name == 'Double':
                 return float(value)
@@ -373,9 +403,11 @@ class DataReader1C(UserDict):
 
                 fields[field_name] = converted
 
-        # Спец-поле: для документов/справочников True по пометке удаления,
-        # для регистров/табличных частей (нет DeletionMark) — False.
-        fields[IS_DELETED_OR_EMPTY_FIELD] = bool(fields.get(DELETION_MARK_FIELD))
+        # Спец-поле «строку не учитывать»: пометка удаления у документа/справочника либо
+        # неактивная запись регистра. Active сравниваем именно с False: у объектов его нет вовсе,
+        # а None означает «1С не прислала» — молча гасить такую строку нельзя.
+        fields[IS_DELETED_OR_EMPTY_FIELD] = (bool(fields.get(DELETION_MARK_FIELD))
+                                             or fields.get(ACTIVE_FIELD) is False)
         fields[EXCHANGE_MESSAGE_NO_FIELD] = self.exchange_message_no
 
         return fields
@@ -387,7 +419,7 @@ class DataReader1C(UserDict):
         # составной ключ (в целевой таблице поля ключа NOT NULL).
         if type_name == 'String':
             return ''
-        if type_name in ('Int64', 'Int16', 'Double'):
+        if type_name in ('Int64', 'Int32', 'Int16', 'Double'):
             return 0
         if type_name == 'Boolean':
             return False
@@ -421,8 +453,9 @@ class DataReader1C(UserDict):
     def _make_deleted_register_record(self, object_name: str, properties: dict) -> dict | None:
         """
         Создает запись для удаленного набора записей регистра (пришел пустой RecordSet).
-        Заполняет полный первичный ключ из метаданных дефолтами по типу поля и проставляет
-        реальные поля регистратора из entry (_entry_recorder_fields).
+        Заполняет полный первичный ключ из метаданных дефолтами по типу поля (кроме номера строки,
+        см. _first_line_number) и проставляет реальные поля регистратора из entry
+        (_entry_recorder_fields).
 
         Возвращает None, если полей регистратора в entry нет — тогда непонятно, чей набор
         удалять, и фиктивную запись создавать нельзя (ключ остался бы пустым).
@@ -430,6 +463,7 @@ class DataReader1C(UserDict):
         metadata_obj = self.metadata[object_name]
         record = {field: self._default_key_value(type_name)
                   for field, type_name in metadata_obj.primary_key.items()}
+        self._first_line_number(record, metadata_obj.primary_key)
 
         recorder_fields = self._entry_recorder_fields(object_name, properties)
         if not any(field in recorder_fields for field in RECORDER_FIELDS):
@@ -441,15 +475,34 @@ class DataReader1C(UserDict):
         record[EXCHANGE_MESSAGE_NO_FIELD] = self.exchange_message_no
         return record
 
+    @staticmethod
+    def _first_line_number(record: dict, primary_key: dict) -> None:
+        """
+        Ставит фиктивной записи номер строки 1 вместо дефолтного 0.
+
+        Смысл — чтобы такая запись не жила вечно. 1С нумерует строки набора (табличная часть, набор
+        движений регистратора) подряд с единицы, поэтому как только набор снова наполнится, реальная
+        первая строка придет с тем же ключом и перезапишет фиктивную: значения настоящие,
+        is_deleted_or_empty=False. С номером 0 такого ключа в 1С не бывает, и запись осталась бы
+        в таблице навсегда (при delete_mode='mark' удалить ее было бы уже некому).
+
+        Если набор вдруг придет без первой строки, фиктивная запись просто останется помеченной —
+        то есть поведение будет как при номере 0, не хуже.
+        """
+        if LINE_NUMBER_FIELD in primary_key:
+            record[LINE_NUMBER_FIELD] = FIRST_LINE_NUMBER
+
     def _make_empty_table_part_record(self, table_part_name: str, ref_key: Any) -> dict:
         """
         Создает запись для опустевшей табличной части (пришла без строк), по аналогии с удаленным
-        набором регистра. Полный ключ из метаданных заполняется дефолтами, а Ref_Key —
-        реальным значением владельца, чтобы scoped-удаление по Ref_Key убрало старые строки.
+        набором регистра. Полный ключ из метаданных заполняется дефолтами (кроме номера строки, см.
+        _first_line_number), а Ref_Key — реальным значением владельца, чтобы scoped-удаление по
+        Ref_Key убрало старые строки.
         """
         primary_key = self.metadata[table_part_name].primary_key
         record = {field: self._default_key_value(type_name)
                   for field, type_name in primary_key.items()}
+        self._first_line_number(record, primary_key)
         record['Ref_Key'] = ref_key
         record[IS_DELETED_OR_EMPTY_FIELD] = True
         record[EXCHANGE_MESSAGE_NO_FIELD] = self.exchange_message_no

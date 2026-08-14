@@ -1,8 +1,12 @@
 
-from sqlalchemy import Engine, Index, MetaData, Table, tuple_, select, or_, and_, exists
+from datetime import datetime
+
+from sqlalchemy import (Engine, Index, MetaData, Table, Integer, Numeric,
+                        tuple_, select, or_, and_, exists, func)
 from dbmerge import dbmerge, mergeResult
 
-from cdc_1c.data_reader import DataObject1C, EXCHANGE_MESSAGE_NO_FIELD
+from cdc_1c.data_reader import (DataObject1C, EXCHANGE_MESSAGE_NO_FIELD,
+                                IS_DELETED_OR_EMPTY_FIELD, VERSION_FIELD)
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.logging_config import get_logger
 
@@ -12,10 +16,13 @@ logger = get_logger(__name__)
 MERGED_ON_FIELD = 'merged_on'
 INSERTED_ON_FIELD = 'inserted_on'
 
-# Порядок сохранения объектов: справочники → документы → регистры. Документы ссылаются на
-# справочники (по *_Key), регистры — на документы (Recorder), поэтому родителей сохраняем раньше.
-# Табличные части (Catalog_X_Y / Document_X_Y) попадают в группу своего владельца по префиксу.
-SAVE_ORDER_PREFIXES = ('Catalog', 'Document', 'InformationRegister', 'AccumulationRegister')
+# Порядок сохранения объектов: ссылочные (справочники и родня) → документы → регистры. Документы
+# ссылаются на справочники (по *_Key), регистры — на документы (Recorder), поэтому родителей
+# сохраняем раньше. Табличные части (Catalog_X_Y / Document_X_Y) попадают в группу своего владельца
+# по префиксу. Состав ссылочных классов — см. ENTITY_TYPES в metadata_reader.
+SAVE_ORDER_PREFIXES = ('Catalog', 'ChartOfCharacteristicTypes', 'ChartOfAccounts',
+                       'ChartOfCalculationTypes', 'BusinessProcess', 'Task',
+                       'Document', 'InformationRegister', 'AccumulationRegister')
 
 
 def save_order_key(object_name: str) -> int:
@@ -36,10 +43,12 @@ class DBWriter1C:
     контекста обмена (его можно использовать и для полной перевыгрузки через read_object, где нет
     номера пакета).
 
-    Версионирование (см. save, full_load): у каждой записи есть exchange_message_no (emn) — номер
-    пакета обмена у изменений, 0 у полной выгрузки. Полная выгрузка (full_load=True) не перезаписывает
-    более свежие данные из потока изменений (guard'ы по emn); изменения авторитетны и идут в порядке
-    пакетов, поэтому guard'ами не ограничиваются.
+    Гонка полной выгрузки с потоком изменений (см. save, full_load_started_at): снимок полной
+    выгрузки читается долго и к моменту записи может устареть, поэтому он не трогает строки,
+    переписанные уже после старта своего прогона (guard'ы по merged_on). Всё, что старше прогона,
+    он вправе перезаписать — за счёт этого полная выгрузка остаётся рабочим способом выровнять
+    данные, если изменение потерялось или не зарегистрировалось в 1С. Изменения авторитетны и идут
+    в порядке пакетов, поэтому guard'ами не ограничиваются.
     """
 
     def __init__(self, engine: Engine, name_mapper: NameMapper1C, schema: str | None = None):
@@ -50,21 +59,27 @@ class DBWriter1C:
         # и не дёргать checkfirst на каждом save).
         self._indexed_tables: set[str] = set()
 
-    def save(self, object_name: str, data_object: DataObject1C, full_load: bool = False) -> mergeResult | None:
+    def save(self, object_name: str, data_object: DataObject1C,
+             full_load_started_at: datetime | None = None) -> mergeResult | None:
         """
         Сохраняет один объект через dbmerge.
 
-        Режим изменений (full_load=False, по умолчанию): для регистров/табличных частей — scoped-
-        удаление по object_key (набор группы заменяется целиком), для документов/справочников —
-        чистый upsert по ключу. Изменения авторитетны, поэтому version-guard'ами не ограничиваются.
+        Режим изменений (full_load_started_at=None, по умолчанию): для регистров/табличных частей —
+        scoped-удаление по object_key (набор группы заменяется целиком), для документов/справочников —
+        чистый upsert по ключу. Изменения авторитетны, поэтому guard'ами не ограничиваются.
 
-        Режим полной выгрузки (full_load=True): записи штампуются emn=0 (см. full_load), и применяются
-        version-guard'ы, чтобы устаревший снимок не затирал более свежие изменения (emn>0):
-        - документ/справочник: upsert без удаления + update_condition (перезаписываем только строки
-          без версии/со своей версией; удаление у документов мягкое — строка остаётся, это update);
+        Режим полной выгрузки (передан full_load_started_at — момент старта прогона, см. db_now):
+        применяются guard'ы по merged_on, чтобы устаревший снимок не затирал изменения, пришедшие
+        уже после старта прогона:
+        - документ/справочник: upsert без удаления + update_condition (перезаписываем строку, только
+          если её не переписывали с момента старта; удаление у документов мягкое — строка остаётся,
+          это update);
         - регистр/табличная часть: own-or-skip группы целиком (группа умещается на одной странице) —
-          scoped-удаление с version-guard'ом, update_condition и insert_condition, чтобы «горячую»
-          группу (есть строка с emn>0) не трогать, а «свою» (emn NULL/0) заменить снимком.
+          scoped-удаление с guard'ом, update_condition и insert_condition, чтобы «горячую» группу
+          (есть строка, переписанная после старта прогона) не трогать, а остальные заменить снимком.
+
+        Строки старше своего прогона снимок перезаписывает — это и делает полную выгрузку способом
+        выровнять данные, а не только добить то, что ни разу не менялось.
 
         Возвращает mergeResult, либо None на ранних выходах (пустой набор / нет метаданных) —
         лог загрузки принимает None (write_result тогда просто не прибавляет счётчики).
@@ -88,61 +103,119 @@ class DBWriter1C:
                       for col, typ in metadata_obj.get_column_types().items()}
 
         object_key = metadata_obj.object_key
-        emn = self.name_mapper.map_field_name(EXCHANGE_MESSAGE_NO_FIELD)
+        started_at = full_load_started_at
+        skip_compare = self._noisy_fields(records)
 
         if not object_key:
             # Документ/справочник (одна запись по ключу): чистый upsert без удаления.
             with dbmerge(engine=self.engine, table_name=table_name, data=records,
                          key=key, data_types=data_types,
                          merged_on_field=MERGED_ON_FIELD, inserted_on_field=INSERTED_ON_FIELD,
+                         skip_compare_fields=skip_compare,
                          delete_mode='no', schema=self.schema) as merge:
                 result = merge.exec(
-                    update_condition=self._update_version_guard(merge, emn) if full_load else None)
+                    update_condition=self._not_touched_since(merge.table, started_at)
+                                     if started_at is not None else None)
         else:
             # Регистр/табличная часть: набор по object_key целиком заменяет существующий.
-            # Удаляем строки только тех групп, что пришли в наборе, и которых больше нет в источнике.
+            # Выпавшие из набора строки помечаем, а не удаляем: исчезновение строки — такое же
+            # событие, как изменение, и без следа его не увидит ни материализатор (нечему поднять
+            # merged_on), ни guard полной выгрузки. Помечаем только те группы, что пришли в наборе.
             mapped_object_key = [self.name_mapper.map_field_name(k) for k in object_key]
             with dbmerge(engine=self.engine, table_name=table_name, data=records,
                          key=key, data_types=data_types,
                          merged_on_field=MERGED_ON_FIELD, inserted_on_field=INSERTED_ON_FIELD,
-                         delete_mode='delete', schema=self.schema) as merge:
+                         skip_compare_fields=skip_compare,
+                         delete_mode='mark',
+                         delete_mark_field=self.name_mapper.map_field_name(IS_DELETED_OR_EMPTY_FIELD),
+                         delete_mark_values=self._resource_reset_values(metadata_obj, records),
+                         schema=self.schema) as merge:
                 scoped = self._scoped_delete_condition(merge.table, merge.temp_table, mapped_object_key)
-                if full_load:
-                    # own-or-skip группы: не трогаем группы с более свежей версией (emn>0).
+                if started_at is not None:
+                    # own-or-skip группы: не трогаем то, что переписано после старта прогона.
                     result = merge.exec(
-                        delete_condition=and_(scoped, self._delete_version_guard(merge, emn)),
-                        update_condition=self._update_version_guard(merge, emn),
-                        insert_condition=self._insert_version_guard(merge, mapped_object_key, emn))
+                        delete_condition=and_(scoped, self._not_touched_since(merge.table, started_at)),
+                        update_condition=self._not_touched_since(merge.table, started_at),
+                        insert_condition=self._group_not_touched_since(merge, mapped_object_key,
+                                                                       started_at))
                 else:
                     result = merge.exec(delete_condition=scoped)
 
         self._ensure_merged_on_index(table_name)
         return result
 
-    # Version-guard'ы полной выгрузки по exchange_message_no (emn): у изменений emn>=1, у полной
-    # выгрузки emn=0. Каждый передаётся в своё условие dbmerge (update/delete/insert).
+    def _noisy_fields(self, records: list[dict]) -> list[str]:
+        """
+        Поля, отличие в которых само по себе не считается изменением строки (skip_compare_fields):
+        exchange_message_no и Version меняются при каждой записи объекта в 1С, даже если ни один
+        реквизит не изменился. Без этого шумный объект переписывал бы строку впустую, поднимая
+        merged_on — а на merged_on завязаны и инкрементальная материализация, и guard'ы полной
+        выгрузки. Писаться поля при этом продолжают: строку обновило что-то другое — обновятся и они.
+        """
+        present = records[0].keys()
+        return [col for col in (self.name_mapper.map_field_name(EXCHANGE_MESSAGE_NO_FIELD),
+                                self.name_mapper.map_field_name(VERSION_FIELD))
+                if col in present]
+
+    def _resource_reset_values(self, metadata_obj, records: list[dict]) -> dict:
+        """
+        Чем ещё пометить строку, выпавшую из набора (delete_mark_values): числовые ресурсы регистра
+        гасим в NULL. SUM игнорирует NULL, поэтому итог остаётся верным даже в запросе, забывшем
+        фильтр по is_deleted_or_empty. Строковые ресурсы не трогаем — суммировать их некому.
+
+        Берём только те ресурсы, что есть в текущем наборе: dbmerge требует существующую колонку,
+        а таблицу он создаёт по этим же данным (набор из одной фиктивной записи ресурсов не несёт).
+        Ресурсы известны не всегда — классификация полей опирается на виртуальные таблицы 1С
+        (см. _classify_register_fields); нет их — гасить нечего.
+        """
+        column_types = metadata_obj.get_column_types()
+        present = records[0].keys()
+        values = {}
+        for resource in metadata_obj.resources:
+            column = self.name_mapper.map_field_name(resource)
+            if column in present and isinstance(column_types.get(resource), (Integer, Numeric)):
+                values[column] = None
+        return values
+
+    def db_now(self) -> datetime:
+        """
+        Текущее время ПО ЧАСАМ БД — момент старта прогона полной выгрузки для guard'ов ниже.
+        Берётся из БД, а не из Python, чтобы сравниваться с merged_on, который dbmerge штампует
+        тем же now(). Вызывать один раз на прогон, до чтения первой страницы: старт заведомо раньше
+        любого чтения, поэтому guard защищает с запасом, а не впритык.
+        """
+        with self.engine.connect() as conn:
+            return conn.scalar(select(func.now()))
+
+    # Guard'ы полной выгрузки по merged_on. Смысл один на все три: снимок читается долго и к моменту
+    # записи может устареть, поэтому он не трогает то, что переписали уже после старта его прогона.
+    # Всё, что старше прогона, снимок вправе перезаписать — данные из 1С он прочитал позже, значит
+    # они не старее. merged_on IS NULL — строка из времён, когда поля ещё не было: считаем старой.
+    #
+    # Сравниваются, по сути, не отметки времени, а порядок чтения из 1С; отметки лишь позволяют его
+    # восстановить: merged_on < started_at => транзакция изменения началась до метки => пакет пришёл
+    # из 1С до метки => страница выгрузки (её читают уже после метки) не старее. Поэтому не страшно,
+    # что now() в PostgreSQL — время начала транзакции и коммит может лечь позже метки.
+    # Условие корректности: merged_on строки никогда не должен быть РАНЬШЕ момента получения пакета
+    # из 1С. Сейчас так и есть — его штампует dbmerge в момент записи. Сломается, если брать его из
+    # поля 1С или переиспользовать отметку прошлой загрузки.
 
     @staticmethod
-    def _update_version_guard(merge, emn: str):
-        """update_condition: перезаписывать целевую строку, только если у неё ещё нет версии или
-        входящая версия не старше сохранённой (temp.emn >= target.emn) — свежее не затираем."""
-        return or_(merge.table.c[emn].is_(None), merge.temp_table.c[emn] >= merge.table.c[emn])
+    def _not_touched_since(table, started_at: datetime):
+        """update_condition/delete_condition: трогаем целевую строку, только если её не переписывали
+        с момента старта прогона."""
+        col = table.c[MERGED_ON_FIELD]
+        return or_(col.is_(None), col < started_at)
 
     @staticmethod
-    def _delete_version_guard(merge, emn: str):
-        """delete_condition: полная выгрузка удаляет целевую строку, только если та не новее снимка —
-        т.е. это базовая строка выгрузки, а не строка от изменения (emn NULL или <=0)."""
-        return or_(merge.table.c[emn].is_(None), merge.table.c[emn] <= 0)
-
-    @staticmethod
-    def _insert_version_guard(merge, mapped_object_key: list[str], emn: str):
-        """insert_condition: не вставлять строку в группу (по object_key), где уже есть строка от
-        изменения (emn>0) — иначе полная выгрузка воскресила бы удалённую изменением строку. В
-        insert-фазе строки по PK нет, поэтому «новизну» проверяем на уровне группы коррелированным
+    def _group_not_touched_since(merge, mapped_object_key: list[str], started_at: datetime):
+        """insert_condition: не вставлять строку в группу (по object_key), где хоть одну строку
+        переписали после старта прогона — иначе снимок воскресил бы строку, удалённую изменением.
+        В insert-фазе строки по PK ещё нет, поэтому проверяем на уровне группы коррелированным
         NOT EXISTS по отдельному алиасу целевой таблицы."""
         g = merge.table.alias()
         conds = [g.c[col] == merge.temp_table.c[col] for col in mapped_object_key]
-        conds.append(g.c[emn] > 0)
+        conds.append(g.c[MERGED_ON_FIELD] >= started_at)
         return ~exists().where(and_(*conds))
 
     def _ensure_merged_on_index(self, table_name: str) -> None:

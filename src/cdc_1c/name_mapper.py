@@ -30,7 +30,7 @@ HASH_LENGTH = 4
 # Служебные имена полей (добавляются при загрузке/сохранении).
 # Наше собственное служебное поле сохраняет имя как есть; поле 1С, которое
 # транслитерируется в служебное имя, переименовывается (добавляется хэш), чтобы не было конфликта.
-RESERVED_FIELD_NAMES = ('merged_on', 'inserted_on', 'exchange_message_no')
+RESERVED_FIELD_NAMES = ('merged_on', 'inserted_on', 'exchange_message_no', 'is_deleted_or_empty')
 
 
 class NameMapper1C:

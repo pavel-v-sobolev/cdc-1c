@@ -253,7 +253,7 @@ class Replicator1C:
                   date_to: date | datetime | str | None = None) -> None:
         """
         Полная постраничная выгрузка объекта 1С в целевую таблицу: по batch_size записей за запрос,
-        каждая страница сразу сохраняется через writer.save(full_load=True). Идемпотентно — повторный
+        каждая страница сразу сохраняется через writer.save(full_load_started_at=...). Идемпотентно — повторный
         прогон обновляет строки по ключу. Документ/справочник — чистый upsert; регистр/табличная часть —
         own-or-skip группы целиком (группа умещается на одной странице), см. DBWriter1C.save.
 
@@ -269,9 +269,10 @@ class Replicator1C:
         укладывается в FULL_LOAD_TARGET_BYTES. Если 1С всё же не осилила страницу (500), размер
         уменьшается и запрос повторяется с того же места (см. FULL_LOAD_BATCH_DIVISOR).
 
-        Версия и гонка с изменениями: строки выгрузки штампуются exchange_message_no=0, а save идёт с
-        full_load=True — с version-guard'ами по emn, чтобы устаревший снимок не затирал более свежие
-        изменения (emn>0) и не воскрешал удалённые строки групп (регистр/ТЧ). См. DBWriter1C.save.
+        Гонка с изменениями: момент старта прогона (по часам БД) берётся один раз и передаётся в
+        save как full_load_started_at — снимок не трогает строки, переписанные уже после старта, и не
+        воскрешает удалённые за это время строки групп (регистр/ТЧ). Всё, что старше прогона, снимок
+        перезаписывает: полная выгрузка остаётся способом выровнять данные. См. DBWriter1C.save.
 
         Необязательный фильтр по периоду: date_field — имя поля даты/времени объекта (Date у
         документов, Period у регистров), date_from/date_to — границы (datetime/date/ISO-строка,
@@ -291,6 +292,10 @@ class Replicator1C:
                               request_timeout=self._request_timeout)
         # Полная выгрузка = базовая версия: emn=0 (ниже любого номера пакета изменений >=1).
         reader.exchange_message_no = 0
+
+        # Момент старта прогона по часам БД — граница для guard'ов save (см. DBWriter1C.db_now).
+        # Берётся один раз, до чтения первой страницы, и общий на все страницы прогона.
+        started_at = self.writer.db_now()
 
         log_id = self.replicator_log.start(self._exchange_name, object_name, None, LOAD_TYPE_FULL)
         logger.info("Full load of %s started (batch_size=%s, key=%s, paging=%s, date_filter=%s)",
@@ -320,7 +325,7 @@ class Replicator1C:
                 continue
             for obj_name, data_object in reader.items():
                 # Много страниц/объектов пишутся в одну строку лога — счётчики суммируются в БД.
-                result = self.writer.save(obj_name, data_object, full_load=True)
+                result = self.writer.save(obj_name, data_object, full_load_started_at=started_at)
                 self.replicator_log.write_result(log_id, result)
             total += page
             if page < page_size:

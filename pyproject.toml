@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cdc-1c"
-version = "0.1.9"
+version = "0.1.10"
 description = "Change data capture (CDC) from 1C:Enterprise to your data warehouse"
 readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
-    "dbmerge>=1.0.20",
+    "dbmerge>=1.0.21",
     "requests>=2.33.0",
     "sqlalchemy>=2.0.49",
     "xmltodict>=1.0.4",

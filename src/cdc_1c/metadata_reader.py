@@ -4,7 +4,7 @@ from typing import Any
 from collections import UserDict
 
 import xmltodict
-from sqlalchemy import (String, Uuid, BigInteger, SmallInteger, Numeric, Boolean, DateTime,
+from sqlalchemy import (String, Uuid, BigInteger, Integer, SmallInteger, Numeric, Boolean, DateTime,
                         JSON, Engine, func, insert, select, update)
 from sqlalchemy.dialects.postgresql import JSONB
 from dbmerge import dbmerge
@@ -36,6 +36,10 @@ METADATA_OBJECTS_TABLE = 'metadata_objects_1c'
 
 type_mapping = {'Guid':Uuid(),
                 'Int64':BigInteger(),
+                # Int32 приходит там, где у объекта числовой код/номер (Code, Number) и у номеров
+                # сообщений плана обмена (ReceivedNo/SentNo) — см. Приложение 12 руководства
+                # разработчика. Без него поле отбрасывалось бы как «неизвестный тип».
+                'Int32':Integer(),
                 'Int16':SmallInteger(),
                 'String':String(),
                 'Double':Numeric(),
@@ -62,7 +66,15 @@ GUESS_UUID_TYPES = True
 # т.к. иначе будут медленно работать JOIN
 
 REGISTER_TYPES = ('InformationRegister','AccumulationRegister')
-ENTITY_TYPES = ('Catalog','Document')
+# Ссылочные классы: устроены одинаково (Ref + DeletionMark + реквизиты + табличные части),
+# поэтому разбираются общим кодом. Регистры бухгалтерии и расчёта сюда не входят: у них своя
+# структура записи (Dr/Cr-пары, счета, периоды действия) — см. Приложение 12 руководства
+# разработчика, разделы 12.11 и 12.12.
+ENTITY_TYPES = ('Catalog','Document','ChartOfCharacteristicTypes','ChartOfAccounts',
+                'ChartOfCalculationTypes','BusinessProcess','Task')
+# Классы, которые мы умеем сохранять. Всё остальное, придя в пакете изменений, будет потеряно
+# (пакет подтверждается целиком), поэтому такие объекты логируются отдельно — см. read_data_entries.
+SUPPORTED_TYPES = REGISTER_TYPES + ENTITY_TYPES
 METADATA_POSTFIXES = ('_RecordType','_RowType','_Balance','_Turnover','_BalanceAndTurnover')
 ODATA_PREFIX = 'StandardODATA.'
 TYPE_PREFIX = 'Edm.'

@@ -1,9 +1,14 @@
 """
-Оффлайн-тесты version-guard полной выгрузки (DBWriter1C.save, full_load=True) на sqlite.
-Изменения штампуются exchange_message_no (emn) >= 1, полная выгрузка — emn=0. Проверяем, что
-устаревший снимок full_load не затирает более свежие изменения и не воскрешает удалённые строки
-групп (регистр/табличная часть). Ключи строковые — тип ключа на version-guard (по emn) не влияет.
+Оффлайн-тесты guard'ов полной выгрузки (DBWriter1C.save, full_load_started_at) на sqlite.
+
+Guard сравнивает merged_on строки с моментом старта прогона: снимок не трогает то, что переписали
+уже после его старта, но всё, что старше прогона, перезаписывает. В тестах момент старта задаётся
+явно — OLD_RUN (прогон стартовал до всех изменений, снимок устарел) и NEW_RUN (прогон стартовал
+после, снимок актуален), — поэтому проверки не зависят от реального времени и от разрешения часов
+СУБД. Ключи строковые: тип ключа на guard не влияет.
 """
+
+from datetime import datetime
 
 from sqlalchemy import create_engine, select, Table, MetaData
 
@@ -13,6 +18,11 @@ from cdc_1c.metadata_reader import MetadataObject1C
 
 REF = "R1"
 REF2 = "R2"
+
+# Прогон, стартовавший до всех изменений: его снимок заведомо устарел.
+OLD_RUN = datetime(2000, 1, 1)
+# Прогон, стартовавший после всех изменений: его снимок свежее всего, что лежит в таблице.
+NEW_RUN = datetime(2100, 1, 1)
 
 
 def _writer():
@@ -40,24 +50,36 @@ def _doc_rec(ref, val, emn):
     return {"Ref_Key": ref, "Val": val, "is_deleted_or_empty": False, "exchange_message_no": emn}
 
 
-def test_full_load_does_not_overwrite_newer_change():
+def test_full_load_does_not_overwrite_change_newer_than_the_run():
     w = _writer()
-    # change записал строку (emn=105)
-    w.save("Catalog_X", _doc([_doc_rec(REF, "change", 105)]), full_load=False)
-    # полная выгрузка (emn=0) со своим (устаревшим) значением — guard не даёт перезаписать
-    w.save("Catalog_X", _doc([_doc_rec(REF, "fullload", 0)]), full_load=True)
+    # change записал строку
+    w.save("Catalog_X", _doc([_doc_rec(REF, "change", 105)]))
+    # прогон стартовал ДО этого изменения → его снимок устарел, перезаписывать нельзя
+    w.save("Catalog_X", _doc([_doc_rec(REF, "fullload", 0)]), full_load_started_at=OLD_RUN)
 
     rows = {r["Ref_Key"]: r for r in _rows(w, "Catalog_X")}
     assert rows[REF]["Val"] == "change"
-    assert rows[REF]["exchange_message_no"] == 105
+
+
+def test_full_load_repairs_row_older_than_the_run():
+    w = _writer()
+    # change записал строку — и, допустим, следующее изменение до нас не доехало
+    w.save("Catalog_X", _doc([_doc_rec(REF, "stale", 105)]))
+    # прогон стартовал ПОСЛЕ → снимок новее строки, полная выгрузка её выравнивает.
+    # Это и есть смысл временного guard'а: строка, once тронутая изменением, не становится
+    # неприкасаемой навсегда.
+    w.save("Catalog_X", _doc([_doc_rec(REF, "fullload", 0)]), full_load_started_at=NEW_RUN)
+
+    rows = {r["Ref_Key"]: r for r in _rows(w, "Catalog_X")}
+    assert rows[REF]["Val"] == "fullload"
 
 
 def test_change_overwrites_full_load_row():
     w = _writer()
-    # сначала легла полная выгрузка (emn=0)
-    w.save("Catalog_X", _doc([_doc_rec(REF, "fullload", 0)]), full_load=True)
-    # затем пришло изменение (emn=106) — перезаписывает базовую строку
-    w.save("Catalog_X", _doc([_doc_rec(REF, "change", 106)]), full_load=False)
+    # сначала легла полная выгрузка
+    w.save("Catalog_X", _doc([_doc_rec(REF, "fullload", 0)]), full_load_started_at=NEW_RUN)
+    # затем пришло изменение — оно авторитетно и guard'ами не ограничено
+    w.save("Catalog_X", _doc([_doc_rec(REF, "change", 106)]))
 
     rows = {r["Ref_Key"]: r for r in _rows(w, "Catalog_X")}
     assert rows[REF]["Val"] == "change" and rows[REF]["exchange_message_no"] == 106
@@ -65,9 +87,11 @@ def test_change_overwrites_full_load_row():
 
 def test_full_load_inserts_untouched_row():
     w = _writer()
-    w.save("Catalog_X", _doc([_doc_rec(REF, "change", 105)]), full_load=False)
-    # строку REF2 изменения не приносили — полная выгрузка её вставляет (backfill)
-    w.save("Catalog_X", _doc([_doc_rec(REF, "old", 0), _doc_rec(REF2, "backfill", 0)]), full_load=True)
+    w.save("Catalog_X", _doc([_doc_rec(REF, "change", 105)]))
+    # строку REF2 изменения не приносили — устаревший прогон всё равно её вставляет (backfill),
+    # вставка новых строк guard'ом не ограничена
+    w.save("Catalog_X", _doc([_doc_rec(REF, "old", 0), _doc_rec(REF2, "backfill", 0)]),
+           full_load_started_at=OLD_RUN)
 
     rows = {r["Ref_Key"]: r for r in _rows(w, "Catalog_X")}
     assert rows[REF]["Val"] == "change"          # существующую свежую не тронули
@@ -90,29 +114,44 @@ def _tp_rec(ref, line, val, emn):
             "is_deleted_or_empty": False, "exchange_message_no": emn}
 
 
-def test_full_load_does_not_resurrect_deleted_group_row():
+def test_full_load_does_not_resurrect_row_deleted_after_the_run_started():
     w = _writer()
-    # change заменил набор группы REF: строки 1,2 (emn=105); строка 3 удалена
-    w.save("Document_X_Rows", _tp([_tp_rec(REF, 1, "a", 105), _tp_rec(REF, 2, "b", 105)]),
-           full_load=False)
-    # устаревший снимок full_load (emn=0) видит и строку 3 — не должен её воскресить,
+    # change заменил набор группы REF: строки 1,2; строка 3 удалена
+    w.save("Document_X_Rows", _tp([_tp_rec(REF, 1, "a", 105), _tp_rec(REF, 2, "b", 105)]))
+    # прогон стартовал ДО этого изменения: его снимок видит и строку 3 — не должен её воскресить
     # и не должен тронуть «горячую» группу
     w.save("Document_X_Rows", _tp([_tp_rec(REF, 1, "a", 0), _tp_rec(REF, 2, "b", 0),
-                                   _tp_rec(REF, 3, "resurrected", 0)]), full_load=True)
+                                   _tp_rec(REF, 3, "resurrected", 0)]),
+           full_load_started_at=OLD_RUN)
 
     rows = {(r["Ref_Key"], r["LineNumber"]): r for r in _rows(w, "Document_X_Rows")}
-    assert (REF, 3) not in rows                    # воскрешение заблокировано insert_condition
+    assert (REF, 3) not in rows                       # воскрешение заблокировано insert_condition
     assert rows[(REF, 1)]["exchange_message_no"] == 105   # горячая группа не тронута
     assert rows[(REF, 2)]["exchange_message_no"] == 105
 
 
-def test_full_load_replaces_own_group():
+def test_full_load_replaces_group_older_than_the_run():
     w = _writer()
-    # группа REF2 создана только полной выгрузкой (emn=0): строки 1,2
-    w.save("Document_X_Rows", _tp([_tp_rec(REF2, 1, "x", 0), _tp_rec(REF2, 2, "y", 0)]),
-           full_load=True)
-    # повторная выгрузка: в источнике осталась только строка 1 → строка 2 должна удалиться
-    w.save("Document_X_Rows", _tp([_tp_rec(REF2, 1, "x", 0)]), full_load=True)
+    # группу принесло изменение: строки 1,2
+    w.save("Document_X_Rows", _tp([_tp_rec(REF, 1, "a", 105), _tp_rec(REF, 2, "b", 105)]))
+    # прогон стартовал ПОСЛЕ: снимок новее группы и заменяет её целиком
+    w.save("Document_X_Rows", _tp([_tp_rec(REF, 1, "fixed", 0)]), full_load_started_at=NEW_RUN)
 
     rows = {(r["Ref_Key"], r["LineNumber"]): r for r in _rows(w, "Document_X_Rows")}
-    assert set(rows) == {(REF2, 1)}               # «свою» группу заменили снимком (строка 2 удалена)
+    assert rows[(REF, 1)]["Val"] == "fixed"
+    # строка 2 выпала из набора: не удалена, а помечена (delete_mode='mark')
+    assert rows[(REF, 2)]["is_deleted_or_empty"]
+
+
+def test_full_load_replaces_own_group():
+    w = _writer()
+    # группа REF2 создана полной выгрузкой
+    w.save("Document_X_Rows", _tp([_tp_rec(REF2, 1, "x", 0), _tp_rec(REF2, 2, "y", 0)]),
+           full_load_started_at=OLD_RUN)
+    # повторный прогон, стартовавший позже: в источнике осталась только строка 1
+    w.save("Document_X_Rows", _tp([_tp_rec(REF2, 1, "x", 0)]), full_load_started_at=NEW_RUN)
+
+    rows = {(r["Ref_Key"], r["LineNumber"]): r for r in _rows(w, "Document_X_Rows")}
+    # «свою» группу заменили снимком: строка 1 живая, строка 2 помечена
+    assert not rows[(REF2, 1)]["is_deleted_or_empty"]
+    assert rows[(REF2, 2)]["is_deleted_or_empty"]

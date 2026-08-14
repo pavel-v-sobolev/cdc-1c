@@ -45,6 +45,30 @@ def _row(**overrides) -> dict:
     return row
 
 
+def test_inactive_record_is_flagged_as_not_counted():
+    # Active=False — запись не участвует в итогах 1С, значит и у нас должна быть погашена
+    # тем же флагом, что и удалённые: is_deleted_or_empty универсален (см. README).
+    fields = dict(_FIELDS, Active="Boolean")
+    reader = _reader(fields)
+    reader._get_register_records(REG, {"d:Recorder_Key": REC, "d:RecordSet": {"d:element": [
+        _row(**{"d:Active": "true"}),
+        _row(**{"d:LineNumber": "2", "d:Active": "false"}),
+    ]}})
+
+    data = reader[REG].data
+    assert data["Active"] == [True, False]
+    assert data[IS_DELETED_OR_EMPTY_FIELD] == [False, True]
+
+
+def test_missing_active_does_not_flag_the_record():
+    # Active в данных нет (объекты, старые выгрузки) — строку не гасим.
+    reader = _reader(dict(_FIELDS, Active="Boolean"))
+    reader._get_register_records(REG, {"d:Recorder_Key": REC,
+                                       "d:RecordSet": {"d:element": [_row()]}})
+
+    assert reader[REG].data[IS_DELETED_OR_EMPTY_FIELD] == [False]
+
+
 def test_record_set_with_recorder_key():
     # Непустой набор: движения разбираются как обычно, Recorder_Key приходит из строк набора.
     reader = _reader(_FIELDS)

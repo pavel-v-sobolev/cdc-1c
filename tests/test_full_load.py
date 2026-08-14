@@ -1,7 +1,7 @@
 """
 Оффлайн-тест постраничной полной выгрузки Replicator1C.full_load. Без живой 1С: чтение страниц
 подменяется (read_object), проверяется логика цикла — keyset-пагинация (курсор after_values),
-условие останова, сохранение в режиме полной выгрузки (full_load=True) для каждого объекта страницы
+условие останова, сохранение в режиме полной выгрузки (full_load_started_at) для каждого объекта страницы
 и одна строка в replicator_1c_log.
 """
 
@@ -65,8 +65,8 @@ def test_full_load_paging(monkeypatch):
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
 
     saved = []
-    def fake_save(name, obj, full_load=False):
-        saved.append((name, obj.data_length, full_load))
+    def fake_save(name, obj, full_load_started_at=None):
+        saved.append((name, obj.data_length, full_load_started_at))
         return _ZERO_RESULT
     rep.writer.save = fake_save
 
@@ -77,8 +77,10 @@ def test_full_load_paging(monkeypatch):
     assert all(c["after_values"] is None for c in calls)
     assert all(c["top"] == 2 for c in calls)
     assert all(c["key_fields"] == ["Ref_Key"] and c["key_types"] == ["Guid"] for c in calls)
-    # каждая страница сохранена в режиме полной выгрузки (full_load=True); всего 2+2+1 записей.
-    assert [s[2] for s in saved] == [True, True, True]
+    # каждая страница сохранена в режиме полной выгрузки (с моментом старта прогона, общим на все
+    # страницы); всего 2+2+1 записей.
+    assert all(s[2] is not None for s in saved)
+    assert len({s[2] for s in saved}) == 1
     assert sum(s[1] for s in saved) == 5
 
     # одна строка лога: это не пакет обмена (message_no=NULL), загрузка завершена (finished_at set).
@@ -118,7 +120,7 @@ def test_full_load_register_paging(monkeypatch):
         return n
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
-    rep.writer.save = lambda name, obj, full_load=False: _ZERO_RESULT
+    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
 
     rep.full_load("AccumulationRegister_R", batch_size=2)
 
@@ -156,7 +158,7 @@ def test_full_load_shrinks_to_single_entry(monkeypatch):
     rep = _replicator()
     calls = []
     monkeypatch.setattr(DataReader1C, "read_object", _failing_above(1, calls))
-    rep.writer.save = lambda name, obj, full_load=False: _ZERO_RESULT
+    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
 
     rep.full_load("Catalog_X", batch_size=1000)
 
@@ -170,7 +172,7 @@ def test_full_load_remembers_reduced_page_size(monkeypatch):
     rep = _replicator()
     calls = []
     monkeypatch.setattr(DataReader1C, "read_object", _failing_above(4, calls))
-    rep.writer.save = lambda name, obj, full_load=False: _ZERO_RESULT
+    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
 
     rep.full_load("Catalog_X", batch_size=1000)
     rep.full_load("Catalog_X", batch_size=1000)
@@ -204,7 +206,7 @@ def test_full_load_reraises_permanent_error(monkeypatch):
         raise requests.HTTPError("403", response=_response(403))
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
-    rep.writer.save = lambda name, obj, full_load=False: _ZERO_RESULT
+    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
 
     with pytest.raises(requests.HTTPError):
         rep.full_load("Catalog_X", batch_size=1000)
@@ -220,7 +222,7 @@ def test_full_load_empty_object(monkeypatch):
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
     saved = []
-    def fake_save(name, obj, full_load=False):
+    def fake_save(name, obj, full_load_started_at=None):
         saved.append(name)
         return _ZERO_RESULT
     rep.writer.save = fake_save
@@ -253,7 +255,7 @@ def test_full_load_composite_key_with_reference(monkeypatch):
         return 0
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
-    rep.writer.save = lambda name, obj, full_load=False: _ZERO_RESULT
+    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
 
     rep.full_load("InformationRegister_Indep", batch_size=2)
 
@@ -284,7 +286,7 @@ def test_full_load_composite_key_keyset(monkeypatch):
         return 0
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
-    rep.writer.save = lambda name, obj, full_load=False: _ZERO_RESULT
+    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
 
     rep.full_load("InformationRegister_Scalar", batch_size=2)
 
@@ -422,7 +424,7 @@ def test_full_load_passes_date_filter(monkeypatch):
         return 0
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
-    rep.writer.save = lambda name, obj, full_load=False: _ZERO_RESULT
+    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
 
     rep.full_load("Catalog_X", batch_size=2, date_field="Date",
                   date_from=date(2026, 6, 1), date_to=date(2026, 6, 30))
