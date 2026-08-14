@@ -3,7 +3,7 @@
 
 Два связанных механизма:
 - шумной пакет (1С переписала объект, не изменив реквизитов) не должен трогать строку: отличие
-  только в exchange_message_no / Version изменением не считается, merged_on остаётся прежним,
+  только в exchange_message_no / версии данных изменением не считается, merged_on остаётся прежним,
   иначе материализатор пересчитывал бы группу впустую;
 - строка, выпавшая из набора регистра/табличной части, не удаляется, а помечается: числовые
   ресурсы гасятся в NULL, merged_on поднимается — событие удаления не должно исчезать бесследно.
@@ -11,9 +11,11 @@
 
 import time
 
+import pytest
 from sqlalchemy import create_engine, select, Table, MetaData
 
 from cdc_1c import DataObject1C, NameMapper1C
+from cdc_1c.data_reader import VERSION_FIELDS
 from cdc_1c.db_writer import DBWriter1C
 from cdc_1c.metadata_reader import MetadataObject1C
 
@@ -32,45 +34,51 @@ def _rows(writer, table_name):
 
 # --- Шум: справочник переписан без изменения реквизитов ---
 
-_DOC_META = MetadataObject1C("Catalog_X", {"Ref_Key": "String", "Val": "String",
-                                           "Version": "String"},
-                             {"Ref_Key": "String"}, object_key=None)
+# Имя поля версии проверяем обоими: платформа отдаёт DataVersion, документация описывает Version
+# (см. VERSION_FIELDS). Тест на выдуманном имени прошёл бы, а на реальных данных механизм молчал.
+@pytest.fixture(params=VERSION_FIELDS)
+def version_field(request):
+    return request.param
 
 
-def _doc_rec(val, emn, version):
-    return {"Ref_Key": REF, "Val": val, "Version": version,
-            "is_deleted_or_empty": False, "exchange_message_no": emn}
+def _doc_meta(version_field):
+    return MetadataObject1C("Catalog_X", {"Ref_Key": "String", "Val": "String",
+                                          version_field: "String"},
+                            {"Ref_Key": "String"}, object_key=None)
 
 
-def _save_doc(writer, val, emn, version):
-    return writer.save("Catalog_X", DataObject1C(_DOC_META, [_doc_rec(val, emn, version)]))
+def _save_doc(writer, version_field, val, emn, version):
+    record = {"Ref_Key": REF, "Val": val, version_field: version,
+              "is_deleted_or_empty": False, "exchange_message_no": emn}
+    return writer.save("Catalog_X", DataObject1C(_doc_meta(version_field), [record]))
 
 
-def test_noisy_packet_does_not_touch_the_row():
+def test_noisy_packet_does_not_touch_the_row(version_field):
     w = _writer()
-    _save_doc(w, "a", emn=105, version="v1")
+    _save_doc(w, version_field, "a", emn=105, version="v1")
     before = _rows(w, "Catalog_X")[0]
 
     # 1С переписала объект: новый пакет и новая версия данных, реквизиты те же.
-    result = _save_doc(w, "a", emn=106, version="v2")
+    result = _save_doc(w, version_field, "a", emn=106, version="v2")
 
     after = _rows(w, "Catalog_X")[0]
     assert result.updated_row_count == 0
     assert after["merged_on"] == before["merged_on"]        # материализатор ничего не пересчитает
     assert after["exchange_message_no"] == 105              # шумные поля тоже не переписаны
+    assert after[version_field] == "v1"
 
 
-def test_real_change_writes_noisy_fields_too():
+def test_real_change_writes_noisy_fields_too(version_field):
     w = _writer()
-    _save_doc(w, "a", emn=105, version="v1")
+    _save_doc(w, version_field, "a", emn=105, version="v1")
 
-    result = _save_doc(w, "b", emn=106, version="v2")
+    result = _save_doc(w, version_field, "b", emn=106, version="v2")
 
     after = _rows(w, "Catalog_X")[0]
     assert result.updated_row_count == 1
     assert after["Val"] == "b"
     # строку обновило настоящее изменение — вместе с ней записались и шумные поля
-    assert after["exchange_message_no"] == 106 and after["Version"] == "v2"
+    assert after["exchange_message_no"] == 106 and after[version_field] == "v2"
 
 
 # --- Надгробия: строка выпала из набора движений регистра ---

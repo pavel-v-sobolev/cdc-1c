@@ -6,7 +6,7 @@ from sqlalchemy import (Engine, Index, MetaData, Table, Integer, Numeric,
 from dbmerge import dbmerge, mergeResult
 
 from cdc_1c.data_reader import (DataObject1C, EXCHANGE_MESSAGE_NO_FIELD,
-                                IS_DELETED_OR_EMPTY_FIELD, VERSION_FIELD)
+                                IS_DELETED_OR_EMPTY_FIELD, VERSION_FIELDS)
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.logging_config import get_logger
 
@@ -147,15 +147,17 @@ class DBWriter1C:
     def _noisy_fields(self, records: list[dict]) -> list[str]:
         """
         Поля, отличие в которых само по себе не считается изменением строки (skip_compare_fields):
-        exchange_message_no и Version меняются при каждой записи объекта в 1С, даже если ни один
-        реквизит не изменился. Без этого шумный объект переписывал бы строку впустую, поднимая
+        exchange_message_no и версия данных меняются при каждой записи объекта в 1С, даже если ни
+        один реквизит не изменился. Без этого шумный объект переписывал бы строку впустую, поднимая
         merged_on — а на merged_on завязаны и инкрементальная материализация, и guard'ы полной
         выгрузки. Писаться поля при этом продолжают: строку обновило что-то другое — обновятся и они.
+
+        Версия данных ищется под обоими известными именами (VERSION_FIELDS): как поле называется в
+        ответе, зависит от платформы, а не от нас. Берём те, что есть в записи.
         """
         present = records[0].keys()
-        return [col for col in (self.name_mapper.map_field_name(EXCHANGE_MESSAGE_NO_FIELD),
-                                self.name_mapper.map_field_name(VERSION_FIELD))
-                if col in present]
+        candidates = (EXCHANGE_MESSAGE_NO_FIELD, *VERSION_FIELDS)
+        return [col for col in map(self.name_mapper.map_field_name, candidates) if col in present]
 
     def _resource_reset_values(self, metadata_obj, records: list[dict]) -> dict:
         """
