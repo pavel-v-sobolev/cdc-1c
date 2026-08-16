@@ -4,9 +4,10 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
+from typing import Iterable
 
 import requests
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine
 
 from cdc_1c.metadata_reader import MetadataReader1C
 from cdc_1c.common_functions import format_duration
@@ -14,8 +15,8 @@ from cdc_1c.data_reader import DataReader1C, RECORDER_FIELDS
 from cdc_1c.change_reader import ChangeReader1C
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.db_writer import DBWriter1C, save_order_key
-from cdc_1c.config import Config
 from cdc_1c.db_logs import Replicator1CLog, LOAD_TYPE_CHANGES, LOAD_TYPE_FULL
+from cdc_1c.handlers import HandlerRunner, MergeTracker, SOURCE_CHANGES, SOURCE_FULL_LOAD
 from cdc_1c.logging_config import _ensure_handler, get_logger, load_mode, LOAD_MODE_CHANGES, LOAD_MODE_FULL
 
 logger = get_logger(__name__)
@@ -103,9 +104,10 @@ class Replicator1C:
     всплывает уже в run_once: в run_forever она попадает в его try/except и повторяется, а в
     одиночном run_once пробрасывается (это нормально).
 
-    Принимает отдельные аргументы (а не объект Config), чтобы библиотечный вызов был прямым и
-    обходился без обёртки. БД передаётся готовым engine — пользователь сам управляет пулом/опциями,
-    а тот же engine прокидывается в DBWriter1C. Для запуска из env есть classmethod from_config.
+    Принимает отдельные аргументы, а не объект настроек: параметры присваиваются явно и на месте
+    вызова видно, что именно передано — одинаково и в python-приложении с литералами, и в
+    контейнере, где значения берутся из окружения. БД передаётся готовым engine: пользователь сам
+    управляет пулом и опциями, а тот же engine прокидывается в DBWriter1C.
     """
 
     def __init__(self, odata_url: str, odata_auth: tuple[str, str] | None,
@@ -150,24 +152,31 @@ class Replicator1C:
         # (exchange_name/message_no), а writer универсален и может делать и полную перевыгрузку.
         self.replicator_log = Replicator1CLog(self.engine, self.db_schema)
 
+        # Реестр идущих merge нужен независимо от обработчиков: он же выдаёт момент старта прогона.
+        self.merges = MergeTracker(self.writer.db_now)
+        # Обработчики (см. handlers.py) подключаются списком в run_forever/run_once, а не здесь:
+        # объявляются они пользовательским кодом, и оркестратору незачем знать, откуда они взялись.
+        self.handlers: HandlerRunner | None = None
 
-    @classmethod
-    def from_config(cls, config: Config) -> "Replicator1C":
-        """Собирает оркестратор из Config: строит engine из db_url и маппит остальные поля."""
-        engine = create_engine(config.db_url)
-        odata_auth = (config.odata_user, config.odata_password) if config.odata_user is not None else None
-        return cls(
-            odata_url=config.odata_url,
-            odata_auth=odata_auth,
-            exchange_name=config.exchange_name,
-            queue_guid=config.queue_guid,
-            engine=engine,
-            db_schema=config.db_schema,
-            full_load_workers=config.full_load_workers,
-        )
+
+    def install_handlers(self, handlers: Iterable) -> None:
+        """
+        Подключает пользовательские обработчики — экземпляры Handler1C, модули или функции с
+        атрибутами `ON`/`handle` (см. handlers.py). Обычно вызывается не напрямую, а передачей
+        `handlers=` в run_forever/run_once.
+
+        Заводит таблицу состояния handlers_1c и помечает каждый обработчик «грязным»: грязные
+        отметки живут в памяти и перезапуск процесса не переживают, поэтому после старта каждый
+        обязан отработать хотя бы раз. Повторный вызов с уже подключёнными обработчиками —
+        ошибка: их состояние (в т.ч. «setup сделан») привязано к текущему набору.
+        """
+        if self.handlers is not None:
+            raise RuntimeError("Handlers are already installed")
+        self.handlers = HandlerRunner(engine=self.engine, schema=self.db_schema,
+                                      handlers=handlers, merge_tracker=self.merges)
 
     @_load_mode_tag(LOAD_MODE_CHANGES)
-    def run_once(self, notify_changes: bool = True) -> None:
+    def run_once(self, notify_changes: bool = True, handlers: Iterable | None = None) -> None:
         """
         Один цикл: (load metadata при первом вызове) → read → save → notify. Подтверждение
         получения отправляется только после успешного сохранения — если save упадёт, изменения
@@ -181,7 +190,13 @@ class Replicator1C:
 
         notify_changes=False отключает подтверждение совсем: изменения остаются в очереди обмена
         1С (полезно для отладки/тестов — цикл становится повторяемым).
+
+        handlers — список пользовательских обработчиков (см. install_handlers). Отдельного потока
+        здесь нет, поэтому ждущие запуска отрабатывают синхронно, в конце цикла. В повторных
+        вызовах список передавать не нужно: подключается он один раз.
         """
+        if handlers is not None and self.handlers is None:
+            self.install_handlers(handlers)
         # Первый вызов: грузим метаданные. Дальше не перечитываем — это делает сам data_reader
         # при появлении нового объекта/поля (get_metadata держит is_loaded=True).
         if not self.metadata.is_loaded:
@@ -216,6 +231,11 @@ class Replicator1C:
         else:
             logger.debug("No changes — skipping confirmation")
 
+        # Одиночный run_once: потока обработчиков нет (его заводит run_forever), поэтому ждущие
+        # запуска отрабатывают здесь же, синхронно, после подтверждения пакета.
+        if self.handlers is not None and not self.handlers.is_running():
+            self.handlers.run_pending()
+
     def _save_changes(self) -> None:
         """
         Сохраняет объекты пакета по одному, записывая лог загрузки на каждый объект
@@ -231,9 +251,31 @@ class Replicator1C:
                                                key=lambda kv: save_order_key(kv[0])):
             log_id = self.replicator_log.start(
                 self.changes.exchange_name, object_name, self.changes.message_no, LOAD_TYPE_CHANGES)
-            result = self.writer.save(object_name, data_object)
+            with self.merges.track(object_name):
+                result = self.writer.save(object_name, data_object)
             # Одно сохранение на строку лога: счётчики и завершение — одним запросом.
             self.replicator_log.write_result(log_id, result, finish=True)
+            self._signal_handlers(object_name, result, SOURCE_CHANGES)
+
+    def _signal_handlers(self, object_name: str, result, source: str) -> None:
+        """
+        Сообщает обработчикам об изменении объекта — но только если merge реально что-то сделал.
+        1С регистрирует изменение объекта на любую перезапись, и в пакет приезжает масса записей,
+        идентичных тому, что уже лежит в БД (шумные поля при сравнении не учитываются, см.
+        DBWriter1C._noisy_fields). Обработчик всё равно выбирает данные сам, и на пустом прогоне
+        его SELECT вернул бы пусто — звать незачем.
+
+        Появление новой колонки — отдельный случай: значения строк оно не меняет, merged_on не
+        двигает, и окно обработчика её не увидит никогда. Поэтому на added_fields подписчики
+        объекта отправляются пересчитывать всё.
+        """
+        if self.handlers is None or result is None:
+            return
+        if result.added_fields:
+            self.handlers.request_full_reload(
+                object_name, f"{object_name} gained columns {sorted(result.added_fields)}")
+        if (result.inserted_row_count + result.updated_row_count + result.deleted_row_count) > 0:
+            self.handlers.signal(object_name, source)
 
     def list_objects(self) -> list[str]:
         """
@@ -325,8 +367,13 @@ class Replicator1C:
                 continue
             for obj_name, data_object in reader.items():
                 # Много страниц/объектов пишутся в одну строку лога — счётчики суммируются в БД.
-                result = self.writer.save(obj_name, data_object, full_load_started_at=started_at)
+                with self.merges.track(obj_name):
+                    result = self.writer.save(obj_name, data_object, full_load_started_at=started_at)
                 self.replicator_log.write_result(log_id, result)
+                # Сигнал на каждую страницу, а не один в конце прогона: очередь обработчиков
+                # схлопывающая, лишних вызовов это не даёт, зато витрина начинает наполняться
+                # после первой же страницы, а не через часы, когда выгрузка закончится.
+                self._signal_handlers(obj_name, result, SOURCE_FULL_LOAD)
             total += page
             if page < page_size:
                 break
@@ -445,7 +492,8 @@ class Replicator1C:
         raise ValueError(f"full_load: no primary key for {object_name}")
 
     def run_forever(self, interval: float = 60.0, max_iterations: int = 0,
-                    max_backoff: float = DEFAULT_MAX_BACKOFF) -> None:
+                    max_backoff: float = DEFAULT_MAX_BACKOFF,
+                    handlers: Iterable | None = None) -> None:
         """
         Цикл run_once с паузой interval секунд. Упавший цикл логируется и не подтверждается —
         повтор на следующей итерации. Корректно завершается по SIGTERM/SIGINT.
@@ -466,10 +514,37 @@ class Replicator1C:
 
         После каждого цикла фоном (пул потоков) запускаются полные выгрузки помеченных объектов —
         диспетчеризация только здесь (одиночный run_once лишь взводит флаги).
+
+        handlers — список пользовательских обработчиков (экземпляры Handler1C, модули или функции
+        с атрибутами `ON`/`handle`, см. handlers.py). Порядок списка = порядок вызова.
+
+        Потоков получается три сорта, и пулы у них раздельные: этот цикл (главный поток),
+        full_load_workers потоков полной выгрузки и ОДИН поток обработчиков. Обработчики в пул
+        выгрузки не сабмитятся и занять его не могут. Общий у них только engine, поэтому дефицит
+        возникает не в потоках, а в соединениях: одновременно их держат пакет изменений, страницы
+        выгрузки и обработчик, отсюда pool_size >= full_load_workers + 3 (см. README).
         """
+        if handlers is not None and self.handlers is None:
+            self.install_handlers(handlers)
         stop = _StopSignal()
         logger.info("Starting replication loop (interval=%ss, max_iterations=%s, timeout=%ss)",
                     interval, max_iterations, self._request_timeout)
+        # Поток обработчиков заводится отдельно от пула полной выгрузки и живёт своей жизнью:
+        # он не сабмитится в executor и его воркеров не занимает.
+        if self.handlers is not None:
+            self.handlers.start()
+        try:
+            self._replication_loop(stop, interval, max_iterations, max_backoff)
+        finally:
+            # После выхода из _replication_loop пул уже дождался своих выгрузок, поэтому страницы,
+            # дописанные на выходе, успели подать сигнал; stop дожидается текущего обработчика.
+            if self.handlers is not None:
+                self.handlers.stop()
+        logger.info("Replication loop stopped")
+
+    def _replication_loop(self, stop: "_StopSignal", interval: float, max_iterations: int,
+                          max_backoff: float) -> None:
+        """Тело run_forever: цикл run_once с backoff и фоновыми полными выгрузками."""
         iterations = 0
         delay = interval
         with ThreadPoolExecutor(max_workers=self._full_load_workers,
@@ -498,7 +573,6 @@ class Replicator1C:
 
                 stop.wait(delay)
             logger.info("Replication loop stopping, waiting for full loads to finish")
-        logger.info("Replication loop stopped")
 
     def _dispatch_full_loads(self, executor: ThreadPoolExecutor) -> None:
         """

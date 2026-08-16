@@ -1,6 +1,6 @@
 """
 Ручной прогон Replicator1C.run_forever против живой 1С и dev-Postgres (параметры как в
-main.py / test_cdc_run_once.py). Интервал опроса — 5 секунд, notify включён по умолчанию
+debug.py / test_cdc_run_once.py). Интервал опроса — 5 секунд, notify включён по умолчанию
 (изменения подтверждаются после успешного сохранения).
 
 Это НЕ pytest-тест: цикл бесконечный, поэтому файл без префикса test_ и pytest его не собирает.
@@ -18,7 +18,7 @@ from sqlalchemy import create_engine
 
 from cdc_1c import Replicator1C
 
-# Параметры из main.py — тестовый/dev-контур, не боевой.
+# Параметры из debug.py — тестовый/dev-контур, не боевой.
 ODATA_URL = "http://192.168.56.102/trade_demo/odata/standard.odata"
 ODATA_USER = "admin"
 ODATA_PASSWORD = "admin"

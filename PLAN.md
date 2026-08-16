@@ -14,12 +14,12 @@
 ## Решения
 - Имя: дистрибутив **cdc-1c**, import-пакет **cdc_1c** (нижний регистр); классы PascalCase.
 - Оркестратор: класс **`Replicator1C`** (суффикс `1C` — как у остальных публичных классов).
-- Конструктор: **отдельные именованные аргументы** (не объект `Config`) — прямой библиотечный
+- Конструктор: **отдельные именованные аргументы** (без объекта настроек) — прямой библиотечный
   вызов без обёртки, единый стиль с прочими классами. БД передаётся готовым **`engine`** (DI по-
   sqlalchemy'ному, тестируемость, переиспользование), а не строкой; тот же engine идёт в `DBWriter1C`.
-- `Config` (dataclass) — env-сторона: хранит `db_url`; classmethod **`Replicator1C.from_config(cfg)`**
-  строит engine из `db_url` (граница «строка → engine» в одном месте) и маппит поля. `poll_interval`/
-  `log_level` остаются в `Config` для `run_forever`/логирования. Entrypoint: `Config.from_env()`.
+- Объекта настроек нет: и entrypoint (`python -m cdc_1c`), и пользовательский runner.py читают
+  окружение сами, присваивают аргументы явно и сами строят engine — так на месте вызова видно, что
+  именно передано, одинаково для python-приложения и для контейнера.
 - Режимы оркестратора: `run_once()` и `run_forever(interval)`.
 - Python: **>=3.10**. Лицензия: **MIT** (предварительно).
 
@@ -39,7 +39,7 @@
 - **`DBWriter1C`** — пер-объектное сохранение; удаление по `metadata_obj.delete_key`: документ/
   справочник → `delete_mode='no'`; регистр/ТЧ → `delete_mode='delete'` со scoped `delete_condition`
   (`_scoped_delete_condition`: подзапрос из temp-таблицы — `col IN (SELECT col FROM temp)` или
-  row-value `tuple_(...).in_(select(...))`). `Config`/`data_reader` в конструкторе, `save_all()`.
+  row-value `tuple_(...).in_(select(...))`). `data_reader` в конструкторе, `save_all()`.
 - **`MetadataReader1C`** — `MetadataObject1C.delete_key` + `_get_delete_key` (регистр →
   `Recorder`/`Recorder_Type`; ТЧ → `Ref_Key`; документ/справочник → None).
 - **Табличные части** — строкам ТЧ проставляется `Ref_Key` владельца (в данных 1С его нет);
@@ -60,19 +60,18 @@
   `ChangeReader1C` пробрасывает `auth`. Захардкоженные `('admin','admin')` убраны (4 места).
   Осталось: общий `requests.Session`, `timeout`, опц. `verify`.
 - **A3. Сброс состояния** — ✅ `ChangeReader1C.read_changes()` в начале делает `self.clear()`.
-- **A4. `Config` (dataclass)** — ✅ (частично) `src/cdc_1c/config.py`: `odata_url`, `odata_user`,
-  `odata_password`, `exchange_name`, `queue_guid`, `db_url`, `db_schema`, `poll_interval`, `log_level`;
-  `from_env()` читает `CDC1C_*`. Осталось: опц. `request_timeout`, `verify_ssl` (вместе с остатком A2).
+- **A4. Настройки из окружения** — ✅ разбор `CDC1C_*` живёт в `src/cdc_1c/__main__.py` (отдельный
+  класс настроек убран как лишний слой). Осталось: опц. `request_timeout`, `verify_ssl` (с остатком A2).
 - **A5. Оркестратор `Replicator1C`** — ✅ `src/cdc_1c/replicator.py`: собирает
-  metadata/changes/mapper/writer из отдельных аргументов (engine + auth из user/password); classmethod
-  `from_config(Config)` строит engine из `db_url`; `run_once()` (read → save → **notify только после
+  metadata/changes/mapper/writer из отдельных аргументов (engine + auth из user/password);
+  `run_once()` (read → save → **notify только после
   успешного save**); `run_forever(interval)` с обработкой исключений (упал цикл → лог, без notify,
   повтор) и graceful SIGTERM/SIGINT (`_StopSignal`). Экспортирован из `cdc_1c`.
 - **A6. Логирование** — ✅ во всех модулях `logger = logging.getLogger(__name__)`, `basicConfig()`/root
-  убраны (ридеры/writer/replicator/config). Авто-вывод из коробки — `src/cdc_1c/logging_config.py`
+  убраны (ридеры/writer/replicator). Авто-вывод из коробки — `src/cdc_1c/logging_config.py`
   `_ensure_handler()` (вешает StreamHandler на логгер `cdc_1c` с INFO, только если `hasHandlers()` ==
   False), вызывается из `Replicator1C.__init__`. Если приложение настроило логирование — молчим.
-  Уровень из `Config.log_level` — настраивать в entrypoint (B2). Проверено: на чистом root INFO виден
+  Уровень из `CDC1C_LOG_LEVEL` — настраивается в entrypoint (B2). Проверено: на чистом root INFO виден
   из коробки, при настроенном приложением логировании — молчим. Зависимость **dbmerge** переведена на
   тот же паттерн (`getLogger('dbmerge')` + `hasHandlers()`, без `basicConfig`) — root больше не
   загрязняется, обе библиотеки сосуществуют чисто.
@@ -85,11 +84,11 @@
   keywords/classifiers/urls; ядро: `dbmerge`, `requests`, `sqlalchemy`, `xmltodict` (убрать `polars`
   и `psycopg2` из обязательных); `[project.optional-dependencies] postgres = ["psycopg[binary]>=3.2"]`
   (psycopg3, DSN `postgresql+psycopg`); `[project.scripts] cdc-1c = "cdc_1c.__main__:main"`.
-- **B2. Entrypoint** — `src/cdc_1c/__main__.py`: `Config.from_env()` → `Replicator`; режим
+- **B2. Entrypoint** — `src/cdc_1c/__main__.py`: `CDC1C_*` → явные аргументы `Replicator1C`; режим
   `CDC1C_MODE=once|loop` (по умолчанию loop). Работает как `python -m cdc_1c` и команда `cdc-1c`.
 - **B3.** `LICENSE`, `src/cdc_1c/py.typed`, `CHANGELOG.md`; английский README (quickstart pip+Docker,
   таблица ENV, требования к плану обмена OData в 1С, поведение имён, спец-поля, ограничения);
-  `main.py` → краткий пример использования `Replicator` (или удалить).
+  `tests/debug.py` — отладочный вход для ручных прогонов против живой 1С.
 
 ### Фаза C. Docker «из коробки»
 - **C1. `Dockerfile`** — `python:3.12-slim`, `cdc-1c[postgres]`, `ENTRYPOINT ["cdc-1c"]`, ENV,
@@ -117,7 +116,7 @@
 
 ## Проверка (end-to-end)
 1. `uv sync`; `pytest` — зелёные offline-тесты (без 1С/Postgres).
-2. `Config(...)` → `Replicator(cfg).run_once()` против живой 1С + Postgres: таблицы, типы,
+2. `Replicator1C(...).run_once()` против живой 1С + Postgres: таблицы, типы,
    scoped-delete, спец-поля; повторный прогон — идемпотентность.
 3. `run_forever(interval=…)`: цикл чистит состояние, notify только после успешного save, реакция на SIGTERM.
 4. Docker: `docker compose up` с заполненным `.env` → данные грузятся без правок кода; `docker stop` штатно завершает.

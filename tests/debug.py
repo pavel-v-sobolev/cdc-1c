@@ -1,3 +1,9 @@
+"""
+Ручной отладочный вход: прогон компонентов против живой 1С и dev-Postgres из-под отладчика.
+Не тест — pytest его не собирает (имя не начинается с `test_`), и в пакет он не попадает.
+Параметры подключения отсюда используют live-тесты (test_cdc_run_once.py, test_run_forever_live.py).
+"""
+
 import requests
 import logging
 from typing import Any

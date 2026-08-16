@@ -1,6 +1,6 @@
 """
 Живой smoke-тест Replicator1C против реального сервера 1С (тестовая база торговли) и
-dev-Postgres. Параметры подключения — те же, что в main.py.
+dev-Postgres. Параметры подключения — те же, что в debug.py.
 
 Гоняет полный цикл Replicator1C.run_once(notify_changes=False): read → save БЕЗ notify, чтобы
 не списывать изменения из очереди обмена 1С и оставить прогон повторяемым. Проверяет, что
@@ -17,7 +17,7 @@ from sqlalchemy import create_engine, inspect
 
 from cdc_1c import Replicator1C
 
-# Параметры из main.py — тестовый/dev-контур, не боевой.
+# Параметры из debug.py — тестовый/dev-контур, не боевой.
 ODATA_URL = "http://192.168.56.101/trade_demo/odata/standard.odata"
 ODATA_USER = "admin"
 ODATA_PASSWORD = "admin"
