@@ -90,7 +90,7 @@ def test_as_handler_accepts_instances_modules_and_functions():
 
     from example_config.handlers import zakazy_klientov as module_handler
     assert as_handler(module_handler.ZakazyKlientov()).on == frozenset(
-        ["AccumulationRegister_ЗаказыКлиентов", "Catalog_Номенклатура"])
+        ["AccumulationRegister_ZakazyKlientov", "Catalog_Nomenklatura"])
 
 
 def test_as_handler_rejects_broken_declarations():
@@ -107,6 +107,33 @@ def test_as_handler_rejects_broken_declarations():
 
     with pytest.raises(AttributeError, match="handle"):
         as_handler(object())
+
+    # Имя объекта 1С вместо имени таблицы: подписка бы просто не сработала, и молча.
+    with pytest.raises(ValueError, match="AccumulationRegister_ZakazyKlientov"):
+        as_handler(Spy(on=["AccumulationRegister_ЗаказыКлиентов"]))
+
+
+def test_handlers_are_signalled_by_table_name(monkeypatch):
+    # Обработчик пишет SQL по таблицам, поэтому и подписывается на имя таблицы. Оркестратор знает
+    # объект под именем 1С и переводит его сам.
+    from cdc_1c.db_writer import DBWriter1C
+    from cdc_1c.replicator import Replicator1C
+
+    monkeypatch.setattr(DBWriter1C, "db_now", lambda self, clock=_clock(): clock())
+
+    spy = Spy(on=["Catalog_Nomenklatura"])
+    rep = Replicator1C(odata_url="http://x", odata_auth=None, exchange_name="E", queue_guid="Q",
+                       engine=create_engine("sqlite://"))
+    rep.install_handlers([spy])
+    rep.handlers.run_pending()
+    spy.calls.clear()
+
+    assert rep._handler_key("Catalog_Номенклатура") == "Catalog_Nomenklatura"
+    rep._signal_handlers(rep._handler_key("Catalog_Номенклатура"), _result(updated=1),
+                         SOURCE_CHANGES)
+    rep.handlers.run_pending()
+    assert len(spy.calls) == 1
+    assert spy.calls[0].objects == frozenset({"Catalog_Nomenklatura"})
 
 
 def test_build_handlers_rejects_duplicate_names():

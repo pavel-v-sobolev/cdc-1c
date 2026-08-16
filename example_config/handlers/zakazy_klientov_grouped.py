@@ -102,7 +102,13 @@ SELECT "Number", "Year" FROM {schema}."ZakazyKlientovGrouped_rows_view"
 
 
 class ZakazyKlientovGrouped(Handler1C):
-    ON = ["AccumulationRegister_ЗаказыКлиентов", "Document_ЗаказКлиента", "Catalog_Номенклатура"]
+    # Имена ТАБЛИЦ в целевой БД (транслит), а не имена объектов 1С — те же, что стоят в SQL выше:
+    #   AccumulationRegister_ZakazyKlientov  ← РегистрНакопления.ЗаказыКлиентов
+    #   Document_ZakazKlienta                ← Документ.ЗаказКлиента
+    #   Catalog_Nomenklatura                 ← Справочник.Номенклатура
+    # Читаются все три, поэтому все три и перечислены: по этому же списку считается верхняя
+    # граница окна.
+    ON = ["AccumulationRegister_ZakazyKlientov", "Document_ZakazKlienta", "Catalog_Nomenklatura"]
 
     def setup(self, ctx):
         self.execute(ctx, DDL)

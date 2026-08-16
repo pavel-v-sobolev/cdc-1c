@@ -251,13 +251,22 @@ class Replicator1C:
                                                key=lambda kv: save_order_key(kv[0])):
             log_id = self.replicator_log.start(
                 self.changes.exchange_name, object_name, self.changes.message_no, LOAD_TYPE_CHANGES)
-            with self.merges.track(object_name):
+            table_name = self._handler_key(object_name)
+            with self.merges.track(table_name):
                 result = self.writer.save(object_name, data_object)
             # Одно сохранение на строку лога: счётчики и завершение — одним запросом.
             self.replicator_log.write_result(log_id, result, finish=True)
-            self._signal_handlers(object_name, result, SOURCE_CHANGES)
+            self._signal_handlers(table_name, result, SOURCE_CHANGES)
 
-    def _signal_handlers(self, object_name: str, result, source: str) -> None:
+    def _handler_key(self, object_name: str) -> str:
+        """
+        Имя таблицы объекта в БД — под ним объект и известен обработчикам (см. Handler1C.ON).
+        Подписка идёт по имени таблицы, а не по имени объекта 1С, потому что обработчик пишет SQL
+        по таблицам: имя 1С он в глаза не видит, а транслит стоит у него в запросе.
+        """
+        return self.name_mapper.map_object_name(object_name)
+
+    def _signal_handlers(self, table_name: str, result, source: str) -> None:
         """
         Сообщает обработчикам об изменении объекта — но только если merge реально что-то сделал.
         1С регистрирует изменение объекта на любую перезапись, и в пакет приезжает масса записей,
@@ -273,9 +282,9 @@ class Replicator1C:
             return
         if result.added_fields:
             self.handlers.request_full_reload(
-                object_name, f"{object_name} gained columns {sorted(result.added_fields)}")
+                table_name, f"{table_name} gained columns {sorted(result.added_fields)}")
         if (result.inserted_row_count + result.updated_row_count + result.deleted_row_count) > 0:
-            self.handlers.signal(object_name, source)
+            self.handlers.signal(table_name, source)
 
     def list_objects(self) -> list[str]:
         """
@@ -367,13 +376,14 @@ class Replicator1C:
                 continue
             for obj_name, data_object in reader.items():
                 # Много страниц/объектов пишутся в одну строку лога — счётчики суммируются в БД.
-                with self.merges.track(obj_name):
+                table_name = self._handler_key(obj_name)
+                with self.merges.track(table_name):
                     result = self.writer.save(obj_name, data_object, full_load_started_at=started_at)
                 self.replicator_log.write_result(log_id, result)
                 # Сигнал на каждую страницу, а не один в конце прогона: очередь обработчиков
                 # схлопывающая, лишних вызовов это не даёт, зато витрина начинает наполняться
                 # после первой же страницы, а не через часы, когда выгрузка закончится.
-                self._signal_handlers(obj_name, result, SOURCE_FULL_LOAD)
+                self._signal_handlers(table_name, result, SOURCE_FULL_LOAD)
             total += page
             if page < page_size:
                 break

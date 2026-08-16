@@ -63,9 +63,12 @@ CREATE INDEX IF NOT EXISTS "ix_AccumulationRegister_ZakazyKlientov_Nomenklatura_
 
 
 class ZakazyKlientov(Handler1C):
-    # Читаются обе таблицы, поэтому обе в ON: по этому списку считается верхняя граница окна
+    # Имена ТАБЛИЦ в целевой БД (транслит), а не имена объектов 1С — те же, что стоят в SQL ниже:
+    #   AccumulationRegister_ZakazyKlientov  ← РегистрНакопления.ЗаказыКлиентов
+    #   Catalog_Nomenklatura                 ← Справочник.Номенклатура
+    # Читаются обе, поэтому обе и перечислены: по этому же списку считается верхняя граница окна
     # (незавершённый merge любой из них прижимает границу к своему старту).
-    ON = ["AccumulationRegister_ЗаказыКлиентов", "Catalog_Номенклатура"]
+    ON = ["AccumulationRegister_ZakazyKlientov", "Catalog_Nomenklatura"]
 
     def setup(self, ctx):
         # Один раз за процесс, а не на каждый вызов: полная выгрузка сигналит постранично, и
