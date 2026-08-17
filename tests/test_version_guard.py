@@ -1,5 +1,5 @@
 """
-Оффлайн-тесты guard'ов полной выгрузки (DBWriter1C.save, full_load_started_at) на sqlite.
+Оффлайн-тесты guard'ов полной выгрузки (DBWriter1C.save, full_load_started_at).
 
 Guard сравнивает merged_on строки с моментом старта прогона: снимок не трогает то, что переписали
 уже после его старта, но всё, что старше прогона, перезаписывает. В тестах момент старта задаётся
@@ -25,13 +25,13 @@ OLD_RUN = datetime(2000, 1, 1)
 NEW_RUN = datetime(2100, 1, 1)
 
 
-def _writer():
-    engine = create_engine("sqlite://")
-    return DBWriter1C(engine, NameMapper1C())
+def _writer(db):
+    return DBWriter1C(db.engine, NameMapper1C(), schema=db.schema)
 
 
 def _rows(writer, table_name):
-    tbl = Table(table_name, MetaData(), autoload_with=writer.engine)
+    tbl = Table(table_name, MetaData(), schema=writer.schema,
+                autoload_with=writer.engine)
     with writer.engine.connect() as conn:
         return [dict(r) for r in conn.execute(select(tbl)).mappings()]
 
@@ -50,8 +50,8 @@ def _doc_rec(ref, val, emn):
     return {"Ref_Key": ref, "Val": val, "is_deleted_or_empty": False, "exchange_message_no": emn}
 
 
-def test_full_load_does_not_overwrite_change_newer_than_the_run():
-    w = _writer()
+def test_full_load_does_not_overwrite_change_newer_than_the_run(db):
+    w = _writer(db)
     # change записал строку
     w.save("Catalog_X", _doc([_doc_rec(REF, "change", 105)]))
     # прогон стартовал ДО этого изменения → его снимок устарел, перезаписывать нельзя
@@ -61,8 +61,8 @@ def test_full_load_does_not_overwrite_change_newer_than_the_run():
     assert rows[REF]["Val"] == "change"
 
 
-def test_full_load_repairs_row_older_than_the_run():
-    w = _writer()
+def test_full_load_repairs_row_older_than_the_run(db):
+    w = _writer(db)
     # change записал строку — и, допустим, следующее изменение до нас не доехало
     w.save("Catalog_X", _doc([_doc_rec(REF, "stale", 105)]))
     # прогон стартовал ПОСЛЕ → снимок новее строки, полная выгрузка её выравнивает.
@@ -74,8 +74,8 @@ def test_full_load_repairs_row_older_than_the_run():
     assert rows[REF]["Val"] == "fullload"
 
 
-def test_change_overwrites_full_load_row():
-    w = _writer()
+def test_change_overwrites_full_load_row(db):
+    w = _writer(db)
     # сначала легла полная выгрузка
     w.save("Catalog_X", _doc([_doc_rec(REF, "fullload", 0)]), full_load_started_at=NEW_RUN)
     # затем пришло изменение — оно авторитетно и guard'ами не ограничено
@@ -85,8 +85,8 @@ def test_change_overwrites_full_load_row():
     assert rows[REF]["Val"] == "change" and rows[REF]["exchange_message_no"] == 106
 
 
-def test_full_load_inserts_untouched_row():
-    w = _writer()
+def test_full_load_inserts_untouched_row(db):
+    w = _writer(db)
     w.save("Catalog_X", _doc([_doc_rec(REF, "change", 105)]))
     # строку REF2 изменения не приносили — устаревший прогон всё равно её вставляет (backfill),
     # вставка новых строк guard'ом не ограничена
@@ -114,8 +114,8 @@ def _tp_rec(ref, line, val, emn):
             "is_deleted_or_empty": False, "exchange_message_no": emn}
 
 
-def test_full_load_does_not_resurrect_row_deleted_after_the_run_started():
-    w = _writer()
+def test_full_load_does_not_resurrect_row_deleted_after_the_run_started(db):
+    w = _writer(db)
     # change заменил набор группы REF: строки 1,2; строка 3 удалена
     w.save("Document_X_Rows", _tp([_tp_rec(REF, 1, "a", 105), _tp_rec(REF, 2, "b", 105)]))
     # прогон стартовал ДО этого изменения: его снимок видит и строку 3 — не должен её воскресить
@@ -130,8 +130,8 @@ def test_full_load_does_not_resurrect_row_deleted_after_the_run_started():
     assert rows[(REF, 2)]["exchange_message_no"] == 105
 
 
-def test_full_load_replaces_group_older_than_the_run():
-    w = _writer()
+def test_full_load_replaces_group_older_than_the_run(db):
+    w = _writer(db)
     # группу принесло изменение: строки 1,2
     w.save("Document_X_Rows", _tp([_tp_rec(REF, 1, "a", 105), _tp_rec(REF, 2, "b", 105)]))
     # прогон стартовал ПОСЛЕ: снимок новее группы и заменяет её целиком
@@ -143,8 +143,8 @@ def test_full_load_replaces_group_older_than_the_run():
     assert rows[(REF, 2)]["is_deleted_or_empty"]
 
 
-def test_full_load_replaces_own_group():
-    w = _writer()
+def test_full_load_replaces_own_group(db):
+    w = _writer(db)
     # группа REF2 создана полной выгрузкой
     w.save("Document_X_Rows", _tp([_tp_rec(REF2, 1, "x", 0), _tp_rec(REF2, 2, "y", 0)]),
            full_load_started_at=OLD_RUN)

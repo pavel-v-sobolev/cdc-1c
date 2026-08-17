@@ -52,6 +52,9 @@ postgres = [
 ]
 dev = [
     "pytest>=8",
+    # Тесты идут против локального PostgreSQL (см. tests/conftest.py), поэтому драйвер входит
+    # в dev-окружение, а не ставится отдельно.
+    "cdc-1c[postgres]",
 ]
 
 [project.scripts]

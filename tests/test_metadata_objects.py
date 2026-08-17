@@ -1,23 +1,17 @@
 """
-Оффлайн-тесты реестра объектов metadata_objects_1c (внутри MetadataReader1C, на sqlite).
+Оффлайн-тесты реестра объектов metadata_objects_1c (внутри MetadataReader1C).
 Проверяют синхронизацию с $metadata (dbmerge delete — пропавшие объекты удаляются из реестра)
 и флаги полной выгрузки (require/list/mark). Ключ реестра — полное имя объекта (object_full_name).
-Без 1С/Postgres.
+Без живой 1С, но с локальным PostgreSQL (см. conftest.py).
 """
 
-import sqlite3
-import uuid
-
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 
 from cdc_1c.metadata_reader import MetadataReader1C
 
-sqlite3.register_adapter(uuid.UUID, str)
 
-
-def _reader(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'm.db'}")
-    return MetadataReader1C("http://x", engine=engine)
+def _reader(db):
+    return MetadataReader1C("http://x", engine=db.engine, schema=db.schema)
 
 
 def _row(reader, object_full_name):
@@ -26,8 +20,8 @@ def _row(reader, object_full_name):
         return c.execute(select(t).where(t.c.object_full_name == object_full_name)).mappings().first()
 
 
-def test_sync_inserts_and_deletes(tmp_path):
-    reader = _reader(tmp_path)
+def test_sync_inserts_and_deletes(db):
+    reader = _reader(db)
     reader._sync_objects(["Catalog_A", "Document_B"])
     assert _row(reader, "Catalog_A")["object_type"] == "Catalog"
     assert _row(reader, "Document_B") is not None
@@ -38,8 +32,8 @@ def test_sync_inserts_and_deletes(tmp_path):
     assert _row(reader, "Catalog_A") is not None
 
 
-def test_require_full_load_if_new(tmp_path):
-    reader = _reader(tmp_path)
+def test_require_full_load_if_new(db):
+    reader = _reader(db)
     reader._sync_objects(["Catalog_A"])             # первая sync создаёт таблицу
 
     # Существующий, ещё не выгружавшийся → флаг ставится.
@@ -54,8 +48,8 @@ def test_require_full_load_if_new(tmp_path):
     assert row["last_full_load_dt"] is not None
 
 
-def test_require_full_load_if_new_reloads_unknown(tmp_path, monkeypatch):
-    reader = _reader(tmp_path)
+def test_require_full_load_if_new_reloads_unknown(db, monkeypatch):
+    reader = _reader(db)
     reader._sync_objects(["Catalog_A"])
 
     # Объект пришёл в пакете, но его ещё нет в реестре → require_full_load_if_new перечитывает
@@ -67,9 +61,9 @@ def test_require_full_load_if_new_reloads_unknown(tmp_path, monkeypatch):
     assert _row(reader, "Catalog_New")["full_load_is_required"] in (True, 1)
 
 
-def test_mark_full_loaded_keyed_by_full_name(tmp_path):
+def test_mark_full_loaded_keyed_by_full_name(db):
     # Отметка и список полной выгрузки работают по полному имени (object_full_name).
-    reader = _reader(tmp_path)
+    reader = _reader(db)
     reader._sync_objects(["Document_Sales", "AccumulationRegister_Sales"])
     reader.require_full_load_if_new("Document_Sales")
     reader.require_full_load_if_new("AccumulationRegister_Sales")
@@ -81,8 +75,8 @@ def test_mark_full_loaded_keyed_by_full_name(tmp_path):
     assert reader.list_full_load_required() == ["AccumulationRegister_Sales"]
 
 
-def test_list_full_load_required_excludes_done_and_deleted(tmp_path):
-    reader = _reader(tmp_path)
+def test_list_full_load_required_excludes_done_and_deleted(db):
+    reader = _reader(db)
     reader._sync_objects(["Catalog_A", "Document_B", "Catalog_C"])
     reader.require_full_load_if_new("Catalog_A")    # требуется
     reader.require_full_load_if_new("Document_B")   # требуется, но станет удалённым

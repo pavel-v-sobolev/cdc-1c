@@ -20,11 +20,14 @@
 
     from handlers import zakazy_klientov, otpravka_v_ochered
 
-    replicator.run_forever(interval=60, handlers=[zakazy_klientov, otpravka_v_ochered])
+    zakazy  = HandlerRunner(engine=engine, schema='cdc_1c', handler=zakazy_klientov)
+    ochered = HandlerRunner(engine=engine, schema='cdc_1c', handler=otpravka_v_ochered)
+    replicator = Replicator1C(..., engine=engine, handler_runners=[zakazy, ochered])
 
-Порядок в списке — порядок вызова в пределах одного прохода (витрина поверх витрины идёт после
-базовой). Обработчики живут где угодно, лишь бы импортировались, поэтому общий код выносится в
-соседний модуль обычным `from handlers._common import ...`, а не особым соглашением.
+У каждого обработчика свой раннер и свой поток, поэтому тяжёлая витрина не задерживает остальные,
+но и порядок между ними не определён: на «витрина поверх витрины считается после базовой»
+полагаться нельзя. Обработчики живут где угодно, лишь бы импортировались, поэтому общий код
+выносится в соседний модуль обычным `from handlers._common import ...`, а не особым соглашением.
 
 Кроме модуля, в списке можно передать функцию с теми же атрибутами (см. декоратор `handler`) или
 готовый `Handler` — раннеру нужно только имя, набор объектов и вызываемое `handle`.
@@ -109,6 +112,13 @@ RETRY_DELAY = 60.0
 # Нижняя граница окна, когда last_run_at ещё нет (первый запуск или запрошен полный пересчёт).
 # Заведомо раньше любого merged_on и при этом валидная дата для всех поддерживаемых СУБД.
 EPOCH = datetime(1900, 1, 1)
+
+
+def db_now(engine: Engine) -> datetime:
+    """Текущее время по часам БД — тем же now(), которым dbmerge штампует merged_on. Сравнивать
+    границы окна с python-часами нельзя: хосты расходятся."""
+    with engine.connect() as conn:
+        return conn.scalar(select(func.now()))
 
 
 @dataclass(frozen=True)
@@ -367,6 +377,11 @@ class MergeTracker:
             if not starts:
                 del self._in_flight[object_name]
 
+    def is_empty(self) -> bool:
+        """Нет ли сейчас незавершённых merge (проверка перед подменой реестра на общий)."""
+        with self._lock:
+            return not self._in_flight
+
     def boundary(self, object_names: Iterable[str]) -> datetime:
         """Верхняя граница окна: минимум из «сейчас» и стартов незавершённых merge по объектам."""
         with self._lock:
@@ -428,110 +443,144 @@ def _add_missing_columns(engine: Engine, table: Table) -> None:
 
 class HandlerRunner:
     """
-    Реестр обработчиков и их исполнитель.
+    Исполнитель ОДНОГО обработчика: его состояние, его очередь и его поток.
 
-    Поток исполнения ОДИН, а очередь схлопывающая: сигнал — это не «запусти», а «объект стал
-    грязным». Пока обработчик считает, прилетевшие страницы помечают тот же объект ещё раз, а не
-    выстраиваются в очередь из тысячи вызовов; отработал — сразу забирает накопившееся. Поэтому
-    сигналить можно на каждую страницу полной выгрузки: витрина начинает наполняться после первой
-    же страницы и догоняет выгрузку с задержкой в один свой прогон.
+    Один обработчик на раннер, а не список, — чтобы тяжёлая витрина не задерживала остальные:
+    потоки у них независимые. Плата за это — порядок вызова между обработчиками не определён, и
+    два обработчика, пишущие в одну целевую таблицу, теперь могут делать это одновременно. Если
+    витрина строится поверх другой витрины, полагаться на «сначала базовая» нельзя.
 
-    Поток отдельный (а не вызов прямо в цикле) — чтобы тяжёлый обработчик не тормозил приём
+    Очередь схлопывающая: сигнал — это не «запусти», а «объект стал грязным». Пока обработчик
+    считает, прилетевшие страницы помечают тот же объект ещё раз, а не выстраиваются в очередь из
+    тысячи вызовов; отработал — сразу забирает накопившееся. Поэтому сигналить можно на каждую
+    страницу полной выгрузки: витрина начинает наполняться после первой же страницы и догоняет
+    выгрузку с задержкой в один свой прогон.
+
+    Поток отдельный (а не вызов прямо в цикле репликации) — чтобы обработчик не тормозил приём
     изменений: пакет не подтверждается в 1С до успешного save, копить отставание незачем.
     Пользовательский код при этом никогда не исполняется в потоках полной выгрузки — они только
-    кладут сигнал, — так что два обработчика не подерутся за одну целевую таблицу.
+    кладут сигнал.
+
+    Раннер можно отдать нескольким репликаторам (несколько планов обмена — один обработчик):
+    start/stop считающие, поток гаснет с выходом последнего.
     """
 
-    def __init__(self, engine: Engine, schema: str | None, handlers: Iterable,
-                 merge_tracker: MergeTracker):
-        # Список разбирается и проверяется ДО первого обращения к БД: кривое объявление (нет
-        # handle, пустой ON, класс вместо экземпляра, одинаковые имена) должно ронять старт, не
-        # оставив за собой ни созданной схемы, ни таблицы состояния.
-        # Порядок списка = порядок вызова в пределах одного прохода: витрина поверх витрины должна
-        # считаться после базовой.
-        self.handlers = build_handlers(handlers)
+    def __init__(self, engine: Engine, schema: str | None, handler,
+                 merge_tracker: "MergeTracker | None" = None):
+        # Объявление разбирается и проверяется ДО первого обращения к БД: кривое (нет handle,
+        # пустой ON, класс вместо экземпляра) должно ронять старт, не оставив за собой ни схемы,
+        # ни строки состояния.
+        self.handler = as_handler(handler)
+        self.name = self.handler.name
 
         self.engine = engine
         self.schema_name = _check_create_schema(engine, schema)
         self.schema = schema
+        # Реестр незавершённых merge. Обычно его отдаёт репликатор при подключении (attach_merges),
+        # и тогда он общий у всех раннеров и всех репликаторов — иначе граница окна не увидела бы
+        # merge соседа. Свой создаётся только для standalone-использования (тесты, ручной прогон).
         self._merges = merge_tracker
-        # Имена обработчиков, у которых setup уже отработал (один раз за процесс).
-        self._prepared: set[str] = set()
 
         self.table = _handlers_table(MetaData(), self.schema_name)
         self.table.create(engine, checkfirst=True)
         _add_missing_columns(engine, self.table)
-        self._register_handlers()
+        self._register_handler()
 
         self._lock = threading.Lock()
-        # handler name → (грязные объекты, откуда пришли). Пустой набор = обработчик не ждёт запуска.
-        self._dirty: dict[str, tuple[set[str], set[str]]] = {}
+        # Грязные отметки: что изменилось и откуда пришло. Пустой набор объектов = ждать нечего.
+        # Сразу непустой: отметки живут в памяти и перезапуск процесса не переживают, поэтому
+        # после старта обработчик обязан отработать хотя бы раз.
+        self._dirty_objects: set[str] = set(self.handler.on)
+        self._dirty_sources: set[str] = {SOURCE_STARTUP}
+        # Разовая подготовка (setup) уже сделана.
+        self._prepared = False
         # Когда обработчику снова можно бежать (MIN_INTERVAL), по монотонным часам.
-        self._next_allowed_at: dict[str, float] = {}
+        self._next_allowed_at = 0.0
         self._wakeup = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        for handler in self.handlers:
-            self._dirty[handler.name] = (set(handler.on), {SOURCE_STARTUP})
+        # Сколько репликаторов сейчас пользуются раннером (см. start/stop). Отдельный лок, а не
+        # общий с грязными отметками: stop дожидается потока, а тому для работы нужен _lock.
+        self._lifecycle_lock = threading.Lock()
+        self._users = 0
 
-    def _register_handlers(self) -> None:
-        """Заводит строку состояния на каждый обработчик. Новый обработчик появляется с
-        last_run_at=NULL, т.е. первым прогоном обработает всё с начала времён."""
+    def __repr__(self) -> str:
+        return f'<HandlerRunner {self.name}>'
+
+    @property
+    def merges(self) -> MergeTracker:
+        """Реестр незавершённых merge. Свой создаётся лениво — только если раннер используют без
+        репликатора: обычно реестр приходит от него (см. attach_merges)."""
+        if self._merges is None:
+            self._merges = MergeTracker(lambda: db_now(self.engine))
+        return self._merges
+
+    def attach_merges(self, merge_tracker: MergeTracker) -> None:
+        """
+        Присоединяет раннер к реестру merge репликатора.
+
+        Реестр обязан быть ОДНИМ на все раннеры и все репликаторы: граница окна обработчика
+        считается по незавершённым merge, и если репликатор пишет мимо этого реестра, его строки,
+        ещё не закоммиченные, окажутся левее записанной отметки — потеряются молча. Поэтому чужой
+        реестр не подменяется, а вызывает ошибку.
+        """
+        if self._merges is None or self._merges is merge_tracker:
+            self._merges = merge_tracker
+            return
+        raise ValueError(
+            f"Handler {self.name} is already attached to another MergeTracker. Replicators "
+            f"sharing handlers must share one: pass the same HandlerRunner objects to all of them")
+
+    def _register_handler(self) -> None:
+        """Заводит строку состояния. Новый обработчик появляется с last_run_at=NULL, т.е. первым
+        прогоном обработает всё с начала времён."""
         with self.engine.begin() as conn:
-            known = set(conn.scalars(select(self.table.c.name)))
-            new = [h.name for h in self.handlers if h.name not in known]
-            if new:
-                conn.execute(insert(self.table),
-                             [{"name": name, "enabled": True, "last_run_at": None,
-                               "last_error": None} for name in new])
-                logger.info("Registered handlers: %s", ', '.join(sorted(new)))
-        for handler in self.handlers:
-            logger.info("Handler %s (on=%s, on_full_load=%s, min_interval=%ss)",
-                        handler.name, sorted(handler.on), handler.on_full_load,
-                        handler.min_interval)
+            known = conn.scalar(select(self.table.c.name).where(self.table.c.name == self.name))
+            if known is None:
+                conn.execute(insert(self.table).values(
+                    name=self.name, enabled=True, last_run_at=None, last_error=None))
+                logger.info("Registered handler %s", self.name)
+        logger.info("Handler %s (on=%s, on_full_load=%s, min_interval=%ss)",
+                    self.name, sorted(self.handler.on), self.handler.on_full_load,
+                    self.handler.min_interval)
 
     # --- сигналы -----------------------------------------------------------------------------
 
     def signal(self, object_name: str, source: str) -> None:
         """
-        Объект изменился в БД — пометить грязными всех его подписчиков и разбудить поток.
+        Таблица изменилась в БД — пометить грязным и разбудить поток. Не подписан на неё — тихо
+        пропускаем.
 
         Зовётся только когда merge реально что-то сделал: 1С регистрирует изменение объекта на
         любую перезапись, и в пакет приезжает масса записей, идентичных тому, что уже лежит в БД.
         Пустой прогон обработчику дал бы пустой SELECT — звать незачем.
         """
-        woken = []
+        if object_name not in self.handler.on:
+            return
+        if source == SOURCE_FULL_LOAD and not self.handler.on_full_load:
+            return
         with self._lock:
-            for handler in self.handlers:
-                if object_name not in handler.on:
-                    continue
-                if source == SOURCE_FULL_LOAD and not handler.on_full_load:
-                    continue
-                objects, sources = self._dirty.setdefault(handler.name, (set(), set()))
-                objects.add(object_name)
-                sources.add(source)
-                woken.append(handler.name)
-        if woken:
-            logger.debug("Signal %s (%s) → %s", object_name, source, ', '.join(woken))
-            self._wakeup.set()
+            self._dirty_objects.add(object_name)
+            self._dirty_sources.add(source)
+        logger.debug("Signal %s (%s) → %s", object_name, source, self.name)
+        self._wakeup.set()
 
     def request_full_rebuild(self, object_name: str, reason: str) -> None:
         """
-        Просит подписчиков объекта собрать витрину заново: ставит full_rebuild_is_required.
+        Просит собрать витрину заново: ставит full_rebuild_is_required. Не подписан на объект —
+        ничего не делаем.
 
         Единственный автоматический повод — новая колонка в таблице объекта (added_fields из
         dbmerge). Инкремент её появления не видит в принципе: окно строится по merged_on, а
         merged_on двигается только у строк, у которых изменились ЗНАЧЕНИЯ; добавление колонки не
         меняет ни одного значения, и все уже лежащие строки остаются левее окна навсегда.
         """
-        names = [h.name for h in self.handlers if object_name in h.on]
-        if not names:
+        if object_name not in self.handler.on:
             return
         with self.engine.begin() as conn:
-            conn.execute(update(self.table)
-                         .where(self.table.c.name.in_(names))
+            conn.execute(update(self.table).where(self.table.c.name == self.name)
                          .values(full_rebuild_is_required=True))
-        logger.info("Full rebuild requested for %s (%s)", ', '.join(sorted(names)), reason)
+        logger.info("Full rebuild requested for %s (%s)", self.name, reason)
 
     # --- исполнение --------------------------------------------------------------------------
 
@@ -540,83 +589,103 @@ class HandlerRunner:
         return self._thread is not None
 
     def start(self) -> None:
-        """Запускает поток исполнения (idempotent)."""
-        if self._thread is not None:
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name='handlers', daemon=True)
-        self._thread.start()
+        """
+        Заявляет о себе как о пользователе раннера: поток поднимается на первом вызове, дальше
+        вызовы только увеличивают счётчик.
+
+        Счётчик, а не флаг, потому что раннер может быть общим у нескольких репликаторов (несколько
+        планов обмена — один обработчик). Каждый из них делает одно и то же на входе в run_forever
+        и на выходе; «владельца», который один имеет право гасить поток, нет. Иначе завершение
+        одного репликатора оборвало бы обработчика остальным, причём молча: соседи продолжают
+        принимать изменения и копить грязные отметки, а разбирать их уже некому.
+
+        Под локом здесь не арифметика счётчика, а связка «посчитать → проверить → создать»: без
+        неё два одновременных start могут оба увидеть отсутствие потока и завести по своему,
+        а два потока на один обработчик — это параллельные merge в одну целевую таблицу.
+        """
+        with self._lifecycle_lock:
+            self._users += 1
+            if self._thread is not None:
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._loop, name=f'handler:{self.name}',
+                                            daemon=True)
+            self._thread.start()
 
     def stop(self, timeout: float | None = None) -> None:
-        """Просит поток завершиться после текущего обработчика и ждёт его."""
-        if self._thread is None:
-            return
-        self._stop.set()
-        self._wakeup.set()
-        self._thread.join(timeout)
-        self._thread = None
+        """
+        Снимает свою заявку. Когда уходит последний пользователь, поток получает команду на выход
+        и дожидается ТЕКУЩЕГО прогона — он не обрывается на середине merge.
+
+        Пока остаётся хоть один пользователь, поток продолжает работать: репликатор, закончившийся
+        по max_iterations, не должен глушить обработчика соседу.
+        """
+        with self._lifecycle_lock:
+            if self._users == 0:
+                return
+            self._users -= 1
+            if self._users > 0 or self._thread is None:
+                return
+            self._stop.set()
+            self._wakeup.set()
+            self._thread.join(timeout)
+            self._thread = None
 
     def _loop(self) -> None:
         with load_mode(LOAD_MODE_HANDLER):
-            logger.info("Handler thread started")
+            logger.info("Handler %s thread started", self.name)
             while not self._stop.is_set():
                 # Событие сбрасываем ДО прогона: сигналы, пришедшие во время работы обработчика,
                 # взведут его снова и не потеряются (набор грязных объектов у них общий).
                 self._wakeup.clear()
                 try:
-                    self.run_pending()
+                    self.run_if_pending()
                 except Exception:
-                    logger.exception("Handler dispatch failed")
+                    logger.exception("Handler %s dispatch failed", self.name)
                 # Ждём сигнала, но с таймаутом: прогон могли отложить MIN_INTERVAL или ещё не
                 # отпустившая граница окна — их наступление событием не сообщается.
                 self._wakeup.wait(IDLE_POLL)
-            logger.info("Handler thread stopped")
+            logger.info("Handler %s thread stopped", self.name)
 
-    def run_pending(self) -> None:
+    def run_if_pending(self) -> None:
         """
-        Один проход по обработчикам, ждущим запуска. Публичный: в режиме одиночного run_once
-        отдельного потока нет, и раннер вызывает этот метод синхронно.
+        Прогон, если обработчик ждёт запуска. Публичный: в режиме одиночного run_once отдельного
+        потока нет, и репликатор вызывает этот метод синхронно.
         """
-        state = self._read_state()
-        for handler in self.handlers:
-            if self._stop.is_set():
-                return
-            enabled, last_run_at, full_rebuild = state.get(handler.name, (False, None, False))
-            if not enabled:
-                # Выключен в таблице — грязные отметки не копим, иначе после включения он получит
-                # окно, накопленное за всё время простоя, и посчитает его одним прогоном.
-                self._take_dirty(handler.name)
-                continue
-            if full_rebuild:
-                # Заказ пересборки сам ставит обработчик в очередь. Иначе он бы дожидался сигнала
-                # об изменении подписанных объектов, а изменений может не быть неделями — флаг,
-                # проставленный руками, так и лежал бы без дела.
-                self._mark_dirty(handler.name, set(handler.on), {SOURCE_REBUILD})
-            if time.monotonic() < self._next_allowed_at.get(handler.name, 0):
-                continue
-            self._run_handler(handler, last_run_at, full_rebuild)
+        enabled, last_run_at, full_rebuild = self._read_state()
+        if not enabled:
+            # Выключен в таблице — грязные отметки не копим, иначе после включения он получит
+            # окно, накопленное за всё время простоя, и посчитает его одним прогоном.
+            self._take_dirty()
+            return
+        if full_rebuild:
+            # Заказ пересборки сам ставит обработчик в очередь. Иначе он бы дожидался сигнала
+            # об изменении подписанных объектов, а изменений может не быть неделями — флаг,
+            # проставленный руками, так и лежал бы без дела.
+            self._mark_dirty(set(self.handler.on), {SOURCE_REBUILD})
+        if time.monotonic() < self._next_allowed_at:
+            return
+        self._run(last_run_at, full_rebuild)
 
-    def _read_state(self) -> dict[str, tuple[bool, datetime | None, bool]]:
-        """Состояние обработчиков из БД: {имя: (включён, last_run_at, заказана ли пересборка)}.
+    def _read_state(self) -> tuple[bool, datetime | None, bool]:
+        """Состояние обработчика из БД: (включён, last_run_at, заказана ли пересборка).
         Читается на каждый проход — все три меняются снаружи, руками или чужим процессом."""
         t = self.table
         with self.engine.connect() as conn:
-            rows = conn.execute(select(t.c.name, t.c.enabled, t.c.last_run_at,
-                                       t.c.full_rebuild_is_required)).all()
-        return {name: (bool(enabled), last_run_at, bool(rebuild))
-                for name, enabled, last_run_at, rebuild in rows}
+            row = conn.execute(select(t.c.enabled, t.c.last_run_at, t.c.full_rebuild_is_required)
+                               .where(t.c.name == self.name)).first()
+        if row is None:
+            return False, None, False
+        return bool(row.enabled), row.last_run_at, bool(row.full_rebuild_is_required)
 
-    def _run_handler(self, handler: Handler, last_run_at: datetime | None,
-                     full_rebuild_requested: bool = False) -> None:
+    def _run(self, last_run_at: datetime | None, full_rebuild_requested: bool) -> None:
         # Грязные отметки забираем ПЕРЕД расчётом границы, а не после: сигнал приходит уже после
         # коммита своего merge, поэтому всё, что не попало в это окно, пришлёт сигнал позже и
         # взведёт обработчик заново. В обратном порядке такой сигнал мог бы быть съеден вместе со
         # снятыми отметками, и его строки ждали бы следующего, ничем не гарантированного изменения.
-        with self._lock:
-            pending = self._dirty.pop(handler.name, None)
-        if not pending or not pending[0]:
+        objects, sources = self._take_dirty()
+        if not objects:
             return
-        objects, sources = pending
 
         started = time.monotonic()
         retry_delay = 0.0
@@ -632,70 +701,72 @@ class HandlerRunner:
         window_start = None if full_rebuild else last_run_at
 
         try:
-            boundary = self._merges.boundary(handler.on)
+            boundary = self.merges.boundary(self.handler.on)
             if window_start is not None and boundary <= window_start:
                 # Окно пустое или вывернутое: по читаемым объектам идёт merge, начавшийся раньше
                 # прошлого прогона. Ничего не берём — отметки возвращаем, вернёмся к ним позже.
                 logger.debug("Handler %s: boundary %s is not past last_run_at %s, waiting",
-                             handler.name, boundary, window_start)
-                self._mark_dirty(handler.name, objects, sources)
+                             self.name, boundary, window_start)
+                self._mark_dirty(objects, sources)
                 return
 
             context = HandlerContext(
                 engine=self.engine, schema=self.schema, last_run_at=window_start,
                 boundary=boundary, objects=frozenset(objects), sources=frozenset(sources),
                 full_rebuild=full_rebuild,
-                logger=get_logger(f'cdc_1c.handler.{handler.name}'))
+                logger=get_logger(f'cdc_1c.handler.{self.name}'))
 
             # Разовая подготовка (DDL вьюшек и целевых таблиц) — до первого handle и только один
             # раз за процесс. Внутри try, чтобы упавший setup лёг в last_error и повторился, а не
-            # уронил поток обработчиков.
-            if handler.setup is not None and handler.name not in self._prepared:
-                handler.setup(context)
-                self._prepared.add(handler.name)
-            handler.handle(context)
+            # уронил поток обработчика.
+            if self.handler.setup is not None and not self._prepared:
+                self.handler.setup(context)
+                self._prepared = True
+            self.handler.handle(context)
         except Exception:
-            logger.exception("Handler %s failed, retry in %ss", handler.name, RETRY_DELAY)
-            self._save_error(handler.name)
+            logger.exception("Handler %s failed, retry in %ss", self.name, RETRY_DELAY)
+            self._save_error()
             # Возвращаем отметки: окно не сдвинулось (last_run_at не записан), но без грязного
             # флага повтор случился бы только при следующем изменении — а его может и не быть.
-            self._mark_dirty(handler.name, objects, sources)
+            self._mark_dirty(objects, sources)
             retry_delay = RETRY_DELAY
         else:
             # last_run_at = граница, ВЗЯТАЯ ДО вызова: всё, что смёржилось за время работы
             # обработчика, окажется правее неё и попадёт в следующее окно, а не потеряется.
             elapsed = time.monotonic() - started
-            if self._save_success(handler.name, boundary, last_run_at, full_rebuild_requested,
+            if self._save_success(boundary, last_run_at, full_rebuild_requested,
                                   full_rebuild, elapsed):
                 logger.info("Handler %s finished in %.1fs (objects=%s)",
-                            handler.name, elapsed, sorted(objects))
+                            self.name, elapsed, sorted(objects))
             else:
                 # Пока обработчик работал, его состояние успели поменять снаружи — например,
                 # заказали пересборку. Записать свой результат значило бы этот заказ молча
                 # отменить, поэтому оставляем чужое значение и взводим обработчик заново.
                 logger.info("Handler %s finished, but its state changed meanwhile — rerunning",
-                            handler.name)
-                self._mark_dirty(handler.name, objects, sources)
+                            self.name)
+                self._mark_dirty(objects, sources)
         finally:
             # Пауза до следующего прогона: обычно MIN_INTERVAL, после падения — RETRY_DELAY, чтобы
             # сломанный обработчик не повторялся каждую секунду и не заваливал лог трейсбеками.
-            delay = max(handler.min_interval, retry_delay)
+            delay = max(self.handler.min_interval, retry_delay)
             if delay > 0:
-                self._next_allowed_at[handler.name] = time.monotonic() + delay
+                self._next_allowed_at = time.monotonic() + delay
 
-    def _take_dirty(self, name: str) -> None:
+    def _take_dirty(self) -> tuple[set[str], set[str]]:
+        """Забирает накопленные отметки, оставляя очередь пустой."""
         with self._lock:
-            self._dirty.pop(name, None)
+            objects, sources = self._dirty_objects, self._dirty_sources
+            self._dirty_objects, self._dirty_sources = set(), set()
+        return objects, sources
 
-    def _mark_dirty(self, name: str, objects: set[str], sources: set[str]) -> None:
+    def _mark_dirty(self, objects: set[str], sources: set[str]) -> None:
         """Ставит обработчика в очередь, не затирая отметки, успевшие прилететь за это время.
         Используется и чтобы вернуть снятые отметки, когда прогон не состоялся или упал."""
         with self._lock:
-            objects_again, sources_again = self._dirty.setdefault(name, (set(), set()))
-            objects_again |= objects
-            sources_again |= sources
+            self._dirty_objects |= objects
+            self._dirty_sources |= sources
 
-    def _save_success(self, name: str, boundary: datetime, expected_last_run_at: datetime | None,
+    def _save_success(self, boundary: datetime, expected_last_run_at: datetime | None,
                       expected_rebuild: bool, full_rebuild: bool, elapsed: float) -> bool:
         """
         Двигает отметку обработчика — но только если его состояние не поменяли снаружи, пока он
@@ -723,12 +794,12 @@ class HandlerRunner:
         with self.engine.begin() as conn:
             result = conn.execute(
                 update(t)
-                .where(t.c.name == name, unchanged,
+                .where(t.c.name == self.name, unchanged,
                        t.c.full_rebuild_is_required == expected_rebuild)
                 .values(**values))
         return result.rowcount > 0
 
-    def _save_error(self, name: str) -> None:
+    def _save_error(self) -> None:
         with self.engine.begin() as conn:
-            conn.execute(update(self.table).where(self.table.c.name == name)
+            conn.execute(update(self.table).where(self.table.c.name == self.name)
                          .values(last_error=traceback.format_exc()[-4000:]))

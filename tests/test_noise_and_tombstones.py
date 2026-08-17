@@ -1,5 +1,5 @@
 """
-Оффлайн-тесты записи изменений на sqlite (DBWriter1C.save, режим изменений).
+Оффлайн-тесты записи изменений (DBWriter1C.save, режим изменений).
 
 Два связанных механизма:
 - шумной пакет (1С переписала объект, не изменив реквизитов) не должен трогать строку: отличие
@@ -22,12 +22,13 @@ from cdc_1c.metadata_reader import MetadataObject1C
 REF = "R1"
 
 
-def _writer():
-    return DBWriter1C(create_engine("sqlite://"), NameMapper1C())
+def _writer(db):
+    return DBWriter1C(db.engine, NameMapper1C(), schema=db.schema)
 
 
 def _rows(writer, table_name):
-    tbl = Table(table_name, MetaData(), autoload_with=writer.engine)
+    tbl = Table(table_name, MetaData(), schema=writer.schema,
+                autoload_with=writer.engine)
     with writer.engine.connect() as conn:
         return [dict(r) for r in conn.execute(select(tbl)).mappings()]
 
@@ -53,8 +54,8 @@ def _save_doc(writer, version_field, val, emn, version):
     return writer.save("Catalog_X", DataObject1C(_doc_meta(version_field), [record]))
 
 
-def test_noisy_packet_does_not_touch_the_row(version_field):
-    w = _writer()
+def test_noisy_packet_does_not_touch_the_row(db, version_field):
+    w = _writer(db)
     _save_doc(w, version_field, "a", emn=105, version="v1")
     before = _rows(w, "Catalog_X")[0]
 
@@ -68,8 +69,8 @@ def test_noisy_packet_does_not_touch_the_row(version_field):
     assert after[version_field] == "v1"
 
 
-def test_real_change_writes_noisy_fields_too(version_field):
-    w = _writer()
+def test_real_change_writes_noisy_fields_too(db, version_field):
+    w = _writer(db)
     _save_doc(w, version_field, "a", emn=105, version="v1")
 
     result = _save_doc(w, version_field, "b", emn=106, version="v2")
@@ -95,14 +96,13 @@ def _reg_rec(line, qty):
             "is_deleted_or_empty": False, "exchange_message_no": 105}
 
 
-def test_row_dropped_from_the_set_is_marked_with_nulled_resource():
-    w = _writer()
+def test_row_dropped_from_the_set_is_marked_with_nulled_resource(db):
+    w = _writer(db)
     w.save("AccumulationRegister_Reg",
            DataObject1C(_REG_META, [_reg_rec(1, 10), _reg_rec(2, 20)]))
     before = {r["LineNumber"]: r for r in _rows(w, "AccumulationRegister_Reg")}
 
     # следующий пакет привёз набор без строки 2
-    time.sleep(1)   # merged_on в sqlite с точностью до секунды
     w.save("AccumulationRegister_Reg", DataObject1C(_REG_META, [_reg_rec(1, 10)]))
 
     rows = {r["LineNumber"]: r for r in _rows(w, "AccumulationRegister_Reg")}
@@ -115,8 +115,8 @@ def test_row_dropped_from_the_set_is_marked_with_nulled_resource():
     assert rows[1]["merged_on"] == before[1]["merged_on"]
 
 
-def test_row_returning_to_the_set_is_resurrected():
-    w = _writer()
+def test_row_returning_to_the_set_is_resurrected(db):
+    w = _writer(db)
     w.save("AccumulationRegister_Reg",
            DataObject1C(_REG_META, [_reg_rec(1, 10), _reg_rec(2, 20)]))
     w.save("AccumulationRegister_Reg", DataObject1C(_REG_META, [_reg_rec(1, 10)]))

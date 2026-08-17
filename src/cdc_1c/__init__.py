@@ -10,9 +10,9 @@ from .data_reader import DataReader1C, DataObject1C
 from .change_reader import ChangeReader1C
 from .name_mapper import NameMapper1C
 from .db_writer import DBWriter1C
-from .handlers import Handler1C, HandlerContext
+from .handlers import Handler1C, HandlerContext, HandlerRunner
 from .replicator import Replicator1C
 
 __all__ = ["MetadataReader1C", "DataReader1C", "DataObject1C", "ChangeReader1C", "NameMapper1C",
-           "DBWriter1C", "Handler1C", "HandlerContext", "Replicator1C", "__version__"]
+           "DBWriter1C", "Handler1C", "HandlerContext", "HandlerRunner", "Replicator1C", "__version__"]
 

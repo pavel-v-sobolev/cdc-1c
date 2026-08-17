@@ -2,6 +2,7 @@ import functools
 import signal
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from typing import Iterable
@@ -121,7 +122,8 @@ class Replicator1C:
                  exchange_name: str, queue_guid: str,
                  engine: Engine, db_schema: str | None = None,
                  request_timeout: float | None = None,
-                 full_load_workers: int = 2):
+                 full_load_workers: int = 2,
+                 handler_runners: "Iterable[HandlerRunner] | None" = None):
         # Включаем вывод логов, если приложение не настроило логирование само.
         _ensure_handler()
 
@@ -161,29 +163,72 @@ class Replicator1C:
 
         # Реестр идущих merge нужен независимо от обработчиков: он же выдаёт момент старта прогона.
         self.merges = MergeTracker(self.writer.db_now)
-        # Обработчики (см. handlers.py) подключаются списком в run_forever/run_once, а не здесь:
-        # объявляются они пользовательским кодом, и оркестратору незачем знать, откуда они взялись.
-        self.handlers: HandlerRunner | None = None
+        self.handler_runners: list[HandlerRunner] = []
+        # Действующий _StopSignal текущего run_forever — через него цикл останавливают снаружи,
+        # когда он крутится не в главном потоке и своего перехвата сигналов не имеет.
+        self._stop_signal: "_StopSignal | None" = None
+        if handler_runners is not None:
+            self.install_handlers(handler_runners)
 
 
-    def install_handlers(self, handlers: Iterable) -> None:
+    def install_handlers(self, handler_runners: "Iterable[HandlerRunner]") -> None:
         """
-        Подключает пользовательские обработчики — экземпляры Handler1C, модули или функции с
-        атрибутами `ON`/`handle` (см. handlers.py). Обычно вызывается не напрямую, а передачей
-        `handlers=` в run_forever/run_once.
+        Подключает обработчиков — по готовому HandlerRunner на каждого:
 
-        Заводит таблицу состояния handlers_1c и помечает каждый обработчик «грязным»: грязные
-        отметки живут в памяти и перезапуск процесса не переживают, поэтому после старта каждый
-        обязан отработать хотя бы раз. Повторный вызов с уже подключёнными обработчиками —
-        ошибка: их состояние (в т.ч. «setup сделан») привязано к текущему набору.
+            zakazy  = HandlerRunner(engine=engine, schema='cdc_1c', handler=ZakazyKlientov())
+            grouped = HandlerRunner(engine=engine, schema='cdc_1c', handler=ZakazyKlientovGrouped())
+            replicator = Replicator1C(..., engine=engine, handler_runners=[zakazy, grouped])
+
+        Раннер на обработчика, а не один на всех, — чтобы у каждого был свой поток и тяжёлая
+        витрина не задерживала остальные. Обратная сторона: порядок вызова между обработчиками не
+        определён, и на «витрина поверх витрины считается после базовой» полагаться нельзя.
+
+        Реестр незавершённых merge раздаём мы: он обязан быть ОДНИМ на все раннеры и все
+        репликаторы, иначе граница окна обработчика не увидит merge соседа, и его строки, ещё не
+        закоммиченные, окажутся левее отметки — потеряются молча. Поэтому при нескольких планах
+        обмена достаточно передать второму репликатору ТЕ ЖЕ объекты раннеров: он подхватит уже
+        присоединённый реестр вместо своего, и общим тот станет сам собой.
         """
-        if self.handlers is not None:
+        handler_runners = list(handler_runners)
+        for runner in handler_runners:
+            if not isinstance(runner, HandlerRunner):
+                raise TypeError(f"handler_runners must contain HandlerRunner objects, got "
+                                f"{type(runner).__name__}. Build one per handler: "
+                                f"HandlerRunner(engine=..., schema=..., handler=...)")
+        if self.handler_runners:
             raise RuntimeError("Handlers are already installed")
-        self.handlers = HandlerRunner(engine=self.engine, schema=self.db_schema,
-                                      handlers=handlers, merge_tracker=self.merges)
+
+        for runner in handler_runners:
+            # Раннер пишет и читает те же таблицы, что и мы, поэтому подключение к чужой БД или
+            # чужой схеме — почти наверняка ошибка сборки, а проявилась бы она пустыми окнами.
+            if runner.engine is not self.engine:
+                raise ValueError(f"Handler {runner.name} is built on a different engine")
+            if runner.schema != self.db_schema:
+                raise ValueError(f"Handler {runner.name} works in schema {runner.schema!r}, "
+                                 f"replicator writes to {self.db_schema!r}")
+
+        # Уже присоединённый реестр (это второй репликатор для тех же раннеров) забираем себе;
+        # свой в этом случае выбрасываем — но только если в нём ничего не идёт, иначе эти merge
+        # для новой границы стали бы невидимыми.
+        attached = {id(r._merges): r._merges for r in handler_runners if r._merges is not None}
+        if len(attached) > 1:
+            raise ValueError("Handlers are attached to different MergeTrackers: pass the same "
+                             "HandlerRunner objects to every replicator that shares them")
+        if attached:
+            shared = next(iter(attached.values()))
+            if shared is not self.merges:
+                if not self.merges.is_empty():
+                    raise RuntimeError("Cannot adopt a shared MergeTracker while merges are in "
+                                       "flight: pass handler_runners= to the constructor instead")
+                self.merges = shared
+
+        for runner in handler_runners:
+            runner.attach_merges(self.merges)
+        self.handler_runners = handler_runners
 
     @_load_mode_tag(LOAD_MODE_CHANGES)
-    def run_once(self, notify_changes: bool = True, handlers: Iterable | None = None) -> None:
+    def run_once(self, notify_changes: bool = True,
+                 handler_runners: "Iterable[HandlerRunner] | None" = None) -> None:
         """
         Один цикл: (load metadata при первом вызове) → read → save → notify. Подтверждение
         получения отправляется только после успешного сохранения — если save упадёт, изменения
@@ -198,12 +243,12 @@ class Replicator1C:
         notify_changes=False отключает подтверждение совсем: изменения остаются в очереди обмена
         1С (полезно для отладки/тестов — цикл становится повторяемым).
 
-        handlers — список пользовательских обработчиков (см. install_handlers). Отдельного потока
-        здесь нет, поэтому ждущие запуска отрабатывают синхронно, в конце цикла. В повторных
-        вызовах список передавать не нужно: подключается он один раз.
+        handler_runners — по HandlerRunner на обработчика (см. install_handlers). Отдельных
+        потоков здесь нет, поэтому ждущие запуска отрабатывают синхронно, в конце цикла. В
+        повторных вызовах передавать их не нужно: подключаются они один раз.
         """
-        if handlers is not None and self.handlers is None:
-            self.install_handlers(handlers)
+        if handler_runners is not None and not self.handler_runners:
+            self.install_handlers(handler_runners)
         # Первый вызов: грузим метаданные. Дальше не перечитываем — это делает сам data_reader
         # при появлении нового объекта/поля (get_metadata держит is_loaded=True).
         if not self.metadata.is_loaded:
@@ -240,8 +285,9 @@ class Replicator1C:
 
         # Одиночный run_once: потока обработчиков нет (его заводит run_forever), поэтому ждущие
         # запуска отрабатывают здесь же, синхронно, после подтверждения пакета.
-        if self.handlers is not None and not self.handlers.is_running():
-            self.handlers.run_pending()
+        for runner in self.handler_runners:
+            if not runner.is_running():
+                runner.run_if_pending()
 
     def _save_changes(self) -> None:
         """
@@ -285,13 +331,15 @@ class Replicator1C:
         двигает, и окно обработчика её не увидит никогда. Поэтому на added_fields подписчики
         объекта отправляются пересчитывать всё.
         """
-        if self.handlers is None or result is None:
+        if not self.handler_runners or result is None:
             return
         if result.added_fields:
-            self.handlers.request_full_rebuild(
-                table_name, f"{table_name} gained columns {sorted(result.added_fields)}")
+            for runner in self.handler_runners:
+                runner.request_full_rebuild(
+                    table_name, f"{table_name} gained columns {sorted(result.added_fields)}")
         if (result.inserted_row_count + result.updated_row_count + result.deleted_row_count) > 0:
-            self.handlers.signal(table_name, source)
+            for runner in self.handler_runners:
+                runner.signal(table_name, source)
 
     def list_objects(self) -> list[str]:
         """
@@ -518,7 +566,7 @@ class Replicator1C:
 
     def run_forever(self, interval: float = 60.0, max_iterations: int = 0,
                     max_backoff: float = DEFAULT_MAX_BACKOFF,
-                    handlers: Iterable | None = None) -> None:
+                    handler_runners: "Iterable[HandlerRunner] | None" = None) -> None:
         """
         Цикл run_once с паузой interval секунд. Упавший цикл логируется и не подтверждается —
         повтор на следующей итерации. Корректно завершается по SIGTERM/SIGINT.
@@ -540,32 +588,44 @@ class Replicator1C:
         После каждого цикла фоном (пул потоков) запускаются полные выгрузки помеченных объектов —
         диспетчеризация только здесь (одиночный run_once лишь взводит флаги).
 
-        handlers — список пользовательских обработчиков (экземпляры Handler1C, модули или функции
-        с атрибутами `ON`/`handle`, см. handlers.py). Порядок списка = порядок вызова.
+        handler_runners — по HandlerRunner на обработчика (см. install_handlers). При нескольких
+        планах обмена одни и те же объекты передаются всем репликаторам.
 
         Потоков получается три сорта, и пулы у них раздельные: этот цикл (главный поток),
-        full_load_workers потоков полной выгрузки и ОДИН поток обработчиков. Обработчики в пул
-        выгрузки не сабмитятся и занять его не могут. Общий у них только engine, поэтому дефицит
-        возникает не в потоках, а в соединениях: одновременно их держат пакет изменений, страницы
-        выгрузки и обработчик, отсюда pool_size >= full_load_workers + 3 (см. README).
+        full_load_workers потоков полной выгрузки и по потоку на каждого обработчика. Обработчики
+        в пул выгрузки не сабмитятся и занять его не могут. Общий у них только engine, поэтому
+        дефицит возникает не в потоках, а в соединениях: одновременно их держат пакет изменений,
+        страницы выгрузки и каждый обработчик, отсюда
+        pool_size >= full_load_workers + число обработчиков + 1 (см. README).
         """
-        if handlers is not None and self.handlers is None:
-            self.install_handlers(handlers)
+        if handler_runners is not None and not self.handler_runners:
+            self.install_handlers(handler_runners)
         stop = _StopSignal()
+        self._stop_signal = stop
         logger.info("Starting replication loop (interval=%ss, max_iterations=%s, timeout=%ss)",
                     interval, max_iterations, self._request_timeout)
-        # Поток обработчиков заводится отдельно от пула полной выгрузки и живёт своей жизнью:
-        # он не сабмитится в executor и его воркеров не занимает.
-        if self.handlers is not None:
-            self.handlers.start()
+        # Поток обработчиков заводится отдельно от пула полной выгрузки: он не сабмитится в
+        # executor и его воркеров не занимает. start/stop считающие, поэтому все репликаторы,
+        # делящие один раннер, делают одно и то же, а поток гаснет, когда выйдет последний.
+        for runner in self.handler_runners:
+            runner.start()
         try:
             self._replication_loop(stop, interval, max_iterations, max_backoff)
         finally:
             # После выхода из _replication_loop пул уже дождался своих выгрузок, поэтому страницы,
             # дописанные на выходе, успели подать сигнал; stop дожидается текущего обработчика.
-            if self.handlers is not None:
-                self.handlers.stop()
+            for runner in self.handler_runners:
+                runner.stop()
         logger.info("Replication loop stopped")
+
+    def request_stop(self) -> None:
+        """
+        Просит идущий run_forever завершиться после текущей итерации — то же, что SIGTERM, но
+        программно. Нужна репликатору, крутящемуся не в главном потоке: свой перехват сигналов ему
+        поставить нельзя (см. _StopSignal), поэтому останавливает его тот, кто поток завёл.
+        """
+        if self._stop_signal is not None:
+            self._stop_signal.requested = True
 
     def _replication_loop(self, stop: "_StopSignal", interval: float, max_iterations: int,
                           max_backoff: float) -> None:
@@ -628,17 +688,47 @@ class Replicator1C:
                 self._full_load_in_progress.discard(object_full_name)
 
 
+# Все живые _StopSignal процесса: SIGTERM означает «останавливаемся целиком», поэтому флаг
+# взводится сразу всем циклам, а не только тому, чей объект оказался последним зарегистрированным.
+# Иначе при нескольких планах обмена (репликаторы в отдельных потоках) сигнал доходил бы лишь до
+# одного из них, а остальные крутились бы дальше — процесс не завершить.
+# WeakSet: отработавший run_forever свой сигнал больше не держит, и тот уходит вместе с ним.
+_stop_signals: "weakref.WeakSet[_StopSignal]" = weakref.WeakSet()
+_signal_handlers_installed = False
+
+
+def _handle_stop_signal(signum, frame) -> None:
+    logger.info("Received signal %s, stopping after current cycle", signum)
+    for stop in list(_stop_signals):
+        stop.requested = True
+
+
+def _install_signal_handlers() -> None:
+    """
+    Ставит перехват SIGTERM/SIGINT — один раз за процесс. Python разрешает это только из главного
+    потока, поэтому попытка из рабочего потока молча ничего не делает: флаг «установлено» при
+    неудаче не выставляется, и перехват поставит первый же вызов из главного потока.
+    """
+    global _signal_handlers_installed
+    if _signal_handlers_installed:
+        return
+    try:
+        signal.signal(signal.SIGTERM, _handle_stop_signal)
+        signal.signal(signal.SIGINT, _handle_stop_signal)
+    except ValueError:
+        logger.debug("Not the main thread: signal handlers will be installed by the main one")
+        return
+    _signal_handlers_installed = True
+
+
 class _StopSignal:
-    """Перехватывает SIGTERM/SIGINT для graceful-остановки run_forever."""
+    """Флаг graceful-остановки одного run_forever. Взводится общим перехватчиком (весь процесс
+    останавливается разом) либо точечно через Replicator1C.request_stop()."""
 
     def __init__(self):
         self.requested = False
-        signal.signal(signal.SIGTERM, self._handle)
-        signal.signal(signal.SIGINT, self._handle)
-
-    def _handle(self, signum, frame):
-        logger.info("Received signal %s, stopping after current cycle", signum)
-        self.requested = True
+        _stop_signals.add(self)
+        _install_signal_handlers()
 
     def wait(self, seconds: float) -> None:
         """Спит до seconds, прерываясь раньше при поступлении сигнала."""

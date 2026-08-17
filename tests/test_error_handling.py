@@ -25,7 +25,7 @@ class _Resp:
         self.url = 'http://1c/odata/SelectChanges'
 
 
-def test_raise_for_status_keeps_body_and_context():
+def test_raise_for_status_keeps_body_and_context(db):
     # Содержательное у 1С только в теле — оно должно быть и в тексте ошибки, вместе с контекстом.
     resp = _Resp(text='Ошибка блокировки данных при попытке чтения')
 
@@ -39,14 +39,14 @@ def test_raise_for_status_keeps_body_and_context():
     assert excinfo.value.response is resp
 
 
-def test_raise_for_status_truncates_long_body():
+def test_raise_for_status_truncates_long_body(db):
     with pytest.raises(requests.HTTPError) as excinfo:
         raise_for_status(_Resp(text='x' * (MAX_ERROR_BODY_CHARS + 500)), 'ctx')
 
     assert '[+500 chars]' in str(excinfo.value)
 
 
-def test_extract_error_text_odata_xml():
+def test_extract_error_text_odata_xml(db):
     body = ('<m:error xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">'
             '<m:code>-1</m:code><m:message>{(3, 23)}: Неверные параметры в операции\n'
             ' сравнения.</m:message></m:error>')
@@ -54,7 +54,7 @@ def test_extract_error_text_odata_xml():
     assert extract_error_text(body) == '{(3, 23)}: Неверные параметры в операции сравнения.'
 
 
-def test_extract_error_text_application_exception_json():
+def test_extract_error_text_application_exception_json(db):
     # Реальный ответ 1С при запрете входа: полезен только descr, а рядом лежат creationStack
     # с адресами в DLL и base64-дамп — в лог они не нужны.
     body = '﻿' + json.dumps({
@@ -83,14 +83,14 @@ def test_extract_error_text_application_exception_json():
     assert '77u/ew0K' not in text
 
 
-def test_extract_error_text_keeps_http_wrapper_when_alone():
+def test_extract_error_text_keeps_http_wrapper_when_alone(db):
     # Если кроме обёртки ничего нет — оставляем её, лучше так, чем пустая ошибка.
     body = json.dumps({"exception": {"descr": "HTTP: Forbidden\nОшибка запроса"}}, ensure_ascii=False)
 
     assert extract_error_text(body) == 'HTTP: Forbidden Ошибка запроса'
 
 
-def test_extract_error_text_platform_html():
+def test_extract_error_text_platform_html(db):
     body = ('<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">\n<html><head>'
             '<title>1C:Enterprise 8 application error</title></head><body>'
             '<h2>1C:Enterprise 8 application error:</h2>Unrecoverable error<br>'
@@ -103,12 +103,12 @@ def test_extract_error_text_platform_html():
     assert '<' not in text and '\n' not in text
 
 
-def test_extract_error_text_unknown_format_falls_back_to_body():
+def test_extract_error_text_unknown_format_falls_back_to_body(db):
     assert extract_error_text('  просто текст  ') == 'просто текст'
     assert extract_error_text('') == '<empty body>'
 
 
-def test_log_failure_http_error_without_traceback_and_text(caplog):
+def test_log_failure_http_error_without_traceback_and_text(db, caplog):
     # Описание от 1С уже вывел raise_for_status строкой выше — второй раз не повторяем,
     # и traceback (внутренности requests) не тащим.
     exc = requests.HTTPError('1C request failed: 403 Forbidden: Ведутся технические работы')
@@ -122,7 +122,7 @@ def test_log_failure_http_error_without_traceback_and_text(caplog):
     assert 'Ведутся технические работы' not in record.getMessage()
 
 
-def test_log_failure_connection_error_keeps_text(caplog):
+def test_log_failure_connection_error_keeps_text(db, caplog):
     # Таймаут/обрыв нигде не логируется до этого — текст нужен, traceback по-прежнему нет.
     with caplog.at_level(logging.ERROR, logger='cdc_1c.replicator'):
         _log_failure(requests.ConnectTimeout('connect timed out'), "Cycle failed")
@@ -132,7 +132,7 @@ def test_log_failure_connection_error_keeps_text(caplog):
     assert record.exc_info is None
 
 
-def test_log_failure_keeps_traceback_for_code_errors(caplog):
+def test_log_failure_keeps_traceback_for_code_errors(db, caplog):
     # Не ошибка обмена — похоже на баг в коде, traceback оставляем.
     with caplog.at_level(logging.ERROR, logger='cdc_1c.replicator'):
         try:
@@ -143,24 +143,25 @@ def test_log_failure_keeps_traceback_for_code_errors(caplog):
     assert caplog.records[-1].exc_info is not None
 
 
-def test_raise_for_status_passes_ok_response():
+def test_raise_for_status_passes_ok_response(db):
     assert raise_for_status(_Resp(status_code=200, text='ok'), 'ctx') is None
 
 
-def _replicator():
+def _replicator(db):
     return Replicator1C(
         odata_url='http://1c/odata',
         odata_auth=('u', 'p'),
         exchange_name='X',
         queue_guid='guid',
-        engine=create_engine('sqlite://'),
+        engine=db.engine,
+        db_schema=db.schema,
     )
 
 
-def _run_and_collect_delays(monkeypatch, error: Exception, waits: int, interval: float = 60.0):
+def _run_and_collect_delays(db, monkeypatch, error: Exception, waits: int, interval: float = 60.0):
     """Гоняет run_forever с падающим run_once, возвращая паузы, которые он запросил.
     Последняя итерация обрывается по max_iterations до паузы, поэтому итераций на одну больше."""
-    repl = _replicator()
+    repl = _replicator(db)
     delays = []
 
     def fake_run_once(*args, **kwargs):
@@ -172,30 +173,30 @@ def _run_and_collect_delays(monkeypatch, error: Exception, waits: int, interval:
     return delays
 
 
-def test_transient_failures_back_off_exponentially(monkeypatch):
+def test_transient_failures_back_off_exponentially(db, monkeypatch):
     # Слепой повтор каждые interval секунд накладывает попытки друг на друга — пауза растёт.
-    delays = _run_and_collect_delays(monkeypatch, requests.ConnectionError('1C is down'), 3)
+    delays = _run_and_collect_delays(db, monkeypatch, requests.ConnectionError('1C is down'), 3)
 
     assert delays == [120.0, 240.0, 480.0]
 
 
-def test_backoff_is_capped(monkeypatch):
-    delays = _run_and_collect_delays(monkeypatch, requests.ConnectionError('1C is down'), 12)
+def test_backoff_is_capped(db, monkeypatch):
+    delays = _run_and_collect_delays(db, monkeypatch, requests.ConnectionError('1C is down'), 12)
 
     assert max(delays) == DEFAULT_MAX_BACKOFF
     assert delays[-1] == DEFAULT_MAX_BACKOFF
 
 
-def test_permanent_error_goes_straight_to_max_backoff(monkeypatch):
+def test_permanent_error_goes_straight_to_max_backoff(db, monkeypatch):
     # 403 не лечится повтором: сразу потолок, а не 15 попыток по мере роста паузы.
     error = requests.HTTPError('forbidden', response=_Resp(status_code=403, reason='Forbidden'))
-    delays = _run_and_collect_delays(monkeypatch, error, 2)
+    delays = _run_and_collect_delays(db, monkeypatch, error, 2)
 
     assert delays == [DEFAULT_MAX_BACKOFF, DEFAULT_MAX_BACKOFF]
 
 
-def test_backoff_resets_after_success(monkeypatch):
-    repl = _replicator()
+def test_backoff_resets_after_success(db, monkeypatch):
+    repl = _replicator(db)
     delays = []
     calls = {'n': 0}
 

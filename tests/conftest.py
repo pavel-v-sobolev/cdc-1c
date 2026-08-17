@@ -1,0 +1,45 @@
+"""
+Общие фикстуры тестов: подключение к локальному PostgreSQL.
+
+Целевая СУБД у продукта — PostgreSQL, на ней и тестируем. sqlite в тестах не используется: он
+отличается ровно в тех местах, которые здесь и проверяются (нет схем, CURRENT_TIMESTAMP с точностью
+до секунды, соединение = отдельная база в in-memory режиме), поэтому зелёный тест на sqlite ничего
+не говорил бы о боевом поведении.
+
+Каждый тест получает СВОЮ схему с уникальным именем, которая создаётся перед ним и сносится после.
+Так тесты не мешают друг другу и не оставляют мусора в рабочих схемах базы.
+
+Адрес базы переопределяется переменной CDC1C_TEST_DB_URL.
+"""
+
+import os
+import uuid
+from dataclasses import dataclass
+
+import pytest
+from sqlalchemy import Engine, create_engine, text
+
+TEST_DB_URL = os.environ.get(
+    "CDC1C_TEST_DB_URL", "postgresql+psycopg2://postgres:postgres@localhost:5432/cdc_1c")
+
+
+@dataclass(frozen=True)
+class TestDB:
+    """Подключение и схема, отведённые одному тесту."""
+
+    engine: Engine
+    schema: str
+
+
+@pytest.fixture
+def db():
+    schema = f"cdc_1c_test_{uuid.uuid4().hex[:8]}"
+    engine = create_engine(TEST_DB_URL)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+        yield TestDB(engine=engine, schema=schema)
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        engine.dispose()

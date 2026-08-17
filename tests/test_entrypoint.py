@@ -5,7 +5,10 @@
 
 import pytest
 
+from sqlalchemy.engine import make_url
+
 import cdc_1c.__main__ as entry
+from conftest import TEST_DB_URL
 
 
 class _FakeReplicator:
@@ -21,7 +24,7 @@ class _FakeReplicator:
 
 def _set_env(monkeypatch, **extra):
     env = {"CDC1C_ODATA_URL": "http://x", "CDC1C_EXCHANGE_NAME": "E",
-           "CDC1C_QUEUE_GUID": "Q", "CDC1C_DB_URL": "sqlite://"}
+           "CDC1C_QUEUE_GUID": "Q", "CDC1C_DB_URL": TEST_DB_URL}
     env.update(extra)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -55,7 +58,7 @@ def test_main_maps_environment_to_arguments(monkeypatch):
     assert captured["queue_guid"] == "Q"
     assert captured["db_schema"] == "cdc_1c"
     assert captured["full_load_workers"] == 4
-    assert str(captured["engine"].url) == "sqlite://"
+    assert captured["engine"].url.database == make_url(TEST_DB_URL).database
 
 
 def test_main_without_user_means_no_auth(monkeypatch):

@@ -29,10 +29,10 @@ def _response(status_code: int):
     return response
 
 
-def _replicator():
-    engine = create_engine("sqlite://")  # in-memory
+def _replicator(db):
+    engine = db.engine
     rep = Replicator1C(odata_url="http://x", odata_auth=None,
-                       exchange_name="E", queue_guid="Q", engine=engine)
+                       exchange_name="E", queue_guid="Q", engine=engine, db_schema=db.schema)
     # Метаданные «уже загружены» — full_load не пойдёт в сеть; primary_key даёт $orderby.
     rep.metadata.is_loaded = True
     rep.metadata["Catalog_X"] = MetadataObject1C("Catalog_X", {"Ref_Key": "Guid"},
@@ -40,10 +40,10 @@ def _replicator():
     return rep
 
 
-def test_full_load_paging(monkeypatch):
+def test_full_load_paging(db, monkeypatch):
     # Справочник: ключ Ref_Key — ссылка, keyset по ней в 1С неприменим (см. _supports_keyset),
     # поэтому страницы берутся через $skip, а курсор after_values не используется.
-    rep = _replicator()
+    rep = _replicator(db)
     meta = rep.metadata["Catalog_X"]
     pages = iter([2, 2, 1])      # batch_size=2: две полные страницы и хвост → останов
     calls = []
@@ -92,9 +92,9 @@ def test_full_load_paging(monkeypatch):
     assert rows[0].finished_at is not None
 
 
-def test_full_load_register_paging(monkeypatch):
+def test_full_load_register_paging(db, monkeypatch):
     # Регистр: сортировка по Recorder, но Recorder — ссылка, поэтому страницы через $skip.
-    rep = _replicator()
+    rep = _replicator(db)
     rep.metadata["AccumulationRegister_R"] = MetadataObject1C(
         "AccumulationRegister_R", {"Recorder": "Guid"},
         {"Recorder": "Guid", "LineNumber": "Int64", "Recorder_Type": "String"},
@@ -129,10 +129,10 @@ def test_full_load_register_paging(monkeypatch):
     assert all(c["after_values"] is None for c in calls)
 
 
-def test_full_load_key_recorder_key():
+def test_full_load_key_recorder_key(db):
     # Регистр с единственным типом регистратора: 1С отдаёт Recorder_Key (Guid) вместо
     # Recorder/Recorder_Type — курсор всё равно должен быть по регистратору, а не составной.
-    rep = _replicator()
+    rep = _replicator(db)
     rep.metadata["InformationRegister_R"] = MetadataObject1C(
         "InformationRegister_R", {"Recorder_Key": "Guid", "Period": "DateTime"},
         {"Recorder_Key": "Guid", "Period": "DateTime"}, object_key=["Recorder_Key"])
@@ -152,10 +152,10 @@ def _failing_above(limit, calls):
     return fake_read_object
 
 
-def test_full_load_shrinks_to_single_entry(monkeypatch):
+def test_full_load_shrinks_to_single_entry(db, monkeypatch):
     # entry неделима (набор движений регистратора — мегабайты), поэтому уменьшаем вплоть до 1.
     # Смещение при этом не сдвигается: повторяем ту же страницу, а не следующую.
-    rep = _replicator()
+    rep = _replicator(db)
     calls = []
     monkeypatch.setattr(DataReader1C, "read_object", _failing_above(1, calls))
     rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
@@ -167,9 +167,9 @@ def test_full_load_shrinks_to_single_entry(monkeypatch):
     assert all(c["skip"] == 0 for c in calls)
 
 
-def test_full_load_remembers_reduced_page_size(monkeypatch):
+def test_full_load_remembers_reduced_page_size(db, monkeypatch):
     # Повторный прогон объекта начинает с уже подобранного размера, а не с пробной страницы.
-    rep = _replicator()
+    rep = _replicator(db)
     calls = []
     monkeypatch.setattr(DataReader1C, "read_object", _failing_above(4, calls))
     rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
@@ -180,10 +180,10 @@ def test_full_load_remembers_reduced_page_size(monkeypatch):
     assert [c["top"] for c in calls] == [20, 5, 1, 1]
 
 
-def test_next_page_size_follows_response_weight():
+def test_next_page_size_follows_response_weight(db):
     # Размер следующей страницы считается из фактического веса выданной: сколько entry
     # укладывается в бюджет FULL_LOAD_TARGET_BYTES (32 МБ).
-    rep = _replicator()
+    rep = _replicator(db)
 
     # запись ~1 МБ (набор движений регистратора) → 32 записи на страницу
     assert rep._next_page_size("O", 20, 20, 20 * 1024 * 1024, 1000) == 32
@@ -197,9 +197,9 @@ def test_next_page_size_follows_response_weight():
     assert rep._next_page_size("O", 7, 0, 0, 1000) == 7
 
 
-def test_full_load_reraises_permanent_error(monkeypatch):
+def test_full_load_reraises_permanent_error(db, monkeypatch):
     # 400/403/404 уменьшением страницы не лечатся — пробрасываем сразу, без повторов.
-    rep = _replicator()
+    rep = _replicator(db)
 
     def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
                          key_types=None, extra_filter=None, skip=None):
@@ -212,8 +212,8 @@ def test_full_load_reraises_permanent_error(monkeypatch):
         rep.full_load("Catalog_X", batch_size=1000)
 
 
-def test_full_load_empty_object(monkeypatch):
-    rep = _replicator()
+def test_full_load_empty_object(db, monkeypatch):
+    rep = _replicator(db)
 
     def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
                          key_types=None, extra_filter=None, skip=None):
@@ -234,9 +234,9 @@ def test_full_load_empty_object(monkeypatch):
     assert len(rows) == 1 and rows[0].finished_at is not None
 
 
-def test_full_load_composite_key_with_reference(monkeypatch):
+def test_full_load_composite_key_with_reference(db, monkeypatch):
     # Независимый регистр, в ключе есть измерение-ссылка (Dim_Key) → keyset запрещён, идём $skip.
-    rep = _replicator()
+    rep = _replicator(db)
     meta = MetadataObject1C("InformationRegister_Indep", {"Period": "DateTime", "Dim_Key": "Guid"},
                             {"Period": "DateTime", "Dim_Key": "Guid"}, object_key=None)
     rep.metadata["InformationRegister_Indep"] = meta
@@ -265,10 +265,10 @@ def test_full_load_composite_key_with_reference(monkeypatch):
     assert all(c["after_values"] is None for c in calls)
 
 
-def test_full_load_composite_key_keyset(monkeypatch):
+def test_full_load_composite_key_keyset(db, monkeypatch):
     # Ключ без ссылок (Period + числовой код) — keyset корректен: курсор следующей страницы
     # = значения всех ключевых полей последней записи, $skip не используется.
-    rep = _replicator()
+    rep = _replicator(db)
     meta = MetadataObject1C("InformationRegister_Scalar", {"Period": "DateTime", "Code": "Int64"},
                             {"Period": "DateTime", "Code": "Int64"}, object_key=None)
     rep.metadata["InformationRegister_Scalar"] = meta
@@ -295,7 +295,7 @@ def test_full_load_composite_key_keyset(monkeypatch):
     assert all(c["skip"] is None for c in calls)
 
 
-def test_read_object_keyset_url(monkeypatch):
+def test_read_object_keyset_url(db, monkeypatch):
     # Проверяем формирование URL keyset-страницы: $top, $orderby, $filter с guid-литералом.
     md = MetadataReader1C("http://x")
     reader = DataReader1C("http://x", md)
@@ -369,8 +369,8 @@ def _flag_row(rep, name):
                          .where(t.c.object_name == name)).first()
 
 
-def test_dispatch_runs_full_load_and_marks_loaded():
-    rep = _replicator()
+def test_dispatch_runs_full_load_and_marks_loaded(db):
+    rep = _replicator(db)
     rep.metadata._sync_objects(["Catalog_X"])          # первая sync создаёт таблицу-реестр
     rep.metadata.require_full_load_if_new("Catalog_X")  # объект пришёл в пакете, не выгружался → нужно
 
@@ -385,8 +385,8 @@ def test_dispatch_runs_full_load_and_marks_loaded():
     assert rep._full_load_in_progress == set()           # из «в работе» убрали
 
 
-def test_dispatch_skips_in_progress():
-    rep = _replicator()
+def test_dispatch_skips_in_progress(db):
+    rep = _replicator(db)
     rep.metadata._sync_objects(["Catalog_X"])
     rep.metadata.require_full_load_if_new("Catalog_X")
     rep._full_load_in_progress.add("Catalog_X")          # уже выгружается
@@ -396,7 +396,7 @@ def test_dispatch_skips_in_progress():
     assert ex.submitted == []                            # повторно не сабмитим
 
 
-def test_build_date_filter():
+def test_build_date_filter(db):
     from cdc_1c.replicator import Replicator1C
     assert Replicator1C._build_date_filter(None, None, None) is None
     # нижняя граница — с начала дня (ge полночь)
@@ -412,9 +412,9 @@ def test_build_date_filter():
         Replicator1C._build_date_filter(None, date(2026, 6, 1), None)
 
 
-def test_full_load_passes_date_filter(monkeypatch):
+def test_full_load_passes_date_filter(db, monkeypatch):
     # full_load транслирует date_field/date_from/date_to в extra_filter и отдаёт его в read_object.
-    rep = _replicator()
+    rep = _replicator(db)
     captured = {}
 
     def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
@@ -433,7 +433,7 @@ def test_full_load_passes_date_filter(monkeypatch):
         "Date ge datetime'2026-06-01T00:00:00' and Date lt datetime'2026-07-01T00:00:00'"
 
 
-def test_read_object_combines_keyset_and_extra_filter(monkeypatch):
+def test_read_object_combines_keyset_and_extra_filter(db, monkeypatch):
     # keyset-курсор и extra_filter объединяются в один $filter по AND; двоеточия в datetime сохранены.
     md = MetadataReader1C("http://x")
     reader = DataReader1C("http://x", md)
