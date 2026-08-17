@@ -407,6 +407,29 @@ def test_full_rebuild_request_opens_the_window_and_is_cleared_after_success():
     assert state.last_run_at is not None
 
 
+def test_full_rebuild_request_alone_starts_the_handler():
+    # Флаг ставят руками в таблице, и никакого сигнала об изменении за ним не приходит. Если бы
+    # заказ не будил обработчик сам, он лежал бы без дела до ближайшего изменения подписанных
+    # объектов — а его может не быть неделями.
+    spy = Spy()
+    runner, _ = _runner(spy)
+    runner.run_pending()
+    spy.calls.clear()
+
+    runner.run_pending()
+    assert spy.calls == [], 'без изменений и без заказа обработчик не зовут'
+
+    with runner.engine.begin() as conn:
+        conn.execute(runner.table.update()
+                     .where(runner.table.c.name == spy.name)
+                     .values(full_rebuild_is_required=True))
+
+    runner.run_pending()
+    assert len(spy.calls) == 1, 'один только заказ пересборки должен запустить обработчик'
+    assert spy.calls[0].full_rebuild is True
+    assert not _state(runner, spy.name).full_rebuild_is_required
+
+
 def test_full_rebuild_requested_during_a_run_is_not_lost():
     # Заказ пересборки может прийти в середине прогона (новая колонка приехала пакетом, пока
     # обработчик считал). Записать поверх него свой результат — значит молча его отменить.

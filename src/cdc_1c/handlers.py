@@ -94,6 +94,9 @@ SOURCE_FULL_LOAD = 'full_load'
 # просто стоял, пока данные грузил кто-то другой). Поэтому на старте каждый обработчик считается
 # грязным один раз: если делать нечего, его SELECT по окну просто вернёт пусто.
 SOURCE_STARTUP = 'startup'
+# Заказана пересборка витрины (full_rebuild_is_required). Отдельный повод к запуску: флаг ставят
+# руками в таблице, и никаких изменений за ним не приходит — ждать сигнала можно вечно.
+SOURCE_REBUILD = 'full_rebuild'
 
 # Пауза холостого цикла потока обработчиков. Нужна не для опроса (о новых данных сообщает событие),
 # а чтобы дождаться истечения MIN_INTERVAL и отпустившей границы окна, не занимая CPU.
@@ -584,6 +587,11 @@ class HandlerRunner:
                 # окно, накопленное за всё время простоя, и посчитает его одним прогоном.
                 self._take_dirty(handler.name)
                 continue
+            if full_rebuild:
+                # Заказ пересборки сам ставит обработчик в очередь. Иначе он бы дожидался сигнала
+                # об изменении подписанных объектов, а изменений может не быть неделями — флаг,
+                # проставленный руками, так и лежал бы без дела.
+                self._mark_dirty(handler.name, set(handler.on), {SOURCE_REBUILD})
             if time.monotonic() < self._next_allowed_at.get(handler.name, 0):
                 continue
             self._run_handler(handler, last_run_at, full_rebuild)
@@ -630,7 +638,7 @@ class HandlerRunner:
                 # прошлого прогона. Ничего не берём — отметки возвращаем, вернёмся к ним позже.
                 logger.debug("Handler %s: boundary %s is not past last_run_at %s, waiting",
                              handler.name, boundary, window_start)
-                self._restore_dirty(handler.name, objects, sources)
+                self._mark_dirty(handler.name, objects, sources)
                 return
 
             context = HandlerContext(
@@ -651,7 +659,7 @@ class HandlerRunner:
             self._save_error(handler.name)
             # Возвращаем отметки: окно не сдвинулось (last_run_at не записан), но без грязного
             # флага повтор случился бы только при следующем изменении — а его может и не быть.
-            self._restore_dirty(handler.name, objects, sources)
+            self._mark_dirty(handler.name, objects, sources)
             retry_delay = RETRY_DELAY
         else:
             # last_run_at = граница, ВЗЯТАЯ ДО вызова: всё, что смёржилось за время работы
@@ -667,7 +675,7 @@ class HandlerRunner:
                 # отменить, поэтому оставляем чужое значение и взводим обработчик заново.
                 logger.info("Handler %s finished, but its state changed meanwhile — rerunning",
                             handler.name)
-                self._restore_dirty(handler.name, objects, sources)
+                self._mark_dirty(handler.name, objects, sources)
         finally:
             # Пауза до следующего прогона: обычно MIN_INTERVAL, после падения — RETRY_DELAY, чтобы
             # сломанный обработчик не повторялся каждую секунду и не заваливал лог трейсбеками.
@@ -679,9 +687,9 @@ class HandlerRunner:
         with self._lock:
             self._dirty.pop(name, None)
 
-    def _restore_dirty(self, name: str, objects: set[str], sources: set[str]) -> None:
-        """Возвращает снятые отметки обратно (прогон не состоялся или упал), не затирая те, что
-        успели прилететь за это время."""
+    def _mark_dirty(self, name: str, objects: set[str], sources: set[str]) -> None:
+        """Ставит обработчика в очередь, не затирая отметки, успевшие прилететь за это время.
+        Используется и чтобы вернуть снятые отметки, когда прогон не состоялся или упал."""
         with self._lock:
             objects_again, sources_again = self._dirty.setdefault(name, (set(), set()))
             objects_again |= objects
