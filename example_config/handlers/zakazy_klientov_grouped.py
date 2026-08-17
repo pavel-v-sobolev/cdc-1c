@@ -2,25 +2,30 @@
 Витрина с ДРУГИМ ключом: агрегат по (Номер документа, Год, Артикул), а не по строкам регистра.
 Второй пример: как та же схема работает, когда ключ витрины не совпадает с ключом источника.
 
-Ключ группы здесь СОСТАВНОЙ — (Number, Year), — и этим пример отличается от zakazy_klientov.py,
-где группа задаётся одним регистратором. Составной ключ меняет ровно две вещи: запрос «что
-изменилось» отдаёт две колонки, а фильтры собираются row-value сравнением
-`tuple_(a, b).in_(...)`. Год берётся из даты документа, то есть это ВЫЧИСЛЯЕМАЯ часть ключа —
-см. предупреждение в handle().
+Ключ группы здесь составной — (Number, Year). Это меняет две вещи: запрос «что пересобрать» отдаёт
+две колонки, а фильтры собираются row-value сравнением `tuple_(a, b).in_(...)`.
+
+Главное же отличие в том, что ключ ВЫЧИСЛЯЕТСЯ из данных: Number берётся из документа, Year — из его
+даты. Значит, изменение в 1С может не изменить строку, а перенести её в другую группу: доехал
+документ — строки ушли из группы-заглушки в реальную; поправили дату через границу года — ушли из
+(N, 2025) в (N, 2026). Новую группу видно в источнике, а старой нет уже нигде, и удалить её нечем.
+
+Поэтому витрина хранит колонки-массивы "*_Keys": GUID-ы объектов 1С, из которых собрана строка.
+Обработчик берёт GUID-ы изменившихся объектов и получает по ним два списка групп — что эти объекты
+давали раньше (по массивам витрины) и что дают сейчас (по построчному слою), — после чего
+пересобирает оба. Покинутая группа при этом чистится сама.
 
 Смена ключа требует двух слоёв вьюшек:
-  1) _rows_view — построчный слой: все JOIN'ы описаны ОДИН раз, и здесь же каждый источник отдаёт
-     свой merged_on отдельной колонкой. Он же отвечает на вопрос «какие группы изменились».
-     Оба соединения — LEFT: объекты 1С приезжают в обмене независимо, и движения регистра могут
-     доехать раньше своего документа или своей номенклатуры. INNER JOIN просто спрятал бы такие
-     строки до прибытия документа; LEFT показывает их сразу, но ценой NULL в ключе группы —
-     отсюда COALESCE ниже и уборка группы-заглушки в handle().
-  2) _view — агрегат поверх построчного слоя, он и есть источник merge.
-Граница обработки приходит готовой в ctx.last_run_at — одна на все источники, — поэтому целевой
-таблице не нужно хранить по отметке на источник, чтобы вычислить её из самой себя.
+  1) _rows_view — построчный: все JOIN'ы описаны один раз, каждый источник отдаёт свой merged_on
+     отдельной колонкой, ссылки на источники выходят наружу как есть;
+  2) _view — агрегат поверх него, он и есть источник merge; здесь же ссылки сворачиваются в массивы.
+
+Соединения — LEFT, потому что объекты 1С приезжают в обмене независимо: движения регистра могут
+доехать раньше своего документа или номенклатуры. INNER JOIN спрятал бы такие строки до прибытия
+документа; LEFT показывает их сразу, ценой NULL в ключе группы — отсюда COALESCE ниже.
 """
 
-from sqlalchemy import or_, select, text, tuple_
+from sqlalchemy import text, tuple_
 
 from dbmerge import dbmerge
 
@@ -39,7 +44,11 @@ SELECT
 			"Zakazano",
 	s."merged_on",
 	z."merged_on" "ZakazKlienta_merged_on",
-	n."merged_on" "Nomenklatura_merged_on"
+	n."merged_on" "Nomenklatura_merged_on",
+	--Ссылки на источники: ниже они сворачиваются в массивы, по которым ищутся покинутые группы.
+	--Регистратор и документ — один и тот же GUID, поэтому колонка одна на оба источника.
+	s."Recorder",
+	s."Nomenklatura_Key"
 FROM {schema}."AccumulationRegister_ZakazyKlientov" s
 LEFT JOIN {schema}."Document_ZakazKlienta" z ON z."Ref_Key" = s."Recorder" AND
 	s."Recorder_Type"='Document_ЗаказКлиента'
@@ -54,7 +63,14 @@ SELECT
 	"Year",
 	"Artikul",
 	SUM("Zakazano") "Zakazano",
-	MAX("merged_on") "merged_on"
+	MAX("merged_on") "merged_on",
+	--Массивы собираются по всей группе, а не по одной строке: если строку удалят, группа должна
+	--достаться остальным. array_agg(DISTINCT ...) сортирует, поэтому массив стабилен и не даёт
+	--ложных UPDATE. FILTER отсекает NULL, COALESCE подставляет пустой массив.
+	COALESCE(array_agg(DISTINCT "Recorder") FILTER (WHERE "Recorder" IS NOT NULL),
+		ARRAY[]::uuid[]) "Recorder_Keys",
+	COALESCE(array_agg(DISTINCT "Nomenklatura_Key") FILTER (WHERE "Nomenklatura_Key" IS NOT NULL),
+		ARRAY[]::uuid[]) "Nomenklatura_Keys"
 FROM {schema}."ZakazyKlientovGrouped_rows_view"
 GROUP BY "Number","Year","Artikul"
 );
@@ -65,6 +81,8 @@ CREATE TABLE IF NOT EXISTS {schema}."ZakazyKlientovGrouped" (
 	"Artikul" varchar,
 	"Zakazano" numeric,
 	"merged_on" timestamp,
+	"Recorder_Keys" uuid[],
+	"Nomenklatura_Keys" uuid[],
 	CONSTRAINT "ZakazyKlientovGrouped_pkey"
 		PRIMARY KEY ("Number", "Year", "Artikul")
 );
@@ -72,24 +90,55 @@ CREATE TABLE IF NOT EXISTS {schema}."ZakazyKlientovGrouped" (
 CREATE INDEX IF NOT EXISTS "ix_ZakazyKlientovGrouped_merged_on" ON
 	{schema}."ZakazyKlientovGrouped" USING btree (merged_on);
 
--- Индекс под source_condition: по ключу группы фильтруется агрегатная вьюшка, а Number приходит
+-- GIN на каждый массив: под запрос «какие группы породил вот этот набор GUID-ов» (оператор &&).
+-- Btree тут не работает: ищем не по значению массива, а по вхождению элемента.
+CREATE INDEX IF NOT EXISTS "ix_ZakazyKlientovGrouped_Recorder_Keys" ON
+	{schema}."ZakazyKlientovGrouped" USING gin ("Recorder_Keys");
+
+CREATE INDEX IF NOT EXISTS "ix_ZakazyKlientovGrouped_Nomenklatura_Keys" ON
+	{schema}."ZakazyKlientovGrouped" USING gin ("Nomenklatura_Keys");
+
+-- Индекс под source_condition: агрегатная вьюшка фильтруется по ключу группы, а Number приходит
 -- из документа.
 CREATE INDEX IF NOT EXISTS "ix_Document_ZakazKlienta_Number" ON
 	{schema}."Document_ZakazKlienta" USING btree ("Number");
 
--- Индекс по колонке соединения со справочником: без него ветка UNION ALL, которую ведёт свежая
--- номенклатура, дотягивается до регистра полным сканом. Репликатор такие индексы не создаёт — он
--- заводит только merged_on, а что с чем соединяется, знает витрина, а не он.
+-- Индекс по колонке соединения со справочником. Репликатор такие индексы не создаёт — он заводит
+-- только merged_on, а что с чем соединяется, знает витрина, а не он.
 CREATE INDEX IF NOT EXISTS "ix_AccumulationRegister_ZakazyKlientov_Nomenklatura_Key" ON
 	{schema}."AccumulationRegister_ZakazyKlientov" USING btree ("Nomenklatura_Key");
 """
 
-# Какие группы (Number, Year) стали свежее — спрашиваем у построчного слоя: одна вьюшка, один источник
-# правды, JOIN'ы не дублируются.
+# Группы, которые надо пересобрать за окно (:since — конец прошлого прогона):
+# PREVIOUS — что изменившиеся объекты давали раньше, CURRENT — что дают сейчас.
 #
-# Ветка на источник через UNION ALL, а не один WHERE с OR — почему именно так, см. комментарий
-# в handle(). DISTINCT не нужен: результат уходит в IN (...), дубликаты там роли не играют.
-CHANGED_GROUPS = """
+# Две тонкости, из-за которых половины записаны по-разному:
+#   - в PREVIOUS оба условия на одной таблице, там OR работает через индексы; в CURRENT они на
+#     разных таблицах соединения, и OR пришлось бы проверять уже после JOIN'а — поэтому UNION ALL;
+#   - набор изменившегося подставляется через ARRAY(SELECT ...), а не IN (SELECT ...): под OR
+#     IN-подзапрос не позволяет планировщику использовать индексы.
+GROUPS_TO_REBUILD_SQL = """
+WITH changed_recorders AS (
+    SELECT DISTINCT "Recorder" AS id
+      FROM {schema}."AccumulationRegister_ZakazyKlientov"
+     WHERE "merged_on" > :since
+    UNION
+    SELECT "Ref_Key" FROM {schema}."Document_ZakazKlienta"
+     WHERE "merged_on" > :since
+),
+changed_nomenklatura AS (
+    SELECT "Ref_Key" AS id FROM {schema}."Catalog_Nomenklatura"
+     WHERE "merged_on" > :since
+)
+
+-- PREVIOUS: группы, которые изменившиеся объекты давали раньше
+SELECT "Number", "Year" FROM {schema}."ZakazyKlientovGrouped"
+ WHERE "Recorder_Keys" && ARRAY(SELECT id FROM changed_recorders)
+    OR "Nomenklatura_Keys" && ARRAY(SELECT id FROM changed_nomenklatura)
+
+UNION ALL
+
+-- CURRENT: группы, которые они дают сейчас
 SELECT "Number", "Year" FROM {schema}."ZakazyKlientovGrouped_rows_view"
  WHERE "merged_on" > :since
 UNION ALL
@@ -110,70 +159,28 @@ class ZakazyKlientovGrouped(Handler1C):
     # граница окна.
     ON = ["AccumulationRegister_ZakazyKlientov", "Document_ZakazKlienta", "Catalog_Nomenklatura"]
 
-    def setup(self, ctx):
-        self.execute(ctx, DDL)
+    def setup(self, context):
+        self.execute(context, DDL)
 
-    def handle(self, ctx):
-        # Здесь граница подставляется в текстовый SQL, а не собирается changed_since: условие живёт
-        # в построчном слое, до которого выражениям SQLAlchemy из этого места не дотянуться.
-        changed_groups = text(CHANGED_GROUPS.format(schema=self.schema_prefix(ctx))).bindparams(
-            since=self.since(ctx))
+    def handle(self, context):
+        groups_to_rebuild = text(
+            GROUPS_TO_REBUILD_SQL.format(schema=self.schema_prefix(context))
+        ).bindparams(since=self.since(context))
 
-        with dbmerge(ctx.engine, table_name="ZakazyKlientovGrouped", schema=ctx.schema,
-                     source_table_name="ZakazyKlientovGrouped_view", source_schema=ctx.schema,
+        with dbmerge(context.engine, table_name="ZakazyKlientovGrouped", schema=context.schema,
+                     source_table_name="ZakazyKlientovGrouped_view", source_schema=context.schema,
                      delete_mode='delete') as merge:
             # Ключ группы составной, поэтому сравнение row-value: (Number, Year) IN (SELECT
             # Number, Year ...). В остальном ничего не меняется по сравнению с одиночным ключом.
             source_key = tuple_(merge.source_table.c["Number"], merge.source_table.c["Year"])
             target_key = tuple_(merge.table.c["Number"], merge.table.c["Year"])
 
-            # Группа-заглушка: строки, чей документ ещё не доехал (Number='' из COALESCE). Её
-            # приходится пересчитывать всегда, и вот почему. Когда документ наконец приезжает, его
-            # строки МЕНЯЮТ ключ группы — уходят из ('', 0) в реальный (Number, Year). Запрос
-            # изменившихся групп вернёт только новый ключ, старый в него не попадёт, и строки под
-            # заглушкой остались бы в витрине навсегда. Та же ловушка сработала бы, если бы дата
-            # документа переехала через границу года: у составного ключа с вычисляемой частью
-            # строка может мигрировать между группами, и покинутую группу надо чистить отдельно.
-            # Здесь это дёшево: ключ заглушки один и известен заранее.
-            source_placeholder = merge.source_table.c["Number"] == ''
-            target_placeholder = merge.table.c["Number"] == ''
+            # Берём из вьюшки все строки этих групп и удаляем в витрине тоже по ним, а не по
+            # содержимому staging-таблицы. Группы, из которой всё уехало, в staging нет — по нему
+            # её было бы не удалить. Удаление по ключу ГРУППЫ (а не по PK) заодно убирает те
+            # Artikul, что из группы выпали, в том числе при переименовании Code.
+            merge.exec(source_condition=source_key.in_(groups_to_rebuild),
+                       delete_condition=target_key.in_(groups_to_rebuild))
 
-            merge.exec(
-                # source_condition — это WHERE по вьюшке ZakazyKlientovGrouped_view. Фильтруем по
-                # ключу группы, т.к. merged_on во вьюшке агрегирован и фильтровать по нему «строки
-                # источника» нельзя — у группы другой ключ.
-                source_condition=or_(source_key.in_(changed_groups), source_placeholder),
-                # delete_condition: чистим все строки изменившихся групп в целевой таблице, затем
-                # merge вставит актуальный состав. Удаляем по ключу группы (а не по PK), чтобы
-                # убрать и те Artikul, что из группы выпали (в том числе при переименовании Code).
-                # Заглушка в scope всегда: строки, ушедшие из неё к своему документу, удалятся
-                # именно здесь — во временной таблице их уже нет.
-                delete_condition=or_(
-                    target_key.in_(select(merge.temp_table.c["Number"], merge.temp_table.c["Year"])),
-                    target_placeholder),
-            )
-
-        # Почему CHANGED_GROUPS собран через UNION ALL, а не одним WHERE с тремя OR. Вариант с OR
-        # читается лучше, но на объёме это узкое место, и дело НЕ в отсутствии индексов. Ветки
-        # такого OR живут на разных таблицах соединения, поэтому ни по одной нельзя отфильтровать
-        # до джойна: условие проверяется только на готовой паре и вырождается в Join Filter поверх
-        # ПОЛНОГО соединения. BitmapOr из индексных сканов Postgres собирает охотно, но только
-        # когда все ветки OR на одной таблице, а преобразовывать OR в UNION через границу джойна он
-        # не умеет. Тип соединения ни при чём: замена LEFT на INNER плана не меняет.
-        #
-        # В варианте с UNION ALL в каждой ветке остаётся предикат ровно по ОДНОЙ базовой таблице.
-        # Такой предикат планировщик опускает внутрь вьюшки, в скан этой таблицы, и ветка заходит
-        # через её индекс merged_on (их заводит сам репликатор, см. _ensure_merged_on_index).
-        # LEFT JOIN не мешает: `n.merged_on > since` для несопоставленных строк даёт NULL,
-        # предикат null-rejecting, и внешнее соединение в этой ветке схлопывается во внутреннее.
-        #
-        # Замер на синтетике (регистр 2 млн строк, окно ~0.5%): OR — 620 мс с полным сканом
-        # регистра, UNION ALL из той же вьюшки — 98 мс без единого seq scan. Переписывать соединения
-        # руками ради этого не нужно: руками получилось 83 мс, разница в пределах накладных
-        # расходов на вьюшку, а логика соединений при этом осталась бы в трёх копиях.
-        #
-        # Ещё два условия, без которых выигрыша не будет:
-        #  - random_page_cost под SSD (1.1 вместо дефолтных 4): иначе планировщик предпочтёт seq
-        #    scan регистра nested loop'у по индексу, и UNION ALL даст лишь ~2x вместо ~6x;
-        #  - индекс по колонке соединения со справочником (Nomenklatura_Key) — см. DDL.
-        ctx.logger.info("Витрина обновлена за окно (%s, %s]", self.since(ctx), ctx.boundary)
+        context.logger.info("Витрина обновлена за окно (%s, %s]",
+                            self.since(context), context.boundary)

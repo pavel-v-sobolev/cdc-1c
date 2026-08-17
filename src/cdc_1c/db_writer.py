@@ -181,13 +181,21 @@ class DBWriter1C:
 
     def db_now(self) -> datetime:
         """
-        Текущее время ПО ЧАСАМ БД — момент старта прогона полной выгрузки для guard'ов ниже.
-        Берётся из БД, а не из Python, чтобы сравниваться с merged_on, который dbmerge штампует
-        тем же now(). Вызывать один раз на прогон, до чтения первой страницы: старт заведомо раньше
-        любого чтения, поэтому guard защищает с запасом, а не впритык.
+        Текущее время ПО ЧАСАМ БД — момент старта прогона полной выгрузки для guard'ов ниже и
+        верхняя граница окна обработчиков. Берётся из БД, а не из Python, чтобы сравниваться с
+        merged_on, который dbmerge штампует тем же now(). Вызывать один раз на прогон, до чтения
+        первой страницы: старт заведомо раньше любого чтения, поэтому guard защищает с запасом.
+
+        Отметка возвращается БЕЗ часового пояса. PostgreSQL now() отдаёт timestamptz, то есть
+        offset-aware datetime, а merged_on и handlers_1c.last_run_at лежат в колонках без часового
+        пояса и читаются offset-naive. Сравнить их в Python нельзя — «can't compare offset-naive and
+        offset-aware datetimes», — а сравнивает их как раз HandlerRunner (boundary против
+        last_run_at). Смещение отбрасываем, а не приводим к UTC: драйвер уже перевёл значение в
+        часовой пояс сессии, и ровно так же PostgreSQL приводит timestamptz к timestamp при записи.
         """
         with self.engine.connect() as conn:
-            return conn.scalar(select(func.now()))
+            value = conn.scalar(select(func.now()))
+        return value.replace(tzinfo=None) if getattr(value, 'tzinfo', None) else value
 
     # Guard'ы полной выгрузки по merged_on. Смысл один на все три: снимок читается долго и к моменту
     # записи может устареть, поэтому он не трогает то, что переписали уже после старта его прогона.

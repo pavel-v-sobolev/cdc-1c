@@ -2,7 +2,7 @@
 Витрина: строки регистра «Заказы клиентов» с артикулом из справочника номенклатуры.
 
 Раннер зовёт обработчик сам, когда в БД реально изменился регистр или номенклатура, и передаёт
-окно (ctx.last_run_at, ctx.boundary] — выбирать данные обработчик должен по нему.
+окно (context.last_run_at, context.boundary] — выбирать данные обработчик должен по нему.
 
 Ключевая мысль всей конструкции: объекты 1С приезжают в обмене независимо, номенклатура может
 доехать позже регистра. Поэтому вьюшка отдаёт merged_on КАЖДОГО источника отдельной колонкой, и в
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS {schema}."ZakazyKlientov" (
 
 -- Индекс по merged_on нужен не этой витрине, а той, что может строиться поверх неё: её обработчик
 -- будет спрашивать «что здесь изменилось». Индекса по Nomenklatura_merged_on нет намеренно: он
--- существовал ради SELECT max(...) из самой витрины, а границу теперь приносит ctx.
+-- существовал ради SELECT max(...) из самой витрины, а границу теперь приносит context.
 CREATE INDEX IF NOT EXISTS "ix_ZakazyKlientov_merged_on" ON
 	{schema}."ZakazyKlientov" USING btree (merged_on);
 
@@ -70,14 +70,14 @@ class ZakazyKlientov(Handler1C):
     # (незавершённый merge любой из них прижимает границу к своему старту).
     ON = ["AccumulationRegister_ZakazyKlientov", "Catalog_Nomenklatura"]
 
-    def setup(self, ctx):
+    def setup(self, context):
         # Один раз за процесс, а не на каждый вызов: полная выгрузка сигналит постранично, и
         # CREATE OR REPLACE VIEW на каждую страницу брал бы блокировки на пустом месте.
-        self.execute(ctx, DDL)
+        self.execute(context, DDL)
 
-    def handle(self, ctx):
-        with dbmerge(ctx.engine, table_name="ZakazyKlientov", schema=ctx.schema,
-                     source_table_name="ZakazyKlientov_view", source_schema=ctx.schema,
+    def handle(self, context):
+        with dbmerge(context.engine, table_name="ZakazyKlientov", schema=context.schema,
+                     source_table_name="ZakazyKlientov_view", source_schema=context.schema,
                      delete_mode='delete') as merge:
 
             # Единица пересчёта — не строка, а ГРУППА (Recorder), потому что удаляем мы тоже
@@ -88,7 +88,7 @@ class ZakazyKlientov(Handler1C):
             # соединений не дублируется, ветки различаются только колонкой в WHERE. ALL — потому
             # что дедупликация не нужна: результат уходит в IN (...), где дубликаты не мешают.
             changed = merge.source_table.alias("chg")
-            since = self.since(ctx)
+            since = self.since(context)
             changed_recorders = union_all(*[
                 select(changed.c["Recorder"], changed.c["Recorder_Type"]).where(changed.c[column] > since)
                 for column in ("merged_on", "Nomenklatura_merged_on")
@@ -138,4 +138,5 @@ class ZakazyKlientov(Handler1C):
             #  - индекс по колонке соединения со справочником (Nomenklatura_Key) — репликатор
             #    заводит только merged_on, поэтому этот индекс создаётся в setup().
 
-        ctx.logger.info("Витрина обновлена за окно (%s, %s]", self.since(ctx), ctx.boundary)
+        context.logger.info("Витрина обновлена за окно (%s, %s]",
+                            self.since(context), context.boundary)

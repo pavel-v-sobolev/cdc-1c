@@ -14,7 +14,7 @@
     ON_FULL_LOAD = True     # звать ли на страницах полной выгрузки (по умолчанию да)
     MIN_INTERVAL = 0        # не чаще раза в N секунд (0 — без ограничения)
 
-    def handle(ctx): ...
+    def handle(context): ...
 
 Подключается явным импортом и явным списком — никакого сканирования каталогов и магии с путями:
 
@@ -38,14 +38,18 @@
 данные, а не только те, ради которых он написан.
 
 Данные обработчику не передаются — он делает свой SELECT. Ему передаётся окно времени
-(`ctx.last_run_at`, `ctx.boundary`), по которому он выбирает изменившееся:
+(`context.last_run_at`, `context.boundary`), по которому он выбирает изменившееся:
 
     WHERE merged_on > :last_run_at
 
 `last_run_at` — отметка предыдущего УСПЕШНОГО запуска, `NULL` — обработчик ещё ни разу не
-отрабатывал либо его попросили пересчитать всё:
+отрабатывал. Собрать витрину заново можно, заказав пересборку:
 
-    UPDATE <схема>.handlers_1c SET last_run_at = NULL WHERE name = '<имя обработчика>';
+    UPDATE <схема>.handlers_1c SET full_rebuild_is_required = true WHERE name = '<имя обработчика>';
+
+Тогда окно откроется с начала времён (`context.last_run_at` = None), а в `context.full_rebuild`
+придёт True — на случай, если пересборка у обработчика устроена иначе, чем обычный прогон. После
+успеха требование снимается и в `last_full_rebuild_dt` записывается время.
 
 Обе границы — по часам БД (тем же now(), которым dbmerge штампует merged_on), чтобы не ловить
 расхождение часов между хостами.
@@ -71,8 +75,8 @@ from datetime import datetime
 from types import ModuleType
 from typing import Callable, Iterable
 
-from sqlalchemy import (Boolean, Column, ColumnElement, DateTime, Engine, MetaData, String,
-                        Table, insert, or_, select, text, update)
+from sqlalchemy import (Boolean, Column, ColumnElement, DateTime, Engine, Float, MetaData, String,
+                        Table, func, insert, inspect, or_, select, text, update)
 
 from cdc_1c.db_logs import _check_create_schema
 from cdc_1c.logging_config import LOAD_MODE_HANDLER, get_logger, load_mode
@@ -117,6 +121,11 @@ class HandlerContext:
     # Границы окна по часам БД: (last_run_at, boundary]. last_run_at=None — с начала времён.
     last_run_at: datetime | None
     boundary: datetime
+    # Витрину просят собрать заново: обработчик ещё ни разу не отрабатывал либо кто-то заказал
+    # пересборку (handlers_1c.full_rebuild_is_required). Окно при этом открыто с начала времён —
+    # обработчику, который считает только по нему, ничего специально делать не надо. Флаг нужен
+    # тем, у кого пересборка идёт иначе: например, не одним merge, а по частям.
+    full_rebuild: bool
     # Таблицы, изменения которых привели к этому вызову, и откуда они пришли. Информационно:
     # выбирать данные всё равно по окну (за время ожидания могли измениться и другие объекты).
     objects: frozenset[str]
@@ -134,10 +143,10 @@ class Handler1C:
             # имена ТАБЛИЦ в целевой БД (транслит), а не имена объектов 1С
             ON = ["AccumulationRegister_ZakazyKlientov", "Catalog_Nomenklatura"]
 
-            def setup(self, ctx):
-                self.execute(ctx, DDL)
+            def setup(self, context):
+                self.execute(context, DDL)
 
-            def handle(self, ctx):
+            def handle(self, context):
                 ...
 
     В раннер передаётся ЭКЗЕМПЛЯР, а не класс: так обработчик можно параметризовать конструктором
@@ -174,24 +183,24 @@ class Handler1C:
     def name(self) -> str:
         return self.NAME or type(self).__name__
 
-    def setup(self, ctx: HandlerContext) -> None:
+    def setup(self, context: HandlerContext) -> None:
         """
         Разовая подготовка: DDL вьюшек и целевых таблиц, создание индексов. Вызывается один раз за
         процесс, перед первым handle. Отдельно от handle именно поэтому: полная выгрузка сигналит
         постранично, и CREATE OR REPLACE VIEW на каждый вызов брал бы блокировки на пустом месте.
         """
 
-    def handle(self, ctx: HandlerContext) -> None:
-        """Полезная работа за окно (ctx.last_run_at, ctx.boundary]."""
-        raise NotImplementedError(f"{self.name}.handle(ctx) is not implemented")
+    def handle(self, context: HandlerContext) -> None:
+        """Полезная работа за окно (context.last_run_at, context.boundary]."""
+        raise NotImplementedError(f"{self.name}.handle(context) is not implemented")
 
     # --- то, что иначе копируется из обработчика в обработчик ----------------------------------
 
-    def since(self, ctx: HandlerContext) -> datetime:
+    def since(self, context: HandlerContext) -> datetime:
         """Нижняя граница окна; None (первый запуск либо запрошен пересчёт) → с начала времён."""
-        return ctx.last_run_at or EPOCH
+        return context.last_run_at or EPOCH
 
-    def changed_since(self, ctx: HandlerContext, *columns: ColumnElement) -> ColumnElement:
+    def changed_since(self, context: HandlerContext, *columns: ColumnElement) -> ColumnElement:
         """
         Условие «хоть одна из отметок свежее прошлого прогона»: `column > since` через OR.
 
@@ -207,26 +216,26 @@ class Handler1C:
         сканов Postgres в таком случае строит сам.
 
         Верхней границы здесь намеренно нет, хотя окно ею закрывается. От потери строк защищает не
-        этот WHERE, а само значение ctx.boundary: оно прижато к старту незавершённого merge, чьи
+        этот WHERE, а само значение context.boundary: оно прижато к старту незавершённого merge, чьи
         строки обработчику ещё не видны. Строку правее границы, которая уже видна, обработчик
         посчитает раньше срока — и посчитает её же ещё раз в следующем окне, потому что last_run_at
         станет boundary. Это лишняя работа, а не пропуск, и взамен витрина получается свежее.
 
         Обработчику, которому повтор дорог (отправка во внешнюю систему, где каждое сообщение
-        стоит денег), верхнюю границу стоит добавить самому: `column <= ctx.boundary`.
+        стоит денег), верхнюю границу стоит добавить самому: `column <= context.boundary`.
         """
-        since = self.since(ctx)
+        since = self.since(context)
         return or_(*[column > since for column in columns])
 
-    def execute(self, ctx: HandlerContext, sql: str, **params) -> None:
+    def execute(self, context: HandlerContext, sql: str, **params) -> None:
         """Выполняет SQL, подставляя в `{schema}` целевую схему (уже в кавычках)."""
-        with ctx.engine.begin() as conn:
-            conn.execute(text(sql.format(schema=self.schema_prefix(ctx))), params)
+        with context.engine.begin() as conn:
+            conn.execute(text(sql.format(schema=self.schema_prefix(context))), params)
 
     @staticmethod
-    def schema_prefix(ctx: HandlerContext) -> str:
+    def schema_prefix(context: HandlerContext) -> str:
         """Имя схемы для подстановки в текстовый SQL; без схемы — public (схема по умолчанию)."""
-        return f'"{ctx.schema}"' if ctx.schema else 'public'
+        return f'"{context.schema}"' if context.schema else 'public'
 
 
 @dataclass(frozen=True)
@@ -264,7 +273,7 @@ def as_handler(obj) -> Handler:
     if handle is None and callable(obj):
         handle = obj
     if not callable(handle):
-        raise AttributeError(f"Handler {obj!r} has no callable handle(ctx)")
+        raise AttributeError(f"Handler {obj!r} has no callable handle(context)")
 
     on = frozenset(getattr(obj, 'ON', ()) or ())
     if not on:
@@ -385,8 +394,33 @@ def _handlers_table(metadata: MetaData, schema_name: str | None) -> Table:
         Column("enabled", Boolean, nullable=False),
         Column("last_run_at", DateTime, nullable=True),
         Column("last_error", String, nullable=True),
+        # Заказ полной пересборки витрины — руками или автоматически (см. request_full_rebuild) —
+        # и метрики последней пересборки. Названы по образцу metadata_objects_1c, где так же
+        # устроена полная выгрузка объекта.
+        Column("full_rebuild_is_required", Boolean, nullable=False, server_default=text('false')),
+        Column("last_full_rebuild_dt", DateTime, nullable=True),
+        Column("last_full_rebuild_minutes", Float, nullable=True),
         schema=schema_name,
     )
+
+
+def _add_missing_columns(engine: Engine, table: Table) -> None:
+    """
+    Дописывает в существующую таблицу колонки, которых в ней ещё нет: create(checkfirst=True)
+    заводит таблицу целиком, но давно созданную не трогает, и после обновления библиотеки строки
+    состояния остались бы без новых колонок.
+    """
+    existing = {column['name'] for column in inspect(engine).get_columns(
+        table.name, schema=table.schema)}
+    missing = [column for column in table.columns if column.name not in existing]
+    if not missing:
+        return
+    compiler = engine.dialect.ddl_compiler(engine.dialect, None)
+    with engine.begin() as conn:
+        for column in missing:
+            conn.execute(text(f'ALTER TABLE {compiler.preparer.format_table(table)} '
+                              f'ADD COLUMN {compiler.get_column_specification(column)}'))
+    logger.info("Added columns to %s: %s", table.name, ', '.join(c.name for c in missing))
 
 
 class HandlerRunner:
@@ -423,6 +457,7 @@ class HandlerRunner:
 
         self.table = _handlers_table(MetaData(), self.schema_name)
         self.table.create(engine, checkfirst=True)
+        _add_missing_columns(engine, self.table)
         self._register_handlers()
 
         self._lock = threading.Lock()
@@ -477,9 +512,9 @@ class HandlerRunner:
             logger.debug("Signal %s (%s) → %s", object_name, source, ', '.join(woken))
             self._wakeup.set()
 
-    def request_full_reload(self, object_name: str, reason: str) -> None:
+    def request_full_rebuild(self, object_name: str, reason: str) -> None:
         """
-        Просит подписчиков объекта пересчитать всё: сбрасывает last_run_at в NULL.
+        Просит подписчиков объекта собрать витрину заново: ставит full_rebuild_is_required.
 
         Единственный автоматический повод — новая колонка в таблице объекта (added_fields из
         dbmerge). Инкремент её появления не видит в принципе: окно строится по merged_on, а
@@ -492,8 +527,8 @@ class HandlerRunner:
         with self.engine.begin() as conn:
             conn.execute(update(self.table)
                          .where(self.table.c.name.in_(names))
-                         .values(last_run_at=None))
-        logger.info("Full reload requested for %s (%s)", ', '.join(sorted(names)), reason)
+                         .values(full_rebuild_is_required=True))
+        logger.info("Full rebuild requested for %s (%s)", ', '.join(sorted(names)), reason)
 
     # --- исполнение --------------------------------------------------------------------------
 
@@ -543,24 +578,28 @@ class HandlerRunner:
         for handler in self.handlers:
             if self._stop.is_set():
                 return
-            if not state.get(handler.name, (False, None))[0]:
+            enabled, last_run_at, full_rebuild = state.get(handler.name, (False, None, False))
+            if not enabled:
                 # Выключен в таблице — грязные отметки не копим, иначе после включения он получит
                 # окно, накопленное за всё время простоя, и посчитает его одним прогоном.
                 self._take_dirty(handler.name)
                 continue
             if time.monotonic() < self._next_allowed_at.get(handler.name, 0):
                 continue
-            self._run_handler(handler, state[handler.name][1])
+            self._run_handler(handler, last_run_at, full_rebuild)
 
-    def _read_state(self) -> dict[str, tuple[bool, datetime | None]]:
-        """Состояние обработчиков из БД: {имя: (включён, last_run_at)}. Читается на каждый проход —
-        и enabled, и сброс last_run_at меняются снаружи, руками или чужим процессом."""
+    def _read_state(self) -> dict[str, tuple[bool, datetime | None, bool]]:
+        """Состояние обработчиков из БД: {имя: (включён, last_run_at, заказана ли пересборка)}.
+        Читается на каждый проход — все три меняются снаружи, руками или чужим процессом."""
         t = self.table
         with self.engine.connect() as conn:
-            rows = conn.execute(select(t.c.name, t.c.enabled, t.c.last_run_at)).all()
-        return {name: (bool(enabled), last_run_at) for name, enabled, last_run_at in rows}
+            rows = conn.execute(select(t.c.name, t.c.enabled, t.c.last_run_at,
+                                       t.c.full_rebuild_is_required)).all()
+        return {name: (bool(enabled), last_run_at, bool(rebuild))
+                for name, enabled, last_run_at, rebuild in rows}
 
-    def _run_handler(self, handler: Handler, last_run_at: datetime | None) -> None:
+    def _run_handler(self, handler: Handler, last_run_at: datetime | None,
+                     full_rebuild_requested: bool = False) -> None:
         # Грязные отметки забираем ПЕРЕД расчётом границы, а не после: сигнал приходит уже после
         # коммита своего merge, поэтому всё, что не попало в это окно, пришлёт сигнал позже и
         # взведёт обработчик заново. В обратном порядке такой сигнал мог бы быть съеден вместе со
@@ -571,29 +610,42 @@ class HandlerRunner:
             return
         objects, sources = pending
 
-        boundary = self._merges.boundary(handler.on)
-        if last_run_at is not None and boundary <= last_run_at:
-            # Окно пустое или вывернутое: по читаемым объектам идёт merge, начавшийся раньше
-            # прошлого прогона. Ничего не берём — отметки возвращаем, вернёмся к ним позже.
-            logger.debug("Handler %s: boundary %s is not past last_run_at %s, waiting",
-                         handler.name, boundary, last_run_at)
-            self._restore_dirty(handler.name, objects, sources)
-            return
-
-        ctx = HandlerContext(engine=self.engine, schema=self.schema, last_run_at=last_run_at,
-                             boundary=boundary, objects=frozenset(objects),
-                             sources=frozenset(sources), logger=get_logger(f'cdc_1c.handler.{handler.name}'))
-
         started = time.monotonic()
         retry_delay = 0.0
+        # Всё, что может упасть, — внутри try, включая расчёт границы. Иначе отметки, снятые выше,
+        # пропадут вместе с исключением: обработчик перестанет вставать в очередь до следующего
+        # изменения, а в handlers_1c не появится last_error, и со стороны БД он будет выглядеть
+        # исправным. Так уже случалось на сравнении границы с last_run_at.
+        # Пересборка — это «ни разу не отрабатывал» либо заказ через full_rebuild_is_required.
+        # Окно в обоих случаях открывается с начала времён, поэтому обработчику, который считает
+        # только по окну, флаг знать не обязательно. В БД last_run_at при этом сохраняется: если
+        # пересборка упадёт, прежняя граница останется на месте.
+        full_rebuild = full_rebuild_requested or last_run_at is None
+        window_start = None if full_rebuild else last_run_at
+
         try:
+            boundary = self._merges.boundary(handler.on)
+            if window_start is not None and boundary <= window_start:
+                # Окно пустое или вывернутое: по читаемым объектам идёт merge, начавшийся раньше
+                # прошлого прогона. Ничего не берём — отметки возвращаем, вернёмся к ним позже.
+                logger.debug("Handler %s: boundary %s is not past last_run_at %s, waiting",
+                             handler.name, boundary, window_start)
+                self._restore_dirty(handler.name, objects, sources)
+                return
+
+            context = HandlerContext(
+                engine=self.engine, schema=self.schema, last_run_at=window_start,
+                boundary=boundary, objects=frozenset(objects), sources=frozenset(sources),
+                full_rebuild=full_rebuild,
+                logger=get_logger(f'cdc_1c.handler.{handler.name}'))
+
             # Разовая подготовка (DDL вьюшек и целевых таблиц) — до первого handle и только один
             # раз за процесс. Внутри try, чтобы упавший setup лёг в last_error и повторился, а не
             # уронил поток обработчиков.
             if handler.setup is not None and handler.name not in self._prepared:
-                handler.setup(ctx)
+                handler.setup(context)
                 self._prepared.add(handler.name)
-            handler.handle(ctx)
+            handler.handle(context)
         except Exception:
             logger.exception("Handler %s failed, retry in %ss", handler.name, RETRY_DELAY)
             self._save_error(handler.name)
@@ -604,15 +656,16 @@ class HandlerRunner:
         else:
             # last_run_at = граница, ВЗЯТАЯ ДО вызова: всё, что смёржилось за время работы
             # обработчика, окажется правее неё и попадёт в следующее окно, а не потеряется.
-            if self._save_success(handler.name, boundary, last_run_at):
+            elapsed = time.monotonic() - started
+            if self._save_success(handler.name, boundary, last_run_at, full_rebuild_requested,
+                                  full_rebuild, elapsed):
                 logger.info("Handler %s finished in %.1fs (objects=%s)",
-                            handler.name, time.monotonic() - started, sorted(objects))
+                            handler.name, elapsed, sorted(objects))
             else:
-                # Пока обработчик работал, его отметку успели поменять снаружи — практически
-                # всегда это запрос полного пересчёта (last_run_at = NULL). Записать свою границу
-                # значило бы этот запрос молча отменить, поэтому оставляем чужое значение и
-                # взводим обработчик заново: следующий прогон отработает с новой отметки.
-                logger.info("Handler %s finished, but its window was reset meanwhile — rerunning",
+                # Пока обработчик работал, его состояние успели поменять снаружи — например,
+                # заказали пересборку. Записать свой результат значило бы этот заказ молча
+                # отменить, поэтому оставляем чужое значение и взводим обработчик заново.
+                logger.info("Handler %s finished, but its state changed meanwhile — rerunning",
                             handler.name)
                 self._restore_dirty(handler.name, objects, sources)
         finally:
@@ -634,21 +687,37 @@ class HandlerRunner:
             objects_again |= objects
             sources_again |= sources
 
-    def _save_success(self, name: str, boundary: datetime,
-                      expected: datetime | None) -> bool:
+    def _save_success(self, name: str, boundary: datetime, expected_last_run_at: datetime | None,
+                      expected_rebuild: bool, full_rebuild: bool, elapsed: float) -> bool:
         """
-        Двигает отметку обработчика — но только если её не поменяли снаружи, пока он работал
-        (`expected` — значение, с которым он стартовал). Возвращает False, если не сдвинул.
+        Двигает отметку обработчика — но только если его состояние не поменяли снаружи, пока он
+        работал (`expected_*` — значения, с которыми он стартовал). False, если не сдвинул.
 
-        Сравнение, а не безусловная запись: request_full_reload сбрасывает last_run_at в NULL, и
-        такой сброс, пришедший в середине прогона, безусловная запись отменила бы, не оставив следа.
-        Условие собрано на IS NULL / равенстве, а не на IS DISTINCT FROM — тот есть не во всех СУБД.
+        Сравнение, а не безусловная запись: пересборку могли заказать уже в середине прогона, и
+        безусловная запись сняла бы этот заказ, не оставив следа. Условие собрано на IS NULL /
+        равенстве, а не на IS DISTINCT FROM — тот есть не во всех СУБД.
+
+        Если прогон был пересборкой (full_rebuild), вместе с отметкой снимается требование и
+        записываются её метрики — как mark_full_loaded делает для полной выгрузки объекта. Время в
+        МИНУТАХ и дробное: пересборка витрины меряется десятками минут, секунды тут только мешают.
+
+        Два разных признака рядом не по недосмотру: expected_rebuild — что стояло в БД на старте
+        прогона (по нему проверяем, не заказали ли пересборку в середине), а full_rebuild — чем
+        прогон оказался на самом деле. Первый в жизни прогон — пересборка, хотя её не заказывали.
         """
         t = self.table
-        unchanged = t.c.last_run_at.is_(None) if expected is None else t.c.last_run_at == expected
+        unchanged = (t.c.last_run_at.is_(None) if expected_last_run_at is None
+                     else t.c.last_run_at == expected_last_run_at)
+        values = {'last_run_at': boundary, 'last_error': None}
+        if full_rebuild:
+            values.update(full_rebuild_is_required=False, last_full_rebuild_dt=func.now(),
+                          last_full_rebuild_minutes=round(elapsed / 60, 3))
         with self.engine.begin() as conn:
-            result = conn.execute(update(t).where(t.c.name == name, unchanged)
-                                  .values(last_run_at=boundary, last_error=None))
+            result = conn.execute(
+                update(t)
+                .where(t.c.name == name, unchanged,
+                       t.c.full_rebuild_is_required == expected_rebuild)
+                .values(**values))
         return result.rowcount > 0
 
     def _save_error(self, name: str) -> None:

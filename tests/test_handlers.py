@@ -10,7 +10,7 @@
 
 import time
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from dbmerge import mergeResult
@@ -19,6 +19,7 @@ from sqlalchemy import StaticPool, create_engine, select
 from cdc_1c import Handler1C
 from cdc_1c.handlers import (SOURCE_CHANGES, SOURCE_FULL_LOAD, HandlerRunner, MergeTracker,
                              as_handler, build_handlers)
+from cdc_1c.name_mapper import NameMapper1C
 
 
 class Spy(Handler1C):
@@ -36,11 +37,11 @@ class Spy(Handler1C):
         self.calls = []
         self.setup_calls = 0
 
-    def setup(self, ctx):
+    def setup(self, context):
         self.setup_calls += 1
 
-    def handle(self, ctx):
-        self.calls.append(ctx)
+    def handle(self, context):
+        self.calls.append(context)
         if self.fail:
             raise RuntimeError('handler failed on purpose')
 
@@ -65,9 +66,14 @@ def _runner(*handlers, db_now=None):
 
 
 def _last_run_at(runner, name):
+    return _state(runner, name).last_run_at
+
+
+def _state(runner, name):
+    """Строка состояния обработчика из handlers_1c."""
     with runner.engine.connect() as conn:
-        return conn.execute(select(runner.table.c.last_run_at)
-                            .where(runner.table.c.name == name)).scalar()
+        return conn.execute(select(runner.table)
+                            .where(runner.table.c.name == name)).one()
 
 
 def _result(inserted=0, updated=0, deleted=0, added_fields=None):
@@ -83,7 +89,7 @@ def test_as_handler_accepts_instances_modules_and_functions():
     # Обязательного базового класса нет: раннеру нужны имя, ON и вызываемое handle.
     assert as_handler(Spy(name='spy')).name == 'spy'
 
-    def send_to_queue(ctx):
+    def send_to_queue(context):
         pass
     send_to_queue.ON = ["Catalog_X"]
     assert as_handler(send_to_queue).name == 'send_to_queue'
@@ -95,7 +101,7 @@ def test_as_handler_accepts_instances_modules_and_functions():
 
 def test_as_handler_rejects_broken_declarations():
     class NoOn(Handler1C):
-        def handle(self, ctx):
+        def handle(self, context):
             pass
 
     with pytest.raises(AttributeError, match="ON"):
@@ -134,6 +140,57 @@ def test_handlers_are_signalled_by_table_name(monkeypatch):
     rep.handlers.run_pending()
     assert len(spy.calls) == 1
     assert spy.calls[0].objects == frozenset({"Catalog_Nomenklatura"})
+
+
+def test_db_now_drops_the_time_zone():
+    # PostgreSQL now() отдаёт timestamptz, драйвер — offset-aware datetime. А merged_on и
+    # handlers_1c.last_run_at лежат в колонках без часового пояса и читаются offset-naive.
+    # Сравнить их в Python нельзя, и HandlerRunner падал на boundary <= last_run_at с
+    # «can't compare offset-naive and offset-aware datetimes».
+    from cdc_1c.db_writer import DBWriter1C
+
+    aware = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=3)))
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def scalar(self, _statement):
+            return aware
+
+    class _Engine:
+        def connect(self):
+            return _Conn()
+
+    writer = DBWriter1C(engine=_Engine(), name_mapper=NameMapper1C())
+    now = writer.db_now()
+
+    assert now.tzinfo is None
+    assert now == aware.replace(tzinfo=None), 'смещение отбрасываем, а не переводим в UTC'
+    assert now > datetime(2026, 1, 1), 'сравнение с naive-отметкой больше не падает'
+
+
+def test_failure_before_handle_keeps_the_handler_in_the_queue():
+    # Падение ДО вызова handle (например, при расчёте границы) не должно съедать грязные отметки:
+    # иначе обработчик перестанет вставать в очередь до следующего изменения, а в handlers_1c не
+    # появится last_error — со стороны БД он будет выглядеть исправным.
+    def broken_clock():
+        raise RuntimeError('БД недоступна')
+
+    spy = Spy()
+    runner, _ = _runner(spy, db_now=broken_clock)
+
+    runner.run_pending()
+
+    assert spy.calls == []
+    with runner.engine.connect() as conn:
+        error = conn.execute(select(runner.table.c.last_error)
+                             .where(runner.table.c.name == spy.name)).scalar()
+    assert error and 'БД недоступна' in error
+    assert runner._dirty.get(spy.name, (set(), set()))[0], 'отметки должны вернуться в очередь'
 
 
 def test_build_handlers_rejects_duplicate_names():
@@ -192,13 +249,14 @@ def test_changed_since_covers_all_sources():
     spy = Spy()
     runner, _ = _runner(spy)
     runner.run_pending()
-    ctx = spy.calls[0]
+    context = spy.calls[0]
 
     t = Table('m', MetaData(), Column('a', DateTime), Column('b', DateTime))
-    sql = str(spy.changed_since(ctx, t.c.a, t.c.b))
+    sql = str(spy.changed_since(context, t.c.a, t.c.b))
     assert sql.count('>') == 2, sql
     assert ' OR ' in sql
-    # Верхней границы нет намеренно: от пропуска строк защищает значение ctx.boundary, а не WHERE.
+    # Верхней границы нет намеренно: от пропуска строк защищает значение context.boundary,
+    # а не WHERE.
     assert '<=' not in sql, sql
 
 
@@ -323,36 +381,53 @@ def test_disabled_handler_does_not_accumulate_window():
     assert spy.calls == [], 'включение само по себе прогон не назначает — ждём изменения'
 
 
-def test_full_reload_request_resets_the_window():
+def test_full_rebuild_request_opens_the_window_and_is_cleared_after_success():
     spy = Spy()
     runner, _ = _runner(spy)
     runner.run_pending()
+    assert spy.calls[0].full_rebuild is True, 'первый прогон — это тоже сборка с нуля'
     spy.calls.clear()
-    assert _last_run_at(runner, spy.name) is not None
+    first = _state(runner, spy.name)
+    assert first.last_run_at is not None
+    assert first.last_full_rebuild_dt is not None, 'метрики пишутся и без явного заказа'
+    assert first.last_full_rebuild_minutes is not None
 
-    runner.request_full_reload("Catalog_X", "new column")
+    runner.request_full_rebuild("Catalog_X", "new column")
+    assert _state(runner, spy.name).full_rebuild_is_required
+
     runner.signal("Catalog_X", SOURCE_CHANGES)
     runner.run_pending()
-    assert spy.calls[0].last_run_at is None, 'пересчёт всего = окно с начала времён'
+    assert spy.calls[0].last_run_at is None, 'пересборка = окно с начала времён'
+    assert spy.calls[0].full_rebuild is True
+
+    state = _state(runner, spy.name)
+    assert not state.full_rebuild_is_required, 'после успеха требование снимается'
+    assert state.last_full_rebuild_dt >= first.last_full_rebuild_dt
+    assert state.last_full_rebuild_minutes is not None, 'сколько заняла пересборка, минуты'
+    assert state.last_run_at is not None
 
 
-def test_full_reload_requested_during_a_run_is_not_lost():
-    # Запрос пересчёта может прийти в середине прогона (новая колонка приехала пакетом, пока
-    # обработчик считал). Записать поверх него свою границу — значит молча его отменить.
+def test_full_rebuild_requested_during_a_run_is_not_lost():
+    # Заказ пересборки может прийти в середине прогона (новая колонка приехала пакетом, пока
+    # обработчик считал). Записать поверх него свой результат — значит молча его отменить.
     spy = Spy()
     runner, _ = _runner(spy)
     runner.run_pending()
     spy.calls.clear()
+    before = _last_run_at(runner, spy.name)
     original = runner.handlers[0]
 
-    def handle_and_request_reload(ctx):
-        original.handle(ctx)
-        runner.request_full_reload("Catalog_X", "new column arrived mid-run")
+    def handle_and_request_rebuild(context):
+        original.handle(context)
+        runner.request_full_rebuild("Catalog_X", "new column arrived mid-run")
 
-    runner.handlers[0] = replace(original, handle=handle_and_request_reload)
+    runner.handlers[0] = replace(original, handle=handle_and_request_rebuild)
     runner.signal("Catalog_X", SOURCE_CHANGES)
     runner.run_pending()
-    assert _last_run_at(runner, spy.name) is None, 'запрос пересчёта пережил успешный прогон'
+
+    state = _state(runner, spy.name)
+    assert state.full_rebuild_is_required, 'заказ пересборки пережил успешный прогон'
+    assert state.last_run_at == before, 'граница не сдвинулась — прогон будет повторён'
 
     runner.handlers[0] = original
     runner.run_pending()

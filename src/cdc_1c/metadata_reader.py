@@ -5,7 +5,7 @@ from collections import UserDict
 
 import xmltodict
 from sqlalchemy import (String, Uuid, BigInteger, Integer, SmallInteger, Numeric, Boolean, DateTime,
-                        JSON, Engine, func, insert, select, update)
+                        Float, JSON, Engine, func, insert, select, update)
 from sqlalchemy.dialects.postgresql import JSONB
 from dbmerge import dbmerge
 
@@ -359,7 +359,8 @@ class MetadataReader1C(UserDict):
                 'fields': field_names,
                 'fields_en': [mapper.map_field_name(f) for f in field_names],
                 # эти значения устанавливаются только при insert, из update они исключены
-                'full_load_is_required': False, 'last_full_load_dt': None})
+                'full_load_is_required': False, 'last_full_load_dt': None,
+                'last_full_load_rows_modified': None, 'last_full_load_minutes': None})
             
         with dbmerge(engine=self.engine, table_name=METADATA_OBJECTS_TABLE, data=data,
                      key=['object_full_name'], delete_mode='delete', 
@@ -370,10 +371,14 @@ class MetadataReader1C(UserDict):
                                  'object_full_name_en': String(), 
                                  'fields': json_type,
                                  'fields_en': json_type,
-                                 'full_load_is_required': Boolean(), 
-                                 'last_full_load_dt': DateTime()
+                                 'full_load_is_required': Boolean(),
+                                 'last_full_load_dt': DateTime(),
+                                 'last_full_load_rows_modified': Integer(),
+                                 'last_full_load_minutes': Float()
                                  },
-                     skip_update_fields=['full_load_is_required', 'last_full_load_dt']) as merge:
+                     skip_update_fields=['full_load_is_required', 'last_full_load_dt',
+                                         'last_full_load_rows_modified',
+                                         'last_full_load_minutes']) as merge:
             merge.exec()
             self.objects_table = merge.table   # Table-описание созданной/существующей таблицы
 
@@ -413,10 +418,23 @@ class MetadataReader1C(UserDict):
                 select(table.c.object_full_name)
                 .where(table.c.full_load_is_required)).scalars())
 
-    def mark_full_loaded(self, object_full_name: str) -> None:
-        """Фиксирует успешную полную выгрузку: ставит last_full_load_dt=now(), снимает требование.
-        Ключ — полное имя (object_full_name), а не короткое: имена регистра и документа могут совпасть."""
+    def mark_full_loaded(self, object_full_name: str, rows_modified: int | None = None,
+                         minutes: float | None = None) -> None:
+        """
+        Фиксирует успешную полную выгрузку: ставит last_full_load_dt=now(), снимает требование и
+        записывает метрики прогона. Ключ — полное имя (object_full_name), а не короткое: имена
+        регистра и документа могут совпасть.
+
+        rows_modified — сколько строк выгрузка на самом деле изменила (вставила, обновила, удалила).
+        Это проверка самого CDC: если изменения доезжают исправно, полная выгрузка находит ровно то,
+        что уже лежит в БД, и значение должно быть 0. Ненулевое — повод разобраться, что не доехало.
+
+        minutes — сколько прогон занял, дробное. Нужно, чтобы понимать цену перевыгрузки объекта и
+        замечать деградацию.
+        """
         table = self.objects_table
         with self.engine.begin() as conn:
             conn.execute(update(table).where(table.c.object_full_name == object_full_name)
-                         .values(last_full_load_dt=func.now(), full_load_is_required=False))
+                         .values(last_full_load_dt=func.now(), full_load_is_required=False,
+                                 last_full_load_rows_modified=rows_modified,
+                                 last_full_load_minutes=minutes))

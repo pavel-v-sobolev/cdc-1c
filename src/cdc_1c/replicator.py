@@ -60,6 +60,13 @@ def _is_permanent_error(exc: BaseException) -> bool:
     return status in PERMANENT_HTTP_CODES
 
 
+def _rows_modified(result) -> int:
+    """Сколько строк merge реально изменил. None — save вышел рано (пустой набор, нет метаданных)."""
+    if result is None:
+        return 0
+    return result.inserted_row_count + result.updated_row_count + result.deleted_row_count
+
+
 def _log_failure(exc: BaseException, message: str, *args) -> None:
     """
     Пишет в лог падение цикла. Для ошибок обмена traceback не нужен: он целиком состоит из
@@ -281,7 +288,7 @@ class Replicator1C:
         if self.handlers is None or result is None:
             return
         if result.added_fields:
-            self.handlers.request_full_reload(
+            self.handlers.request_full_rebuild(
                 table_name, f"{table_name} gained columns {sorted(result.added_fields)}")
         if (result.inserted_row_count + result.updated_row_count + result.deleted_row_count) > 0:
             self.handlers.signal(table_name, source)
@@ -301,7 +308,7 @@ class Replicator1C:
     def full_load(self, object_name: str, batch_size: int = 1000,
                   date_field: str | None = None,
                   date_from: date | datetime | str | None = None,
-                  date_to: date | datetime | str | None = None) -> None:
+                  date_to: date | datetime | str | None = None) -> int:
         """
         Полная постраничная выгрузка объекта 1С в целевую таблицу: по batch_size записей за запрос,
         каждая страница сразу сохраняется через writer.save(full_load_started_at=...). Идемпотентно — повторный
@@ -329,6 +336,10 @@ class Replicator1C:
         документов, Period у регистров), date_from/date_to — границы (datetime/date/ISO-строка,
         включительно). Транслируется в OData $filter `date_field ge …[ and date_field le …]` и
         объединяется с keyset-курсором по AND. Полезно для ручной догрузки за нужный период.
+
+        Возвращает число РЕАЛЬНО изменённых строк (вставлено + обновлено + удалено, по всем
+        страницам и вложенным объектам). Это проверка самого CDC: если изменения доезжают исправно,
+        выгрузка находит ровно то, что уже лежит в БД, и ответ должен быть 0.
         """
         if not self.metadata.is_loaded:
             self.metadata.get_metadata()
@@ -355,6 +366,7 @@ class Replicator1C:
         after_values = None
         skip = 0
         total = 0
+        rows_modified = 0
         # Начинаем с размера, подобранного по этому объекту раньше, иначе — с пробной страницы.
         page_size = min(batch_size,
                         self._full_load_page_size.get(object_name, FULL_LOAD_PROBE_BATCH))
@@ -380,6 +392,7 @@ class Replicator1C:
                 with self.merges.track(table_name):
                     result = self.writer.save(obj_name, data_object, full_load_started_at=started_at)
                 self.replicator_log.write_result(log_id, result)
+                rows_modified += _rows_modified(result)
                 # Сигнал на каждую страницу, а не один в конце прогона: очередь обработчиков
                 # схлопывающая, лишних вызовов это не даёт, зато витрина начинает наполняться
                 # после первой же страницы, а не через часы, когда выгрузка закончится.
@@ -396,7 +409,9 @@ class Replicator1C:
             page_size = self._next_page_size(object_name, page_size, page,
                                              reader.last_response_bytes, batch_size)
         self.replicator_log.write_result(log_id, finish=True)
-        logger.info("Full load of %s finished (%s records)", object_name, total)
+        logger.info("Full load of %s finished (%s records, %s rows modified)",
+                    object_name, total, rows_modified)
+        return rows_modified
 
     @staticmethod
     def _odata_datetime(value: date | datetime | str) -> str:
@@ -598,11 +613,14 @@ class Replicator1C:
 
     @_load_mode_tag(LOAD_MODE_FULL)
     def _run_full_load(self, object_full_name: str) -> None:
-        """Фоновая полная выгрузка одного объекта; на успехе фиксирует mark_full_loaded.
-        При ошибке флаг full_load_is_required остаётся → ретрай на следующем цикле."""
+        """Фоновая полная выгрузка одного объекта; на успехе фиксирует mark_full_loaded вместе с
+        метриками прогона. При ошибке флаг full_load_is_required остаётся → ретрай на следующем
+        цикле, а метрики не пишутся: они описывают завершённую выгрузку."""
+        started = time.monotonic()
         try:
-            self.full_load(object_full_name)
-            self.metadata.mark_full_loaded(object_full_name)
+            rows_modified = self.full_load(object_full_name)
+            self.metadata.mark_full_loaded(object_full_name, rows_modified=rows_modified,
+                                           minutes=round((time.monotonic() - started) / 60, 3))
         except Exception as exc:
             _log_failure(exc, "Background full_load of %s failed, will retry", object_full_name)
         finally:
