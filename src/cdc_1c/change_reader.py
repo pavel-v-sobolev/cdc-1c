@@ -25,7 +25,9 @@ class ChangeReader1C(DataReader1C):
         self.message_no = self.get_last_received_no()+1
         self.exchange_message_no = self.message_no
 
-        logger.info(f"Reading changes from 1C (message {self.message_no})")
+        # DEBUG, а не INFO: строка полезна только рядом с ответом, а он логируется ниже. На холостом
+        # ходу (пустой пакет раз в минуту) пара «начал — пусто» — это чистый шум в общем логе.
+        logger.debug(f"Reading changes from 1C (message {self.message_no})")
 
         url = f"{self.odata_url}/SelectChanges?DataExchangePoint='{self.odata_url}/ExchangePlan_{self.exchange_name}(guid'{self.queue_guid}')'&MessageNo={self.message_no}"
 
@@ -39,10 +41,17 @@ class ChangeReader1C(DataReader1C):
         parsed = self.read_data_entries(change_entries)
         # Одна строка на пакет: что пришло, сколько строк и сколько весил ответ. Раньше лог писался
         # на каждую entry, и один пакет давал сотни одинаковых строк.
-        logger.info("Read changes (message %s): %s entries, %s rows, %s%s",
-                    self.message_no, len(change_entries), self.rows_read(),
-                    format_bytes(self.last_response_bytes),
-                    ''.join(f'\n    {name}: {n} entries' for name, n in parsed.items()))
+        #
+        # Пустой пакет — на DEBUG. Изменений нет большую часть суток, а опрос идёт раз в минуту:
+        # на INFO это тысячи одинаковых строк в день, среди которых не видно настоящей работы, и
+        # со стороны выглядит как зациклившийся процесс. Номер пакета при этом не двигается —
+        # пустой пакет не подтверждается (см. Replicator1C.run_once), — так что и строки эти
+        # неотличимы одна от другой.
+        log = logger.info if change_entries else logger.debug
+        log("Read changes (message %s): %s entries, %s rows, %s%s",
+            self.message_no, len(change_entries), self.rows_read(),
+            format_bytes(self.last_response_bytes),
+            ''.join(f'\n    {name}: {n} entries' for name, n in parsed.items()))
 
     def notify_changes_received(self):
         """

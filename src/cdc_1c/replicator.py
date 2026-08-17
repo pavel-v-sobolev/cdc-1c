@@ -206,9 +206,12 @@ class Replicator1C:
         started = time.monotonic()
         self.changes.read_changes()
         self._save_changes()
-        logger.info("Changes package %s processed in %s: %s rows",
-                    self.changes.message_no, format_duration(time.monotonic() - started),
-                    self.changes.rows_read())
+        # Итог пакета — на INFO, пустой цикл — на DEBUG (см. ChangeReader1C.read_changes): опрос
+        # идёт раз в interval секунд, и на INFO холостой ход забивает лог одинаковыми строками.
+        log = logger.info if len(self.changes) > 0 else logger.debug
+        log("Changes package %s processed in %s: %s rows",
+            self.changes.message_no, format_duration(time.monotonic() - started),
+            self.changes.rows_read())
         # Объект пришёл в пакете → он в плане обмена. Если ни разу не выгружался целиком,
         # помечаем на полную выгрузку (выполнит фоновый воркер в run_forever). 
         # Табличные части пропускаем — у них нет отдельной OData-сущности, они
