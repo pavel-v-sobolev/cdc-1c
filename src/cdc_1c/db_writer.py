@@ -119,7 +119,7 @@ class DBWriter1C:
         else:
             # Регистр/табличная часть: набор по object_key целиком заменяет существующий.
             # Выпавшие из набора строки помечаем, а не удаляем: исчезновение строки — такое же
-            # событие, как изменение, и без следа его не увидит ни материализатор (нечему поднять
+            # событие, как изменение, и без следа его не увидит ни обработчик (нечему поднять
             # merged_on), ни guard полной выгрузки. Помечаем только те группы, что пришли в наборе.
             mapped_object_key = [self.name_mapper.map_field_name(k) for k in object_key]
             with dbmerge(engine=self.engine, table_name=table_name, data=records,
@@ -189,7 +189,7 @@ class DBWriter1C:
         Отметка возвращается БЕЗ часового пояса. PostgreSQL now() отдаёт timestamptz, то есть
         offset-aware datetime, а merged_on и handlers_1c.last_run_at лежат в колонках без часового
         пояса и читаются offset-naive. Сравнить их в Python нельзя — «can't compare offset-naive and
-        offset-aware datetimes», — а сравнивает их как раз HandlerRunner (boundary против
+        offset-aware datetimes», — а сравнивает их как раз HandlerLoop (boundary против
         last_run_at). Смещение отбрасываем, а не приводим к UTC: драйвер уже перевёл значение в
         часовой пояс сессии, и ровно так же PostgreSQL приводит timestamptz к timestamp при записи.
         """
@@ -230,14 +230,14 @@ class DBWriter1C:
 
     def _ensure_merged_on_index(self, table_name: str) -> None:
         """
-        Индекс по merged_on (для быстрых сканов материализатора `merged_on > граница обработки`).
-        Только средствами SQLAlchemy, идемпотентно (checkfirst). Таблицу уже создал dbmerge.
-        Результат кэшируется на инстансе — рефлексия/checkfirst выполняются один раз на таблицу.
+        Индекс по merged_on — по нему обработчики выбирают изменившееся за своё окно
+        (`merged_on > last_run_at`). Только средствами SQLAlchemy, идемпотентно (checkfirst):
+        таблицу уже создал dbmerge. Результат кэшируется на инстансе — рефлексия/checkfirst
+        выполняются один раз на таблицу.
         """
         if table_name in self._indexed_tables:
             return
-        eff_schema = None if self.engine.dialect.name == 'sqlite' else self.schema
-        tbl = Table(table_name, MetaData(), schema=eff_schema, autoload_with=self.engine)
+        tbl = Table(table_name, MetaData(), schema=self.schema, autoload_with=self.engine)
         if MERGED_ON_FIELD in tbl.c:
             ix_name = NameMapper1C._fit_length(f'ix_{table_name}_merged_on')
             Index(ix_name, tbl.c[MERGED_ON_FIELD]).create(self.engine, checkfirst=True)

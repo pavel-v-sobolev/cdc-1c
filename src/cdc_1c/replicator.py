@@ -1,11 +1,8 @@
 import functools
-import signal
 import threading
 import time
-import weakref
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
-from typing import Iterable
 
 import requests
 from sqlalchemy import Engine
@@ -17,7 +14,9 @@ from cdc_1c.change_reader import ChangeReader1C
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.db_writer import DBWriter1C, save_order_key
 from cdc_1c.db_logs import Replicator1CLog, LOAD_TYPE_CHANGES, LOAD_TYPE_FULL
-from cdc_1c.handlers import HandlerRunner, MergeTracker, SOURCE_CHANGES, SOURCE_FULL_LOAD
+from cdc_1c.handlers import (HandlerSignals, SharedMergeTracker,
+                             SOURCE_CHANGES, SOURCE_FULL_LOAD)
+from cdc_1c.stop_signal import StopSignal, install_signal_handlers
 from cdc_1c.logging_config import _ensure_handler, get_logger, load_mode, LOAD_MODE_CHANGES, LOAD_MODE_FULL
 
 logger = get_logger(__name__)
@@ -122,10 +121,13 @@ class Replicator1C:
                  exchange_name: str, queue_guid: str,
                  engine: Engine, db_schema: str | None = None,
                  request_timeout: float | None = None,
-                 full_load_workers: int = 2,
-                 handler_runners: "Iterable[HandlerRunner] | None" = None):
+                 full_load_workers: int = 2):
         # Включаем вывод логов, если приложение не настроило логирование само.
         _ensure_handler()
+        # Перехват SIGTERM/SIGINT ставим здесь, а не при запуске цикла: run_forever типовая точка
+        # входа отправляет в пул потоков, а из рабочего потока перехват поставить нельзя (см.
+        # stop_signal). Конструктор же зовётся из главного.
+        install_signal_handlers(quiet=False)
 
         self.engine = engine
         self.db_schema = db_schema
@@ -161,74 +163,19 @@ class Replicator1C:
         # (exchange_name/message_no), а writer универсален и может делать и полную перевыгрузку.
         self.replicator_log = Replicator1CLog(self.engine, self.db_schema)
 
-        # Реестр идущих merge нужен независимо от обработчиков: он же выдаёт момент старта прогона.
-        self.merges = MergeTracker(self.writer.db_now)
-        self.handler_runners: list[HandlerRunner] = []
-        # Действующий _StopSignal текущего run_forever — через него цикл останавливают снаружи,
+        # Реестр идущих merge — в БД, а не в памяти: обработчик может считать витрину в другом
+        # процессе, и границу своего окна он обязан прижимать к НАШИМ незавершённым merge.
+        self.merges = SharedMergeTracker(self.engine, self.db_schema, self._exchange_name)
+        # Сигналы обработчикам идут через handlers_1c, а не через объекты: репликатору не нужны
+        # ни их код, ни общий с ними процесс (см. HandlerSignals).
+        self.handler_signals = HandlerSignals(self.engine, self.db_schema)
+        # Действующий StopSignal текущего run_forever — через него цикл останавливают снаружи,
         # когда он крутится не в главном потоке и своего перехвата сигналов не имеет.
-        self._stop_signal: "_StopSignal | None" = None
-        if handler_runners is not None:
-            self.install_handlers(handler_runners)
+        self._stop_signal: "StopSignal | None" = None
 
-
-    def install_handlers(self, handler_runners: "Iterable[HandlerRunner]") -> None:
-        """
-        Подключает обработчиков — по готовому HandlerRunner на каждого:
-
-            zakazy  = HandlerRunner(engine=engine, schema='cdc_1c', handler=ZakazyKlientov())
-            grouped = HandlerRunner(engine=engine, schema='cdc_1c', handler=ZakazyKlientovGrouped())
-            replicator = Replicator1C(..., engine=engine, handler_runners=[zakazy, grouped])
-
-        Раннер на обработчика, а не один на всех, — чтобы у каждого был свой поток и тяжёлая
-        витрина не задерживала остальные. Обратная сторона: порядок вызова между обработчиками не
-        определён, и на «витрина поверх витрины считается после базовой» полагаться нельзя.
-
-        Реестр незавершённых merge раздаём мы: он обязан быть ОДНИМ на все раннеры и все
-        репликаторы, иначе граница окна обработчика не увидит merge соседа, и его строки, ещё не
-        закоммиченные, окажутся левее отметки — потеряются молча. Поэтому при нескольких планах
-        обмена достаточно передать второму репликатору ТЕ ЖЕ объекты раннеров: он подхватит уже
-        присоединённый реестр вместо своего, и общим тот станет сам собой.
-        """
-        handler_runners = list(handler_runners)
-        for runner in handler_runners:
-            if not isinstance(runner, HandlerRunner):
-                raise TypeError(f"handler_runners must contain HandlerRunner objects, got "
-                                f"{type(runner).__name__}. Build one per handler: "
-                                f"HandlerRunner(engine=..., schema=..., handler=...)")
-        if self.handler_runners:
-            raise RuntimeError("Handlers are already installed")
-
-        for runner in handler_runners:
-            # Раннер пишет и читает те же таблицы, что и мы, поэтому подключение к чужой БД или
-            # чужой схеме — почти наверняка ошибка сборки, а проявилась бы она пустыми окнами.
-            if runner.engine is not self.engine:
-                raise ValueError(f"Handler {runner.name} is built on a different engine")
-            if runner.schema != self.db_schema:
-                raise ValueError(f"Handler {runner.name} works in schema {runner.schema!r}, "
-                                 f"replicator writes to {self.db_schema!r}")
-
-        # Уже присоединённый реестр (это второй репликатор для тех же раннеров) забираем себе;
-        # свой в этом случае выбрасываем — но только если в нём ничего не идёт, иначе эти merge
-        # для новой границы стали бы невидимыми.
-        attached = {id(r._merges): r._merges for r in handler_runners if r._merges is not None}
-        if len(attached) > 1:
-            raise ValueError("Handlers are attached to different MergeTrackers: pass the same "
-                             "HandlerRunner objects to every replicator that shares them")
-        if attached:
-            shared = next(iter(attached.values()))
-            if shared is not self.merges:
-                if not self.merges.is_empty():
-                    raise RuntimeError("Cannot adopt a shared MergeTracker while merges are in "
-                                       "flight: pass handler_runners= to the constructor instead")
-                self.merges = shared
-
-        for runner in handler_runners:
-            runner.attach_merges(self.merges)
-        self.handler_runners = handler_runners
 
     @_load_mode_tag(LOAD_MODE_CHANGES)
-    def run_once(self, notify_changes: bool = True,
-                 handler_runners: "Iterable[HandlerRunner] | None" = None) -> None:
+    def run_once(self, notify_changes: bool = True) -> None:
         """
         Один цикл: (load metadata при первом вызове) → read → save → notify. Подтверждение
         получения отправляется только после успешного сохранения — если save упадёт, изменения
@@ -243,12 +190,7 @@ class Replicator1C:
         notify_changes=False отключает подтверждение совсем: изменения остаются в очереди обмена
         1С (полезно для отладки/тестов — цикл становится повторяемым).
 
-        handler_runners — по HandlerRunner на обработчика (см. install_handlers). Отдельных
-        потоков здесь нет, поэтому ждущие запуска отрабатывают синхронно, в конце цикла. В
-        повторных вызовах передавать их не нужно: подключаются они один раз.
         """
-        if handler_runners is not None and not self.handler_runners:
-            self.install_handlers(handler_runners)
         # Первый вызов: грузим метаданные. Дальше не перечитываем — это делает сам data_reader
         # при появлении нового объекта/поля (get_metadata держит is_loaded=True).
         if not self.metadata.is_loaded:
@@ -283,17 +225,12 @@ class Replicator1C:
         else:
             logger.debug("No changes — skipping confirmation")
 
-        # Одиночный run_once: потока обработчиков нет (его заводит run_forever), поэтому ждущие
-        # запуска отрабатывают здесь же, синхронно, после подтверждения пакета.
-        for runner in self.handler_runners:
-            if not runner.is_running():
-                runner.run_if_pending()
 
     def _save_changes(self) -> None:
         """
         Сохраняет объекты пакета по одному, записывая лог загрузки на каждый объект
         (replicator_1c_log). finish() — только после успешного save: упавший объект остаётся с
-        finished_at=NULL и не двигает границу обработки материализатора. Лог здесь, а не в DBWriter1C,
+        finished_at=NULL и не двигает границу окна обработчика. Лог здесь, а не в DBWriter1C,
         потому что только тут есть контекст обмена (exchange_name/message_no).
 
         Порядок сохранения — справочники → документы → регистры (save_order_key): документы ссылаются
@@ -321,25 +258,27 @@ class Replicator1C:
 
     def _signal_handlers(self, table_name: str, result, source: str) -> None:
         """
-        Сообщает обработчикам об изменении объекта — но только если merge реально что-то сделал.
+        Сообщает обработчикам, что таблица изменилась — но только если merge реально что-то сделал.
         1С регистрирует изменение объекта на любую перезапись, и в пакет приезжает масса записей,
         идентичных тому, что уже лежит в БД (шумные поля при сравнении не учитываются, см.
         DBWriter1C._noisy_fields). Обработчик всё равно выбирает данные сам, и на пустом прогоне
         его SELECT вернул бы пусто — звать незачем.
 
+        Сообщаем через БД: поднимаем update_is_required в handlers_1c тем, у кого эта таблица есть
+        в update_on. Ни объектов обработчиков, ни их кода репликатору для этого не нужно, поэтому
+        они могут работать в другом процессе или контейнере.
+
         Появление новой колонки — отдельный случай: значения строк оно не меняет, merged_on не
         двигает, и окно обработчика её не увидит никогда. Поэтому на added_fields подписчики
-        объекта отправляются пересчитывать всё.
+        таблицы отправляются пересобирать витрину целиком.
         """
-        if not self.handler_runners or result is None:
+        if result is None:
             return
         if result.added_fields:
-            for runner in self.handler_runners:
-                runner.request_full_rebuild(
-                    table_name, f"{table_name} gained columns {sorted(result.added_fields)}")
-        if (result.inserted_row_count + result.updated_row_count + result.deleted_row_count) > 0:
-            for runner in self.handler_runners:
-                runner.signal(table_name, source)
+            self.handler_signals.request_full_rebuild(
+                table_name, f"{table_name} gained columns {sorted(result.added_fields)}")
+        if _rows_modified(result) > 0:
+            self.handler_signals.signal(table_name, source)
 
     def list_objects(self) -> list[str]:
         """
@@ -441,9 +380,9 @@ class Replicator1C:
                     result = self.writer.save(obj_name, data_object, full_load_started_at=started_at)
                 self.replicator_log.write_result(log_id, result)
                 rows_modified += _rows_modified(result)
-                # Сигнал на каждую страницу, а не один в конце прогона: очередь обработчиков
-                # схлопывающая, лишних вызовов это не даёт, зато витрина начинает наполняться
-                # после первой же страницы, а не через часы, когда выгрузка закончится.
+                # Флаг на каждую страницу, а не один в конце прогона: он булев, тысяча страниц
+                # поднимет его один раз, зато витрина начинает наполняться после первой же
+                # страницы, а не через часы, когда выгрузка закончится.
                 self._signal_handlers(table_name, result, SOURCE_FULL_LOAD)
             total += page
             if page < page_size:
@@ -565,8 +504,7 @@ class Replicator1C:
         raise ValueError(f"full_load: no primary key for {object_name}")
 
     def run_forever(self, interval: float = 60.0, max_iterations: int = 0,
-                    max_backoff: float = DEFAULT_MAX_BACKOFF,
-                    handler_runners: "Iterable[HandlerRunner] | None" = None) -> None:
+                    max_backoff: float = DEFAULT_MAX_BACKOFF) -> None:
         """
         Цикл run_once с паузой interval секунд. Упавший цикл логируется и не подтверждается —
         повтор на следующей итерации. Корректно завершается по SIGTERM/SIGINT.
@@ -588,46 +526,34 @@ class Replicator1C:
         После каждого цикла фоном (пул потоков) запускаются полные выгрузки помеченных объектов —
         диспетчеризация только здесь (одиночный run_once лишь взводит флаги).
 
-        handler_runners — по HandlerRunner на обработчика (см. install_handlers). При нескольких
-        планах обмена одни и те же объекты передаются всем репликаторам.
-
-        Потоков получается три сорта, и пулы у них раздельные: этот цикл (главный поток),
-        full_load_workers потоков полной выгрузки и по потоку на каждого обработчика. Обработчики
-        в пул выгрузки не сабмитятся и занять его не могут. Общий у них только engine, поэтому
-        дефицит возникает не в потоках, а в соединениях: одновременно их держат пакет изменений,
-        страницы выгрузки и каждый обработчик, отсюда
-        pool_size >= full_load_workers + число обработчиков + 1 (см. README).
+        Потоков получается четыре сорта, и пулы у них раздельные: этот цикл, full_load_workers
+        потоков полной выгрузки, поток отметки живости незавершённых merge (его ведёт реестр, а не
+        этот цикл) и по потоку на каждого обработчика. Обработчики в пул выгрузки не сабмитятся и
+        занять его не могут. Общий у них только engine, поэтому дефицит возникает не в потоках, а
+        в соединениях: одновременно их держат пакет изменений, страницы выгрузки, отметка живости
+        и каждый обработчик, отсюда
+        pool_size >= full_load_workers + 2 + число обработчиков (см. README).
         """
-        if handler_runners is not None and not self.handler_runners:
-            self.install_handlers(handler_runners)
-        stop = _StopSignal()
+        stop = StopSignal()
         self._stop_signal = stop
         logger.info("Starting replication loop (interval=%ss, max_iterations=%s, timeout=%ss)",
                     interval, max_iterations, self._request_timeout)
-        # Поток обработчиков заводится отдельно от пула полной выгрузки: он не сабмитится в
-        # executor и его воркеров не занимает. start/stop считающие, поэтому все репликаторы,
-        # делящие один раннер, делают одно и то же, а поток гаснет, когда выйдет последний.
-        for runner in self.handler_runners:
-            runner.start()
-        try:
-            self._replication_loop(stop, interval, max_iterations, max_backoff)
-        finally:
-            # После выхода из _replication_loop пул уже дождался своих выгрузок, поэтому страницы,
-            # дописанные на выходе, успели подать сигнал; stop дожидается текущего обработчика.
-            for runner in self.handler_runners:
-                runner.stop()
+        # Отметку живости незавершённых merge ведёт сам реестр (SharedMergeTracker), а не этот
+        # цикл: строки появляются и в одиночном run_once, и в вызванном руками full_load, где
+        # никакого цикла нет.
+        self._replication_loop(stop, interval, max_iterations, max_backoff)
         logger.info("Replication loop stopped")
 
     def request_stop(self) -> None:
         """
         Просит идущий run_forever завершиться после текущей итерации — то же, что SIGTERM, но
         программно. Нужна репликатору, крутящемуся не в главном потоке: свой перехват сигналов ему
-        поставить нельзя (см. _StopSignal), поэтому останавливает его тот, кто поток завёл.
+        поставить нельзя (см. stop_signal), поэтому останавливает его тот, кто поток завёл.
         """
         if self._stop_signal is not None:
             self._stop_signal.requested = True
 
-    def _replication_loop(self, stop: "_StopSignal", interval: float, max_iterations: int,
+    def _replication_loop(self, stop: StopSignal, interval: float, max_iterations: int,
                           max_backoff: float) -> None:
         """Тело run_forever: цикл run_once с backoff и фоновыми полными выгрузками."""
         iterations = 0
@@ -686,52 +612,3 @@ class Replicator1C:
         finally:
             with self._in_progress_lock:
                 self._full_load_in_progress.discard(object_full_name)
-
-
-# Все живые _StopSignal процесса: SIGTERM означает «останавливаемся целиком», поэтому флаг
-# взводится сразу всем циклам, а не только тому, чей объект оказался последним зарегистрированным.
-# Иначе при нескольких планах обмена (репликаторы в отдельных потоках) сигнал доходил бы лишь до
-# одного из них, а остальные крутились бы дальше — процесс не завершить.
-# WeakSet: отработавший run_forever свой сигнал больше не держит, и тот уходит вместе с ним.
-_stop_signals: "weakref.WeakSet[_StopSignal]" = weakref.WeakSet()
-_signal_handlers_installed = False
-
-
-def _handle_stop_signal(signum, frame) -> None:
-    logger.info("Received signal %s, stopping after current cycle", signum)
-    for stop in list(_stop_signals):
-        stop.requested = True
-
-
-def _install_signal_handlers() -> None:
-    """
-    Ставит перехват SIGTERM/SIGINT — один раз за процесс. Python разрешает это только из главного
-    потока, поэтому попытка из рабочего потока молча ничего не делает: флаг «установлено» при
-    неудаче не выставляется, и перехват поставит первый же вызов из главного потока.
-    """
-    global _signal_handlers_installed
-    if _signal_handlers_installed:
-        return
-    try:
-        signal.signal(signal.SIGTERM, _handle_stop_signal)
-        signal.signal(signal.SIGINT, _handle_stop_signal)
-    except ValueError:
-        logger.debug("Not the main thread: signal handlers will be installed by the main one")
-        return
-    _signal_handlers_installed = True
-
-
-class _StopSignal:
-    """Флаг graceful-остановки одного run_forever. Взводится общим перехватчиком (весь процесс
-    останавливается разом) либо точечно через Replicator1C.request_stop()."""
-
-    def __init__(self):
-        self.requested = False
-        _stop_signals.add(self)
-        _install_signal_handlers()
-
-    def wait(self, seconds: float) -> None:
-        """Спит до seconds, прерываясь раньше при поступлении сигнала."""
-        deadline = time.monotonic() + seconds
-        while not self.requested and time.monotonic() < deadline:
-            time.sleep(min(1.0, deadline - time.monotonic()))

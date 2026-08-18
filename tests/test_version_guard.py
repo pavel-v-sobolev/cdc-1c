@@ -10,7 +10,7 @@ Guard сравнивает merged_on строки с моментом старт
 
 from datetime import datetime
 
-from sqlalchemy import create_engine, select, Table, MetaData
+from sqlalchemy import select, Table, MetaData
 
 from cdc_1c import DataObject1C, NameMapper1C
 from cdc_1c.db_writer import DBWriter1C

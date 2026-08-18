@@ -70,10 +70,11 @@ testpaths = ["tests"]
 # Корень репозитория в sys.path: тесты обработчиков импортируют example_config.handlers, чтобы
 # примеры не разъезжались с контрактом молча.
 pythonpath = ["."]
-# По умолчанию гоняем только офлайн-тесты; live-тесты 1С/Postgres — под маркером integration.
+# По умолчанию не гоняем тесты, которым нужна живая 1С. Postgres нужен всем тестам без
+# исключения (см. tests/conftest.py), маркером это не отсекается.
 addopts = "-m 'not integration'"
 markers = [
-    "integration: требует живого сервера 1С и Postgres (параметры из tests/debug.py)",
+    "integration: требует живого сервера 1С (параметры из tests/test_cdc_run_once.py)",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -12,14 +12,35 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    # Целевая СУБД у продукта — PostgreSQL, и тесты идут против неё же: каждый берёт свою схему
+    # (см. tests/conftest.py). sqlite не подошёл бы — он отличается ровно в тех местах, которые
+    # тесты и проверяют (схемы, точность CURRENT_TIMESTAMP, соединение = отдельная база).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cdc_1c
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --extra dev
-      # integration-тесты (живая 1С/Postgres) отсеиваются addopts из pyproject.
+      # Тесты, которым нужна живая 1С, помечены integration и отсеиваются addopts из pyproject.
+      # Postgres нужен всем остальным — его и поднимает services выше.
       - run: uv run pytest -q
+        env:
+          CDC1C_TEST_DB_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/cdc_1c
 
   publish:
     # Публикация на PyPI по git-тегу vX.Y.Z. Требует настроенного Trusted Publishing на стороне PyPI

@@ -5,7 +5,7 @@ from collections import UserDict
 
 import xmltodict
 from sqlalchemy import (String, Uuid, BigInteger, Integer, SmallInteger, Numeric, Boolean, DateTime,
-                        Float, JSON, Engine, func, insert, select, update)
+                        Float, JSON, Engine, func, select, update)
 from sqlalchemy.dialects.postgresql import JSONB
 from dbmerge import dbmerge
 
@@ -190,7 +190,7 @@ class MetadataReader1C(UserDict):
         # (delete: пропавшие объекты удаляются, merged_on ведёт dbmerge).
         # Таблицу создаёт сам dbmerge при первой sync; objects_table — её Table-описание оттуда же.
         self.engine = engine
-        self.schema = None if (engine is not None and engine.dialect.name == 'sqlite') else schema
+        self.schema = schema
         self.objects_table = None
 
 
@@ -344,7 +344,7 @@ class MetadataReader1C(UserDict):
         # просмотра состава объекта. Все три синхронизируются с $metadata.
         mapper = NameMapper1C()
         # На json-колонке dbmerge сравнивает значения через IS DISTINCT FROM; у Postgres-типа json
-        # нет оператора равенства — берём jsonb (у sqlite generic JSON хранится текстом, сравнение ок).
+        # нет оператора равенства — берём jsonb.
         json_type = JSONB() if self.engine.dialect.name == 'postgresql' else JSON()
         data = []
         for object_full_name in object_names:

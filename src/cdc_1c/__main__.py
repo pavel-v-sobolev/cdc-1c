@@ -8,8 +8,8 @@ Entrypoint для запуска из окружения без единой с�
 CDC1C_DB_SCHEMA, CDC1C_FULL_LOAD_WORKERS, CDC1C_POLL_INTERVAL, CDC1C_LOG_LEVEL, CDC1C_MODE.
 
 Обработчиков здесь нет: они объявляются кодом, а тут кода пользователя нет. Нужны обработчики —
-берите за основу example_config/runner.py: там ровно та же сборка, только список обработчиков
-передаётся в run_forever, а значения при желании заменяются литералами.
+берите за основу example_config/runner.py: там ровно та же сборка, плюс по HandlerLoop на каждого
+обработчика, а значения при желании заменяются литералами.
 """
 import logging
 import os
@@ -23,9 +23,10 @@ def main() -> None:
     odata_user = os.environ.get("CDC1C_ODATA_USER")
     full_load_workers = int(os.environ.get("CDC1C_FULL_LOAD_WORKERS", "2"))
 
-    # Пул: одновременно соединение держат цикл изменений, страницы полной выгрузки и поток
-    # обработчиков, отсюда full_load_workers + 3 (см. README).
-    engine = create_engine(os.environ["CDC1C_DB_URL"], pool_size=full_load_workers + 3)
+    # Пул: одновременно соединение держат цикл изменений, поток отметки живости незавершённых
+    # merge и страницы полной выгрузки, отсюда full_load_workers + 2 (см. README). Обработчиков
+    # здесь нет — были бы, добавилось бы по соединению на каждого.
+    engine = create_engine(os.environ["CDC1C_DB_URL"], pool_size=full_load_workers + 2)
 
     # Параметры присваиваются явно, по одному — как и в example_config/runner.py: сборка одинаково
     # читается и здесь, и в пользовательском коде, где значения будут литералами.

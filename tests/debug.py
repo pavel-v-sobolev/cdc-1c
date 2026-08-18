@@ -1,52 +1,52 @@
 """
 Ручной отладочный вход: прогон компонентов против живой 1С и dev-Postgres из-под отладчика.
 Не тест — pytest его не собирает (имя не начинается с `test_`), и в пакет он не попадает.
-Параметры подключения отсюда используют live-тесты (test_cdc_run_once.py, test_run_forever_live.py).
+
+Запускается целиком (`python tests/debug.py`) или построчно из-под отладчика: до `main()` идут
+только присваивания, поэтому любой блок можно выполнить отдельно, оставив остальные закомментированными.
+
+Параметры подключения дублируются в live-тестах (test_cdc_run_once.py, test_run_forever_live.py) —
+меняя их здесь, поменяйте и там.
 """
 
-import requests
 import logging
-from typing import Any
 
-import xmltodict
-from sqlalchemy import String, Uuid, BigInteger, SmallInteger, Numeric, Boolean, DateTime, create_engine
+from sqlalchemy import create_engine
 
-from cdc_1c import MetadataReader1C, DataReader1C, ChangeReader1C, NameMapper1C, DBWriter1C, Replicator1C
+from cdc_1c import ChangeReader1C, DBWriter1C, MetadataReader1C, NameMapper1C, Replicator1C
 
-
-logging.basicConfig()
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-
-engine = create_engine("postgresql+psycopg2://postgres:postgres@localhost:5432/cdc_1c")
-
-exchange_name = 'ДляODATA'
-queue_guid = 'a9bc23c5-3689-11f1-926c-0800270bc6cb'
-odata_url = "http://192.168.56.102/trade_demo/odata/standard.odata"
+ODATA_URL = "http://192.168.56.102/trade_demo/odata/standard.odata"
+ODATA_AUTH = ('admin', 'admin')
+EXCHANGE_NAME = 'ДляODATA'
+QUEUE_GUID = 'a9bc23c5-3689-11f1-926c-0800270bc6cb'
+DB_URL = "postgresql+psycopg2://postgres:postgres@localhost:5432/cdc_1c"
+DB_SCHEMA = 'cdc_1c_trade_demo'
 
 
-odata_auth=('admin', 'admin')
-metadata = MetadataReader1C(odata_url, odata_auth=odata_auth)
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    engine = create_engine(DB_URL)
 
-# order_data = DataReader(odata_url, metadata)
-# order_data.read_object('Document_ЗаказКлиента')
-mapper = NameMapper1C()
-changes = ChangeReader1C(odata_url, exchange_name, queue_guid, metadata, odata_auth=odata_auth)
+    # Компоненты по отдельности — чтобы смотреть промежуточный результат каждого.
+    metadata = MetadataReader1C(ODATA_URL, odata_auth=ODATA_AUTH, engine=engine, schema=DB_SCHEMA)
+    changes = ChangeReader1C(ODATA_URL, EXCHANGE_NAME, QUEUE_GUID, metadata, odata_auth=ODATA_AUTH)
+    writer = DBWriter1C(engine=engine, name_mapper=NameMapper1C(), schema=DB_SCHEMA)
 
-writer = DBWriter1C(engine=engine, name_mapper=mapper, data_reader=changes, schema='cdc_1c_trade_demo')
+    changes.read_changes()
+    for object_name, data_object in changes.items():
+        result = writer.save(object_name, data_object)
+        print(object_name, result)
+    # Подтверждение приёма намеренно НЕ отправляется: без него пакет остаётся в очереди 1С и
+    # отладку можно повторять сколько угодно раз. Нужно списать — раскомментируйте.
+    # changes.notify_changes_received()
 
-replicator = Replicator1C(engine=engine, odata_url=odata_url, exchange_name=exchange_name,
-                          queue_guid=queue_guid, odata_auth=odata_auth)
-
-replicator.list_objects()
-
-changes.read_changes()
-
-writer.save_all()
-changes['Document_ЗаказКлиента'].to_nested_records()
-#changes.notify_changes_received()
+    # То же самое целиком, оркестратором.
+    replicator = Replicator1C(odata_url=ODATA_URL, odata_auth=ODATA_AUTH,
+                              exchange_name=EXCHANGE_NAME, queue_guid=QUEUE_GUID,
+                              engine=engine, db_schema=DB_SCHEMA)
+    print(replicator.list_objects())
+    replicator.run_once(notify_changes=False)
 
 
-
-
-pass
+if __name__ == "__main__":
+    main()

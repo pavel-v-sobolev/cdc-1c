@@ -7,8 +7,8 @@
   finished_at=NULL у незавершённой/упавшей); счётчики строк merge и `total_time` наращиваются
   в БД по мере сохранений (см. Replicator1CLog.write_result).
 
-Время берётся серверным `func.now()` (на sqlite SQLAlchemy компилирует в CURRENT_TIMESTAMP).
-Схема на sqlite не поддерживается (и schema=None) — приводится к None (как в dbmerge).
+Время берётся серверным `func.now()`. Схема не задана (schema=None) — работаем в схеме БД
+по умолчанию (public у PostgreSQL), как это делает и dbmerge.
 """
 
 from dbmerge import mergeResult
@@ -28,9 +28,9 @@ LOAD_TYPE_FULL = 'full'
 
 
 def _check_create_schema(engine: Engine, schema_name: str | None) -> str | None:
-    # sqlite схемы не поддерживает; schema_name=None — работаем в схеме БД по умолчанию (создавать
-    # нечего). В обоих случаях возвращаем None, не дёргая has_schema/CreateSchema с None.
-    if engine.dialect.name == 'sqlite' or schema_name is None:
+    # schema_name=None — работаем в схеме БД по умолчанию, создавать нечего: возвращаем None,
+    # не дёргая has_schema/CreateSchema с None.
+    if schema_name is None:
         return None
     with engine.begin() as conn:
         if not conn.dialect.has_schema(conn, schema_name):

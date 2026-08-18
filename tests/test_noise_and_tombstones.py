@@ -4,15 +4,14 @@
 Два связанных механизма:
 - шумной пакет (1С переписала объект, не изменив реквизитов) не должен трогать строку: отличие
   только в exchange_message_no / версии данных изменением не считается, merged_on остаётся прежним,
-  иначе материализатор пересчитывал бы группу впустую;
+  иначе обработчик пересчитывал бы группу впустую;
 - строка, выпавшая из набора регистра/табличной части, не удаляется, а помечается: числовые
   ресурсы гасятся в NULL, merged_on поднимается — событие удаления не должно исчезать бесследно.
 """
 
-import time
 
 import pytest
-from sqlalchemy import create_engine, select, Table, MetaData
+from sqlalchemy import select, Table, MetaData
 
 from cdc_1c import DataObject1C, NameMapper1C
 from cdc_1c.data_reader import VERSION_FIELDS
@@ -64,7 +63,7 @@ def test_noisy_packet_does_not_touch_the_row(db, version_field):
 
     after = _rows(w, "Catalog_X")[0]
     assert result.updated_row_count == 0
-    assert after["merged_on"] == before["merged_on"]        # материализатор ничего не пересчитает
+    assert after["merged_on"] == before["merged_on"]        # обработчик ничего не пересчитает
     assert after["exchange_message_no"] == 105              # шумные поля тоже не переписаны
     assert after[version_field] == "v1"
 
@@ -110,7 +109,7 @@ def test_row_dropped_from_the_set_is_marked_with_nulled_resource(db):
     assert rows[2]["is_deleted_or_empty"]
     assert rows[2]["Kolichestvo"] is None            # SUM не заметит её и без фильтра по флагу
     assert rows[2]["Comment"] == "c"                 # не-ресурс сохранён: видно, что это была за строка
-    assert rows[2]["merged_on"] > before[2]["merged_on"]   # событие видно материализатору
+    assert rows[2]["merged_on"] > before[2]["merged_on"]   # событие видно обработчику
     # строка 1 не менялась и осталась нетронутой
     assert rows[1]["merged_on"] == before[1]["merged_on"]
 

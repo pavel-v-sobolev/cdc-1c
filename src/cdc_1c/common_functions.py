@@ -131,7 +131,7 @@ def parse_object_full_name(object_full_name):
     Возвращает очищенное имя и тип объекта
     """
     if object_full_name is None:
-        logger.error(f'Object full name is None')
+        logger.error('Object full name is None')
         return None, None
 
     object_name = object_full_name

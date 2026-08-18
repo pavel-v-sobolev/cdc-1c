@@ -90,19 +90,21 @@
   таблица ENV, требования к плану обмена OData в 1С, поведение имён, спец-поля, ограничения);
   `tests/debug.py` — отладочный вход для ручных прогонов против живой 1С.
 
-### Фаза C. Docker «из коробки»
+### Фаза C. Docker «из коробки» — НЕ СДЕЛАНО
+Ни `Dockerfile`, ни `docker-compose.yml` в репозитории нет, хотя README уже говорит про контейнеры
+и про том с `example_config/`. Что нужно:
 - **C1. `Dockerfile`** — `python:3.12-slim`, `cdc-1c[postgres]`, `ENTRYPOINT ["cdc-1c"]`, ENV,
-  graceful SIGTERM.
+  graceful SIGTERM (перехват сигналов ставится в конструкторах, см. `stop_signal`).
 - **C2. `docker-compose.yml`** — сервис `cdc-1c` + опциональный `postgres`; `.env.example`;
   README-раздел «Запуск в Docker за 1 минуту».
 
 ### Фаза D. Качество
-- **D1. Тесты (pytest)** — `NameMapper1C`, `to_records_mapped`, `_get_delete_key`; на sqlite —
-  `DBWriter1C` scoped-delete (регистр/ТЧ/пустая ТЧ), идемпотентность, фиктивные записи,
-  `is_deleted_or_empty` по всем веткам, GUID→`uuid.UUID`; ридеры — фикстуры реального XML
-  `SelectChanges`/`$metadata`.
-- **D2. CI (GitHub Actions)** — ruff, тесты на матрице 3.10–3.13, сборка; публикация на PyPI по
-  git-тегу (OIDC/trusted publishing).
+- **D1. Тесты (pytest)** — ✅ идут против локального PostgreSQL, каждому тесту своя схема
+  (`tests/conftest.py`). sqlite не используется: он отличается ровно в тех местах, которые тесты и
+  проверяют (схемы, точность `CURRENT_TIMESTAMP`, соединение = отдельная база). Живые тесты 1С —
+  под маркером `integration`, по умолчанию отсеиваются.
+- **D2. CI (GitHub Actions)** — ✅ матрица 3.10–3.14 с `services: postgres`; публикация на PyPI по
+  git-тегу (OIDC/trusted publishing). Линтера в CI пока нет.
 
 ---
 
@@ -115,9 +117,10 @@
 - Уникальность обрезанных длинных имён строго не гарантируется (хэш от полного имени).
 
 ## Проверка (end-to-end)
-1. `uv sync`; `pytest` — зелёные offline-тесты (без 1С/Postgres).
+1. `uv sync`; `pytest` — зелёные offline-тесты (без 1С, но Postgres нужен).
 2. `Replicator1C(...).run_once()` против живой 1С + Postgres: таблицы, типы,
    scoped-delete, спец-поля; повторный прогон — идемпотентность.
 3. `run_forever(interval=…)`: цикл чистит состояние, notify только после успешного save, реакция на SIGTERM.
-4. Docker: `docker compose up` с заполненным `.env` → данные грузятся без правок кода; `docker stop` штатно завершает.
+4. Docker (после фазы C): `docker compose up` с заполненным `.env` → данные грузятся без правок
+   кода; `docker stop` штатно завершает.
 5. `uv build` + установка из wheel в чистом окружении (3.10): импорт и `cdc-1c`/`python -m cdc_1c`.

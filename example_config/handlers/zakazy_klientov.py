@@ -1,7 +1,7 @@
 """
 Витрина: строки регистра «Заказы клиентов» с артикулом из справочника номенклатуры.
 
-Раннер зовёт обработчик сам, когда в БД реально изменился регистр или номенклатура, и передаёт
+Обработчик зовут сам, когда в БД реально изменился регистр или номенклатура, и передают
 окно (context.last_run_at, context.boundary] — выбирать данные обработчик должен по нему.
 
 Ключевая мысль всей конструкции: объекты 1С приезжают в обмене независимо, номенклатура может
@@ -83,16 +83,21 @@ class ZakazyKlientov(Handler1C):
             # Единица пересчёта — не строка, а ГРУППА (Recorder), потому что удаляем мы тоже
             # группой. Берём ключи групп, у которых стал свежее хоть один источник.
             #
-            # Не OR по всем отметкам сразу, а UNION ALL по одной отметке на ветку — почему так,
-            # см. длинный комментарий в конце метода. Вьюшка при этом одна и та же: логика
-            # соединений не дублируется, ветки различаются только колонкой в WHERE. ALL — потому
-            # что дедупликация не нужна: результат уходит в IN (...), где дубликаты не мешают.
+            # Вьюшка у веток одна и та же: логика соединений не дублируется, различаются они
+            # только колонкой в WHERE. ALL — потому что дедупликация не нужна: результат уходит
+            # в IN (...), где дубликаты не мешают.
             changed = merge.source_table.alias("chg")
             since = self.since(context)
-            changed_recorders = union_all(*[
-                select(changed.c["Recorder"], changed.c["Recorder_Type"]).where(changed.c[column] > since)
-                for column in ("merged_on", "Nomenklatura_merged_on")
-            ])
+
+            changed_by_register = (
+                select(changed.c["Recorder"], changed.c["Recorder_Type"])
+                .where(changed.c["merged_on"] > since))
+
+            changed_by_nomenklatura = (
+                select(changed.c["Recorder"], changed.c["Recorder_Type"])
+                .where(changed.c["Nomenklatura_merged_on"] > since))
+
+            changed_recorders = union_all(changed_by_register, changed_by_nomenklatura)
 
             merge.exec(
                 source_condition=tuple_(merge.source_table.c["Recorder"],

@@ -10,7 +10,7 @@ from datetime import date, datetime
 
 import pytest
 import requests
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 from dbmerge import mergeResult
 
 from cdc_1c import DataObject1C

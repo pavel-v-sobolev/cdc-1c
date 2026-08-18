@@ -1,14 +1,13 @@
 """
-Ручной прогон Replicator1C.run_forever против живой 1С и dev-Postgres (параметры как в
-debug.py / test_cdc_run_once.py). Интервал опроса — 5 секунд, notify включён по умолчанию
-(изменения подтверждаются после успешного сохранения).
+Ручной прогон Replicator1C.run_forever против живой 1С и dev-Postgres (параметры берутся из
+debug.py). notify включён по умолчанию — изменения подтверждаются после успешного сохранения.
 
-Это НЕ pytest-тест: цикл бесконечный, поэтому файл без префикса test_ и pytest его не собирает.
-Запуск вручную:
+Тестовых функций здесь нет: цикл бесконечный, и pytest, собрав файл, ничего в нём не найдёт и не
+запустит. Запуск только вручную:
 
-    uv run python tests/run_forever_live.py
+    uv run python tests/test_run_forever_live.py
 
-Кидай изменения из 1С — каждые 5 секунд они вычитываются, сохраняются в Postgres и
+Кидай изменения из 1С — раз в POLL_INTERVAL они вычитываются, сохраняются в Postgres и
 подтверждаются. Остановка — Ctrl+C (graceful: дорабатывает текущий цикл и выходит).
 """
 
@@ -18,14 +17,9 @@ from sqlalchemy import create_engine
 
 from cdc_1c import Replicator1C
 
-# Параметры из debug.py — тестовый/dev-контур, не боевой.
-ODATA_URL = "http://192.168.56.102/trade_demo/odata/standard.odata"
-ODATA_USER = "admin"
-ODATA_PASSWORD = "admin"
-EXCHANGE_NAME = "ДляODATA"
-QUEUE_GUID = "a9bc23c5-3689-11f1-926c-0800270bc6cb"
-DB_URL = "postgresql+psycopg2://postgres:postgres@localhost:5432/cdc_1c"
-DB_SCHEMA = "cdc_1c_trade_demo"
+# Тестовый/dev-контур, не боевой (debug.py лежит рядом и импортируется как обычный модуль).
+from debug import DB_SCHEMA, DB_URL, EXCHANGE_NAME, ODATA_AUTH, ODATA_URL, QUEUE_GUID
+
 POLL_INTERVAL = 60.0
 
 
@@ -34,7 +28,7 @@ if __name__ == "__main__":
 
     repl = Replicator1C(
         odata_url=ODATA_URL,
-        odata_auth=(ODATA_USER, ODATA_PASSWORD),
+        odata_auth=ODATA_AUTH,
         exchange_name=EXCHANGE_NAME,
         queue_guid=QUEUE_GUID,
         engine=create_engine(DB_URL),

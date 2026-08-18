@@ -4,33 +4,41 @@
 
 Зачем отдельный механизм. Инкрементальная витрина (или отправка изменений во внешнюю систему)
 не может сама узнать, что данные приехали: она либо опрашивает БД вхолостую, либо ждёт, пока её
-запустят руками. Раннер эту информацию имеет — он и сохраняет данные, — поэтому он же и зовёт
-обработчик.
+запустят руками. Репликатор эту информацию имеет — он и сохраняет данные, — поэтому он и
+сообщает, что пора считать.
 
-Обработчик — обычный импортируемый модуль:
+Обработчик — класс, унаследованный от Handler1C:
 
     # handlers/zakazy_klientov.py
-    ON = ["AccumulationRegister_ZakazyKlientov", "Catalog_Nomenklatura"]
-    ON_FULL_LOAD = True     # звать ли на страницах полной выгрузки (по умолчанию да)
-    MIN_INTERVAL = 0        # не чаще раза в N секунд (0 — без ограничения)
+    class ZakazyKlientov(Handler1C):
+        ON = ["AccumulationRegister_ZakazyKlientov", "Catalog_Nomenklatura"]
+        ON_FULL_LOAD = True     # звать ли на страницах полной выгрузки (по умолчанию да)
+        MIN_INTERVAL = 0        # не чаще раза в N секунд (0 — без ограничения)
 
-    def handle(context): ...
+        def handle(self, context): ...
 
-Подключается явным импортом и явным списком — никакого сканирования каталогов и магии с путями:
+Наследование не обязательно: as_handler примет и модуль целиком, и функцию — нужны только те же
+`ON` и `handle`. Базовый класс просто избавляет от копипасты (см. Handler1C).
 
-    from handlers import zakazy_klientov, otpravka_v_ochered
+Каждому обработчику — свой HandlerLoop, и запускается он блокирующим run_forever, как и
+репликатор:
 
-    zakazy  = HandlerRunner(engine=engine, schema='cdc_1c', handler=zakazy_klientov)
-    ochered = HandlerRunner(engine=engine, schema='cdc_1c', handler=otpravka_v_ochered)
-    replicator = Replicator1C(..., engine=engine, handler_runners=[zakazy, ochered])
+    from handlers import ZakazyKlientov, OtpravkaVOchered
 
-У каждого обработчика свой раннер и свой поток, поэтому тяжёлая витрина не задерживает остальные,
-но и порядок между ними не определён: на «витрина поверх витрины считается после базовой»
-полагаться нельзя. Обработчики живут где угодно, лишь бы импортировались, поэтому общий код
-выносится в соседний модуль обычным `from handlers._common import ...`, а не особым соглашением.
+    handler_zakazy  = HandlerLoop(engine=engine, schema='cdc_1c', handler=ZakazyKlientov())
+    handler_ochered = HandlerLoop(engine=engine, schema='cdc_1c', handler=OtpravkaVOchered())
 
-Кроме модуля, в списке можно передать функцию с теми же атрибутами (см. декоратор `handler`) или
-готовый `Handler` — раннеру нужно только имя, набор объектов и вызываемое `handle`.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pool.submit(handler_zakazy.run_forever)
+        pool.submit(handler_ochered.run_forever)
+
+Репликатору эти циклы не передаются: он о них не знает, а сообщает через таблицу handlers_1c (см.
+HandlerSignals). Поэтому обработчики можно запускать где угодно — хоть в отдельном контейнере.
+
+Цикл на обработчика, а не один на всех, — чтобы тяжёлая витрина не задерживала остальные. Порядок
+между ними при этом не определён: на «витрина поверх витрины считается после базовой» полагаться
+нельзя. Общий код обработчиков выносится в соседний модуль обычным `from handlers._common import
+...`, а не особым соглашением.
 
 В `ON` перечисляются имена ТАБЛИЦ, как они выглядят в целевой БД (транслит), а не имена объектов
 1С: обработчик пишет SQL по таблицам, имя 1С он в глаза не видит. Имя 1С в `ON` не совпадёт ни с
@@ -61,7 +69,7 @@
 коммитится минутами позже (толстая страница полной выгрузки), поэтому строка может иметь merged_on
 заведомо в прошлом и при этом быть не видна SELECT-у обработчика. Отметка бы её перешагнула, и
 строка потерялась бы навсегда. Поэтому граница — минимум из «сейчас» и стартов ещё не завершённых
-merge по таблицам из `ON` (см. MergeTracker): всё, что обработчику не видно, записано незавершённым
+merge по таблицам из `ON` (см. SharedMergeTracker): всё, что обработчику не видно, записано незавершённым
 merge, а его merged_on не может быть меньше старта этого merge — значит оно гарантированно окажется
 правее границы и попадёт в следующее окно.
 
@@ -70,20 +78,22 @@ last_run_at, окно повторится. Обработчик обязан б
 само, для отправки во внешнюю систему — забота потребителя).
 """
 
+import itertools
 import threading
 import time
 import traceback
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import ModuleType
 from typing import Callable, Iterable
 
-from sqlalchemy import (Boolean, Column, ColumnElement, DateTime, Engine, Float, MetaData, String,
-                        Table, func, insert, inspect, or_, select, text, update)
+from sqlalchemy import (ARRAY, Boolean, Column, ColumnElement, DateTime, Engine, Float, MetaData,
+                        String, Table, func, insert, inspect, or_, select, text, update)
 
 from cdc_1c.db_logs import _check_create_schema
 from cdc_1c.logging_config import LOAD_MODE_HANDLER, get_logger, load_mode
 from cdc_1c.name_mapper import NameMapper1C
+from cdc_1c.stop_signal import StopSignal, install_signal_handlers
 
 logger = get_logger(__name__)
 
@@ -100,6 +110,9 @@ SOURCE_STARTUP = 'startup'
 # Заказана пересборка витрины (full_rebuild_is_required). Отдельный повод к запуску: флаг ставят
 # руками в таблице, и никаких изменений за ним не приходит — ждать сигнала можно вечно.
 SOURCE_REBUILD = 'full_rebuild'
+# Репликатор поднял update_is_required: подписанная таблица изменилась. Так выглядит сигнал,
+# пришедший через БД, — от репликатора в другом процессе или контейнере.
+SOURCE_DB_SIGNAL = 'db_signal'
 
 # Пауза холостого цикла потока обработчиков. Нужна не для опроса (о новых данных сообщает событие),
 # а чтобы дождаться истечения MIN_INTERVAL и отпустившей границы окна, не занимая CPU.
@@ -109,23 +122,47 @@ IDLE_POLL = 1.0
 # поэтому без паузы сломанный обработчик повторялся бы каждый холостой цикл.
 RETRY_DELAY = 60.0
 
+# Как часто репликатор перечитывает подписки обработчиков (update_on) из handlers_1c. Меняются они
+# только при перезапуске обработчика, а читать их на каждый сохранённый объект — лишние запросы:
+# при полной выгрузке это запрос на страницу.
+SUBSCRIPTIONS_TTL = 30.0
+
+# Реестр идущих merge (SharedMergeTracker). Репликатор обновляет отметку живости своих строк
+# не реже HEARTBEAT_PERIOD; строки, чья отметка старше HEARTBEAT_TTL, считаются брошенными —
+# процесс, который их завёл, умер, а вместе с ним откатились и его транзакции, так что держать по
+# ним границу больше не нужно. TTL с запасом больше периода: разовая задержка не должна выглядеть
+# как смерть процесса.
+MERGES_TABLE = "merges_in_process_1c"
+HEARTBEAT_PERIOD = 20.0
+HEARTBEAT_TTL = 90.0
+# Через сколько строка брошенного процесса не просто игнорируется при расчёте границы, а удаляется.
+# Нужно потому, что процесс может не вернуться никогда: репликатор переименовали (сменился
+# exchange_name) или выключили совсем — его строки иначе остались бы в таблице навсегда. С запасом
+# больше HEARTBEAT_TTL: удалять то, что ещё держит границу, нельзя ни при каких обстоятельствах.
+ABANDONED_TTL = 3600.0
+
 # Нижняя граница окна, когда last_run_at ещё нет (первый запуск или запрошен полный пересчёт).
 # Заведомо раньше любого merged_on и при этом валидная дата для всех поддерживаемых СУБД.
 EPOCH = datetime(1900, 1, 1)
 
 
-def db_now(engine: Engine) -> datetime:
-    """Текущее время по часам БД — тем же now(), которым dbmerge штампует merged_on. Сравнивать
-    границы окна с python-часами нельзя: хосты расходятся."""
-    with engine.connect() as conn:
-        return conn.scalar(select(func.now()))
+def _naive(moment: datetime | None) -> datetime | None:
+    """
+    Отметка БД без часового пояса. PostgreSQL now() отдаёт timestamptz, то есть offset-aware
+    datetime, а merged_on и handlers_1c.last_run_at лежат в колонках без пояса и читаются
+    offset-naive. Сравнить их в Python нельзя — «can't compare offset-naive and offset-aware
+    datetimes», — а сравнивает их как раз HandlerLoop (boundary против last_run_at). Смещение
+    отбрасываем, а не приводим к UTC: драйвер уже перевёл значение в часовой пояс сессии, и ровно
+    так же PostgreSQL приводит timestamptz к timestamp при записи.
+    """
+    return moment.replace(tzinfo=None) if moment is not None else None
 
 
 @dataclass(frozen=True)
 class HandlerContext:
     """
     Что обработчик получает на вход. Данных здесь нет намеренно: обработчик делает свой SELECT —
-    так он не зависит от того, в каком виде их прочитал раннер, и переживает перезапуск процесса
+    так он не зависит от того, в каком виде их прочитал репликатор, и переживает перезапуск процесса
     (всё его состояние — в БД).
     """
 
@@ -139,8 +176,14 @@ class HandlerContext:
     # обработчику, который считает только по нему, ничего специально делать не надо. Флаг нужен
     # тем, у кого пересборка идёт иначе: например, не одним merge, а по частям.
     full_rebuild: bool
-    # Таблицы, изменения которых привели к этому вызову, и откуда они пришли. Информационно:
-    # выбирать данные всё равно по окну (за время ожидания могли измениться и другие объекты).
+    # Что привело к вызову. Только для логов: выбирать данные обязательно по окну.
+    #
+    # Точности тут немного, и это осознанно. Репликатор сообщает об изменении флагом в handlers_1c,
+    # а флаг не несёт ни имени изменившейся таблицы, ни источника — иначе пришлось бы городить в
+    # таблице очередь событий вместо одного булева поля. Поэтому objects — это весь ON обработчика,
+    # а sources — db_signal (изменение), startup (первый проход процесса) или full_rebuild (заказ
+    # пересборки). Отличить бэкфилл полной выгрузки от живого изменения по sources нельзя; если
+    # обработчику не нужен бэкфилл, он выключается целиком через ON_FULL_LOAD.
     objects: frozenset[str]
     sources: frozenset[str]
     logger: object
@@ -148,7 +191,7 @@ class HandlerContext:
 
 class Handler1C:
     """
-    Базовый класс обработчика. Наследоваться не обязательно — раннеру достаточно `name`, `ON` и
+    Базовый класс обработчика. Наследоваться не обязательно — HandlerLoop достаточно `name`, `ON` и
     `handle` (годится и модуль, и функция), — но здесь лежит то, что иначе копируется из
     обработчика в обработчик.
 
@@ -162,8 +205,8 @@ class Handler1C:
             def handle(self, context):
                 ...
 
-    В раннер передаётся ЭКЗЕМПЛЯР, а не класс: так обработчик можно параметризовать конструктором
-    (одна и та же логика на две схемы — два экземпляра в списке). Но имя по умолчанию берётся от
+    В HandlerLoop передаётся ЭКЗЕМПЛЯР, а не класс: так обработчик можно параметризовать
+    конструктором (одна и та же логика на две схемы — два экземпляра). Но имя по умолчанию берётся от
     класса и служит ключом состояния в handlers_1c, поэтому у параметризованных экземпляров оно
     обязано различаться — иначе они молча поделили бы одну отметку last_run_at на двоих.
 
@@ -254,7 +297,7 @@ class Handler1C:
 @dataclass(frozen=True)
 class Handler:
     """
-    Нормализованный обработчик: то, с чем работает раннер, независимо от того, чем он был объявлен
+    Нормализованный обработчик: то, с чем работает HandlerLoop, независимо от того, чем он был объявлен
     (экземпляр Handler1C, модуль или функция). Собирается функцией as_handler.
     """
 
@@ -271,8 +314,8 @@ def as_handler(obj) -> Handler:
     Приводит объявленный пользователем обработчик к Handler.
 
     Принимается всё, у чего есть `handle` и непустой `ON`: экземпляр Handler1C, модуль
-    (`from handlers import zakazy` → модуль целиком) или функция с теми же атрибутами. Раннеру
-    важны только имя, набор объектов и вызываемое — обязательного базового класса нет.
+    (`from handlers import zakazy` → модуль целиком) или функция с теми же атрибутами. Нужны
+    только имя, набор объектов и вызываемое — обязательного базового класса нет.
     """
     if isinstance(obj, Handler):
         return obj
@@ -318,91 +361,20 @@ def _handler_name(obj) -> str:
     return type(obj).__name__
 
 
-def build_handlers(objects: Iterable) -> list[Handler]:
-    """Нормализует список обработчиков и проверяет уникальность имён: имя — ключ состояния в
-    handlers_1c, и два одноимённых обработчика молча делили бы одну отметку last_run_at."""
-    handlers = [as_handler(obj) for obj in objects]
-    seen = set()
-    for handler in handlers:
-        if handler.name in seen:
-            raise ValueError(f"Duplicate handler name {handler.name!r}: the name is the state key "
-                             f"in {HANDLERS_TABLE}, set NAME to tell them apart")
-        seen.add(handler.name)
-    return handlers
-
-
-class MergeTracker:
-    """
-    Стартовые отметки незавершённых merge — по объектам, чтобы посчитать верхнюю границу окна
-    обработчика (см. модульную docstring).
-
-    Отметки на объект, а не одна общая: долгий merge толстого справочника иначе держал бы границу
-    всем обработчикам подряд, в том числе тем, кто этот справочник вообще не читает.
-
-    Взятие отметки и расчёт границы делаются ПОД ОДНИМ ЛОКОМ вместе с запросом времени у БД, и это
-    не перестраховка. Если бы merge сначала спрашивал у БД своё время, а регистрировался отдельным
-    шагом, между этими шагами помещался бы расчёт границы: он бы этот merge ещё не увидел, а время
-    взял бы уже более позднее — и строки merge оказались бы левее границы, но невидимыми, то есть
-    потерянными. Под общим локом остаётся только два порядка, и оба безопасны: либо merge успел
-    зарегистрироваться, и граница прижимается к его старту, либо граница взята раньше его времени
-    старта — тогда его строки заведомо правее неё и попадут в следующее окно.
-    """
-
-    def __init__(self, db_now: Callable[[], datetime]):
-        self._db_now = db_now
-        self._lock = threading.Lock()
-        # object_name → список стартов идущих сейчас merge (их может быть несколько: страницы
-        # полной выгрузки идут своим потоком параллельно с пакетом изменений).
-        self._in_flight: dict[str, list[datetime]] = {}
-
-    def track(self, object_name: str) -> "_TrackedMerge":
-        """
-        Контекст-менеджер на время одного merge: берёт его стартовую отметку по часам БД и держит
-        её в реестре до выхода из блока, т.е. до коммита merge.
-
-        Возвращённую отметку (`.started_at`) можно использовать и как момент старта прогона для
-        guard'ов полной выгрузки — это то же самое «время до первой записи по часам БД».
-        """
-        with self._lock:
-            started_at = self._db_now()
-            self._in_flight.setdefault(object_name, []).append(started_at)
-        return _TrackedMerge(self, object_name, started_at)
-
-    def _remove(self, object_name: str, started_at: datetime) -> None:
-        with self._lock:
-            starts = self._in_flight.get(object_name)
-            if not starts:
-                return
-            starts.remove(started_at)
-            if not starts:
-                del self._in_flight[object_name]
-
-    def is_empty(self) -> bool:
-        """Нет ли сейчас незавершённых merge (проверка перед подменой реестра на общий)."""
-        with self._lock:
-            return not self._in_flight
-
-    def boundary(self, object_names: Iterable[str]) -> datetime:
-        """Верхняя граница окна: минимум из «сейчас» и стартов незавершённых merge по объектам."""
-        with self._lock:
-            now = self._db_now()
-            starts = [s for name in object_names for s in self._in_flight.get(name, ())]
-        return min([now, *starts])
-
-
 class _TrackedMerge:
-    """Один merge в реестре MergeTracker: снимается по выходу из блока, т.е. после коммита."""
+    """Один merge в реестре: снимается по выходу из блока, т.е. после коммита. Ключ — имя объекта
+    строки в merges_in_process_1c."""
 
-    def __init__(self, tracker: MergeTracker, object_name: str, started_at: datetime):
+    def __init__(self, tracker, key: str, started_at: datetime):
         self._tracker = tracker
-        self._object_name = object_name
+        self._key = key
         self.started_at = started_at
 
     def __enter__(self) -> "_TrackedMerge":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self._tracker._remove(self._object_name, self.started_at)
+        self._tracker._remove(self._key)
 
 
 def _handlers_table(metadata: MetaData, schema_name: str | None) -> Table:
@@ -412,6 +384,17 @@ def _handlers_table(metadata: MetaData, schema_name: str | None) -> Table:
         Column("enabled", Boolean, nullable=False),
         Column("last_run_at", DateTime, nullable=True),
         Column("last_error", String, nullable=True),
+        # На что обработчик подписан. Заполняет он сам при старте, читает — репликатор: так
+        # репликатору не нужны ни объекты обработчиков, ни их код, и они могут жить в другом
+        # процессе или вообще в другом контейнере.
+        Column("update_on", ARRAY(String), nullable=True),
+        # Звать ли на страницах полной выгрузки. Объявляет обработчик, читает репликатор: сам
+        # обработчик по флагу update_is_required источник изменения не различает, поэтому решение
+        # принимается на стороне того, кто флаг поднимает.
+        Column("on_full_load", Boolean, nullable=False, server_default=text('true')),
+        # Репликатор увидел изменение подписанной таблицы. Единственный способ, которым он зовёт
+        # обработчика: поднять флаг, а дальше тот сам увидит его своим циклом.
+        Column("update_is_required", Boolean, nullable=False, server_default=text('false')),
         # Заказ полной пересборки витрины — руками или автоматически (см. request_full_rebuild) —
         # и метрики последней пересборки. Названы по образцу metadata_objects_1c, где так же
         # устроена полная выгрузка объекта.
@@ -441,32 +424,283 @@ def _add_missing_columns(engine: Engine, table: Table) -> None:
     logger.info("Added columns to %s: %s", table.name, ', '.join(c.name for c in missing))
 
 
-class HandlerRunner:
-    """
-    Исполнитель ОДНОГО обработчика: его состояние, его очередь и его поток.
+def _merges_table(metadata: MetaData, schema_name: str | None) -> Table:
+    return Table(
+        MERGES_TABLE, metadata,
+        Column("id", String(64), primary_key=True),
+        Column("replicator", String(255), nullable=False),
+        Column("object_name", String(255), nullable=False),
+        # Момент старта merge по часам БД — то, к чему прижимается граница окна обработчика.
+        Column("started_at", DateTime, nullable=False),
+        # Отметка живости: обновляется, пока процесс жив (см. HEARTBEAT_TTL).
+        Column("heartbeat_at", DateTime, nullable=False),
+        schema=schema_name,
+    )
 
-    Один обработчик на раннер, а не список, — чтобы тяжёлая витрина не задерживала остальные:
-    потоки у них независимые. Плата за это — порядок вызова между обработчиками не определён, и
+
+class SharedMergeTracker:
+    """
+    Реестр незавершённых merge в БАЗЕ: строка живёт ровно столько, сколько данные merge могут быть
+    ещё не видны другим процессам.
+
+    Нужен, потому что обработчик может работать отдельно от репликатора. Граница его окна обязана
+    быть прижата к незакоммиченным merge: их merged_on уже в прошлом, а строки ещё не видны, и
+    отметка, взятая как «сейчас», их бы перешагнула — потеря строк, молча. В памяти такой реестр
+    чужому процессу не виден, поэтому он живёт в таблице merges_in_process_1c: строка появляется
+    перед merge и исчезает после коммита.
+
+    Брошенные строки (процесс умер между вставкой и удалением) отсекаются по отметке живости: раз
+    процесса нет, его транзакции откатились, и держать по ним границу незачем. Поэтому падение
+    репликатора обработчиков не морозит — максимум на HEARTBEAT_TTL.
+
+    Отметку живости обновляет сам реестр, своим потоком. Именно реестр, а не цикл репликации:
+    строки появляются в любом сценарии, включая одиночный run_once и вызванный руками full_load,
+    а цикла в этих сценариях нет. Без этого одна страница выгрузки, считающаяся дольше
+    HEARTBEAT_TTL, признавалась бы брошенной — и обработчик молча перешагнул бы её строки. Поток
+    отдельный ещё и потому, что merge и сам может идти дольше HEARTBEAT_TTL: обновлять отметку
+    между merge поздно.
+    """
+
+    def __init__(self, engine: Engine, schema: str | None, replicator: str):
+        self.engine = engine
+        self.schema_name = _check_create_schema(engine, schema)
+        self.replicator = replicator
+        self.table = _merges_table(MetaData(), self.schema_name)
+        self.table.create(engine, checkfirst=True)
+        self._counter = itertools.count()
+        self._lock = threading.Lock()
+        # Сколько своих merge сейчас в реестре и поток, который обновляет им отметку живости.
+        # Поток поднимается с первым merge и гаснет, когда продлевать становится нечего: реестры
+        # живут долго, и оставлять при каждом по спящему потоку незачем.
+        self._active = 0
+        self._heartbeat_thread: threading.Thread | None = None
+        self._closed = threading.Event()
+        self._cleanup()
+
+    def close(self) -> None:
+        """Останавливает поток отметки живости. Для процесса не обязательна (поток daemon), нужна
+        тестам и тем, кто заводит реестры по ходу работы."""
+        self._closed.set()
+
+    def _ensure_heartbeat(self) -> None:
+        """Поднимает поток отметки живости, если он ещё не поднят. Под локом: проверка «поток есть»
+        и его создание обязаны быть неделимыми, иначе два merge, стартовавших одновременно, заведут
+        по потоку каждый."""
+        with self._lock:
+            if self._heartbeat_thread is not None or self._closed.is_set():
+                return
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop, name=f'heartbeat:{self.replicator}', daemon=True)
+            self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        """
+        Продлевает свои строки, пока они есть, и гаснет, когда их не осталось.
+
+        Решение «гаснуть» принимается под тем же локом, под которым track() поднимает поток, и
+        ПОСЛЕ инкремента _active. Поэтому промежутка, в котором merge уже стартовал, а поток уже
+        решил выйти, не существует: либо выходящий поток видит _active > 0 и остаётся, либо он
+        успел обнулить _heartbeat_thread, и track() заводит новый.
+        """
+        while not self._closed.is_set():
+            try:
+                self.heartbeat()
+            except Exception:
+                logger.exception("Merge heartbeat failed")
+            self._closed.wait(HEARTBEAT_PERIOD)
+            with self._lock:
+                if self._active == 0:
+                    self._heartbeat_thread = None
+                    return
+
+    def _cleanup(self) -> None:
+        """
+        Уборка при старте — двух видов строк.
+
+        Свои, от прошлого запуска: транзакции того процесса давно откатились, и ждать по ним
+        HEARTBEAT_TTL после каждого рестарта незачем.
+
+        Чужие брошенные, старше ABANDONED_TTL: при расчёте границы они и так игнорируются, но
+        удалить их некому — процесс может не вернуться никогда (репликатор переименовали или
+        выключили). Без этой уборки они копились бы в таблице вечно.
+        """
+        t = self.table
+        with self.engine.begin() as conn:
+            now = conn.scalar(select(func.now()))
+            result = conn.execute(t.delete().where(or_(
+                t.c.replicator == self.replicator,
+                t.c.heartbeat_at < now - timedelta(seconds=ABANDONED_TTL))))
+        if result.rowcount:
+            logger.info("Removed %s stale rows from %s", result.rowcount, MERGES_TABLE)
+
+    def track(self, object_name: str) -> "_TrackedMerge":
+        """
+        Регистрирует начало merge и держит его до выхода из блока (то есть до коммита).
+
+        Отметку старта и вставку строки делаем в ОДНОЙ транзакции: иначе между «спросил время» и
+        «записался» помещается расчёт границы, который этого merge ещё не видит, а время берёт уже
+        более позднее — и строки merge оказались бы левее границы, но невидимыми.
+        """
+        row_id = f'{self.replicator}:{next(self._counter)}'
+        with self._lock:
+            self._active += 1
+        self._ensure_heartbeat()
+        with self.engine.begin() as conn:
+            started_at = _naive(conn.scalar(select(func.now())))
+            conn.execute(insert(self.table).values(
+                id=row_id, replicator=self.replicator, object_name=object_name,
+                started_at=started_at, heartbeat_at=started_at))
+        return _TrackedMerge(self, row_id, started_at)
+
+    def _remove(self, row_id: str) -> None:
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(self.table.delete().where(self.table.c.id == row_id))
+        finally:
+            with self._lock:
+                self._active -= 1
+
+    def boundary(self, object_names: Iterable[str]) -> datetime:
+        """Верхняя граница окна: минимум из «сейчас» и стартов живых незавершённых merge по этим
+        таблицам, чьи бы они ни были."""
+        t = self.table
+        with self.engine.connect() as conn:
+            now = _naive(conn.scalar(select(func.now())))
+            earliest = _naive(conn.scalar(
+                select(func.min(t.c.started_at))
+                .where(t.c.object_name.in_(list(object_names)),
+                       t.c.heartbeat_at > now - timedelta(seconds=HEARTBEAT_TTL))))
+        return min(now, earliest) if earliest is not None else now
+
+    def heartbeat(self) -> None:
+        """Продлевает жизнь своим строкам. Зовётся своим же потоком (см. _heartbeat_loop), пока в
+        реестре есть незавершённые merge этого процесса."""
+        with self.engine.begin() as conn:
+            conn.execute(update(self.table)
+                         .where(self.table.c.replicator == self.replicator)
+                         .values(heartbeat_at=func.now()))
+
+
+class HandlerSignals:
+    """
+    Сторона РЕПЛИКАТОРА: как он зовёт обработчиков, не зная о них ничего.
+
+    Обработчик при старте объявляет себя в handlers_1c и перечисляет в update_on таблицы, на
+    которые подписан. Репликатор перечитывает эту таблицу и, увидев изменение подписанной таблицы,
+    просто поднимает update_is_required. Дальше обработчик сам заметит флаг своим циклом.
+
+    Отсюда и берётся возможность разнести их как угодно: репликатору не нужны ни объекты
+    обработчиков, ни их импорт, ни общий с ними процесс — только общая БД. Обработчик может жить
+    в отдельном контейнере, его можно перезапускать и обновлять независимо.
+
+    Подписки кэшируются и перечитываются не чаще SUBSCRIPTIONS_TTL: они меняются только при
+    перезапуске обработчика, а читать их на каждый сохранённый объект — лишние запросы (при полной
+    выгрузке это запрос на страницу).
+    """
+
+    def __init__(self, engine: Engine, schema: str | None):
+        self.engine = engine
+        self.schema_name = _check_create_schema(engine, schema)
+        self.table = _handlers_table(MetaData(), self.schema_name)
+        # Таблицу заводит и репликатор тоже: обработчиков в этом процессе может не быть вовсе, а
+        # поднимать флаг всё равно надо — иначе первый же сигнал упал бы на отсутствующей таблице.
+        self.table.create(engine, checkfirst=True)
+        _add_missing_columns(engine, self.table)
+        self._lock = threading.Lock()
+        self._subscriptions: dict[str, list[str]] = {}
+        self._read_at = 0.0
+
+    def subscribers(self, object_name: str, source: str = SOURCE_CHANGES) -> list[str]:
+        """
+        Имена обработчиков, которых это изменение касается: подписаны на таблицу (update_on) и
+        согласны на такой источник (on_full_load).
+
+        Источник учитывается здесь, а не у обработчика: тот видит только флаг update_is_required и
+        по нему не может отличить бэкфилл от живого изменения. Поэтому обработчик объявляет своё
+        on_full_load в таблице, а решение принимает тот, кто флаг поднимает.
+        """
+        with self._lock:
+            if time.monotonic() - self._read_at > SUBSCRIPTIONS_TTL:
+                self._subscriptions = self._read_subscriptions()
+                self._read_at = time.monotonic()
+            subscribed = self._subscriptions.get(object_name, [])
+        if source == SOURCE_FULL_LOAD:
+            return [name for name, on_full_load in subscribed if on_full_load]
+        return [name for name, _ in subscribed]
+
+    def _read_subscriptions(self) -> dict[str, list[tuple[str, bool]]]:
+        """update_on всех включённых обработчиков, развёрнутый в отображение
+        таблица → [(имя, звать ли на полной выгрузке)]."""
+        t = self.table
+        subscriptions: dict[str, list[tuple[str, bool]]] = {}
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(t.c.name, t.c.update_on, t.c.on_full_load).where(t.c.enabled)).all()
+        for name, update_on, on_full_load in rows:
+            for object_name in update_on or ():
+                subscriptions.setdefault(object_name, []).append((name, bool(on_full_load)))
+        return subscriptions
+
+    def signal(self, object_name: str, source: str) -> None:
+        """Поднимает update_is_required подписчикам таблицы. Подписчиков нет — ничего не делаем."""
+        names = self.subscribers(object_name, source)
+        if not names:
+            return
+        with self.engine.begin() as conn:
+            conn.execute(update(self.table)
+                         .where(self.table.c.name.in_(names))
+                         .values(update_is_required=True))
+        logger.info("Changed %s (%s) → update requested for %s",
+                    object_name, source, ', '.join(sorted(names)))
+
+    def request_full_rebuild(self, object_name: str, reason: str) -> None:
+        """
+        Просит подписчиков таблицы собрать витрину заново: ставит full_rebuild_is_required.
+
+        Единственный автоматический повод — новая колонка в таблице объекта (added_fields из
+        dbmerge). Инкремент её появления не видит в принципе: окно строится по merged_on, а
+        merged_on двигается только у строк, у которых изменились ЗНАЧЕНИЯ; добавление колонки не
+        меняет ни одного значения, и все уже лежащие строки остаются левее окна навсегда.
+        """
+        names = self.subscribers(object_name)
+        if not names:
+            return
+        with self.engine.begin() as conn:
+            conn.execute(update(self.table)
+                         .where(self.table.c.name.in_(names))
+                         .values(full_rebuild_is_required=True))
+        logger.info("Changed %s (%s) → full rebuild requested for %s",
+                    object_name, reason, ', '.join(sorted(names)))
+
+
+class HandlerLoop:
+    """
+    Цикл ОДНОГО обработчика: его состояние, его очередь и его прогоны.
+
+    Один обработчик на цикл, а не список, — чтобы тяжёлая витрина не задерживала остальные:
+    циклы независимы и крутятся каждый в своём потоке. Плата за это — порядок вызова между обработчиками не определён, и
     два обработчика, пишущие в одну целевую таблицу, теперь могут делать это одновременно. Если
     витрина строится поверх другой витрины, полагаться на «сначала базовая» нельзя.
 
-    Очередь схлопывающая: сигнал — это не «запусти», а «объект стал грязным». Пока обработчик
-    считает, прилетевшие страницы помечают тот же объект ещё раз, а не выстраиваются в очередь из
-    тысячи вызовов; отработал — сразу забирает накопившееся. Поэтому сигналить можно на каждую
-    страницу полной выгрузки: витрина начинает наполняться после первой же страницы и догоняет
-    выгрузку с задержкой в один свой прогон.
+    Сигнал — булев флаг update_is_required в handlers_1c, а не очередь событий. Пока обработчик
+    считает, прилетевшие страницы поднимают тот же флаг ещё раз, а не выстраиваются в очередь из
+    тысячи вызовов. Поэтому репликатор может сигналить на каждую страницу полной выгрузки: витрина
+    начинает наполняться после первой же и догоняет выгрузку с задержкой в один свой прогон.
 
-    Поток отдельный (а не вызов прямо в цикле репликации) — чтобы обработчик не тормозил приём
+    Цикл отдельный (а не вызов прямо в цикле репликации) — чтобы обработчик не тормозил приём
     изменений: пакет не подтверждается в 1С до успешного save, копить отставание незачем.
-    Пользовательский код при этом никогда не исполняется в потоках полной выгрузки — они только
-    кладут сигнал.
+    Пользовательский код при этом никогда не исполняется в потоках репликатора — те только
+    поднимают флаг.
 
-    Раннер можно отдать нескольким репликаторам (несколько планов обмена — один обработчик):
-    start/stop считающие, поток гаснет с выходом последнего.
+    Планов обмена может быть сколько угодно: все репликаторы поднимают тот же флаг и публикуют свои
+    незавершённые merge в общую merges_in_process_1c, поэтому обработчику безразлично, кто его кормит.
     """
 
     def __init__(self, engine: Engine, schema: str | None, handler,
-                 merge_tracker: "MergeTracker | None" = None):
+                 merge_tracker: "SharedMergeTracker | None" = None):
+        # Перехват SIGTERM/SIGINT — по той же причине, что у Replicator1C: run_forever уходит в
+        # пул потоков, а поставить перехват можно только из главного (см. stop_signal).
+        install_signal_handlers(quiet=False)
         # Объявление разбирается и проверяется ДО первого обращения к БД: кривое (нет handle,
         # пустой ON, класс вместо экземпляра) должно ронять старт, не оставив за собой ни схемы,
         # ни строки состояния.
@@ -476,9 +710,8 @@ class HandlerRunner:
         self.engine = engine
         self.schema_name = _check_create_schema(engine, schema)
         self.schema = schema
-        # Реестр незавершённых merge. Обычно его отдаёт репликатор при подключении (attach_merges),
-        # и тогда он общий у всех раннеров и всех репликаторов — иначе граница окна не увидела бы
-        # merge соседа. Свой создаётся только для standalone-использования (тесты, ручной прогон).
+        # Реестр незавершённых merge. По умолчанию — общий, из таблицы merges_in_process_1c
+        # (см. свойство merges); подменяется только в тестах.
         self._merges = merge_tracker
 
         self.table = _handlers_table(MetaData(), self.schema_name)
@@ -496,168 +729,105 @@ class HandlerRunner:
         self._prepared = False
         # Когда обработчику снова можно бежать (MIN_INTERVAL), по монотонным часам.
         self._next_allowed_at = 0.0
-        self._wakeup = threading.Event()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        # Сколько репликаторов сейчас пользуются раннером (см. start/stop). Отдельный лок, а не
-        # общий с грязными отметками: stop дожидается потока, а тому для работы нужен _lock.
-        self._lifecycle_lock = threading.Lock()
-        self._users = 0
+        # Действующий StopSignal текущего run_forever — через него цикл останавливают снаружи.
+        self._stop_signal: "StopSignal | None" = None
 
     def __repr__(self) -> str:
-        return f'<HandlerRunner {self.name}>'
+        return f'<HandlerLoop {self.name}>'
 
     @property
-    def merges(self) -> MergeTracker:
-        """Реестр незавершённых merge. Свой создаётся лениво — только если раннер используют без
-        репликатора: обычно реестр приходит от него (см. attach_merges)."""
+    def merges(self):
+        """
+        Реестр незавершённых merge, по которому считается верхняя граница окна.
+
+        По умолчанию — общий, из таблицы merges_in_process_1c: обработчик обязан видеть merge ЛЮБОГО
+        репликатора, в том числе работающего в другом процессе или контейнере. Его незакоммиченные
+        строки имеют merged_on в прошлом, и граница, взятая как «сейчас», их бы перешагнула.
+        Подменяется только в тестах.
+        """
         if self._merges is None:
-            self._merges = MergeTracker(lambda: db_now(self.engine))
+            self._merges = SharedMergeTracker(self.engine, self.schema, f'handler:{self.name}')
         return self._merges
 
-    def attach_merges(self, merge_tracker: MergeTracker) -> None:
-        """
-        Присоединяет раннер к реестру merge репликатора.
-
-        Реестр обязан быть ОДНИМ на все раннеры и все репликаторы: граница окна обработчика
-        считается по незавершённым merge, и если репликатор пишет мимо этого реестра, его строки,
-        ещё не закоммиченные, окажутся левее записанной отметки — потеряются молча. Поэтому чужой
-        реестр не подменяется, а вызывает ошибку.
-        """
-        if self._merges is None or self._merges is merge_tracker:
-            self._merges = merge_tracker
-            return
-        raise ValueError(
-            f"Handler {self.name} is already attached to another MergeTracker. Replicators "
-            f"sharing handlers must share one: pass the same HandlerRunner objects to all of them")
-
     def _register_handler(self) -> None:
-        """Заводит строку состояния. Новый обработчик появляется с last_run_at=NULL, т.е. первым
-        прогоном обработает всё с начала времён."""
+        """
+        Объявляет себя в handlers_1c: заводит строку состояния и — главное — записывает в update_on
+        список таблиц, на которые подписан.
+
+        update_on пишется на КАЖДОМ старте, а не только при первой регистрации: подписка живёт в
+        коде обработчика (Handler1C.ON), и после её правки таблица обязана догнать код. Читает
+        update_on репликатор — так ему не нужны ни объекты обработчиков, ни их импорт, и обработчик
+        может работать в другом процессе или контейнере.
+
+        Новый обработчик появляется с last_run_at=NULL, т.е. первым прогоном обработает всё
+        с начала времён.
+        """
+        update_on = sorted(self.handler.on)
         with self.engine.begin() as conn:
             known = conn.scalar(select(self.table.c.name).where(self.table.c.name == self.name))
             if known is None:
                 conn.execute(insert(self.table).values(
-                    name=self.name, enabled=True, last_run_at=None, last_error=None))
+                    name=self.name, enabled=True, last_run_at=None, last_error=None,
+                    update_on=update_on, on_full_load=self.handler.on_full_load))
                 logger.info("Registered handler %s", self.name)
-        logger.info("Handler %s (on=%s, on_full_load=%s, min_interval=%ss)",
-                    self.name, sorted(self.handler.on), self.handler.on_full_load,
-                    self.handler.min_interval)
-
-    # --- сигналы -----------------------------------------------------------------------------
-
-    def signal(self, object_name: str, source: str) -> None:
-        """
-        Таблица изменилась в БД — пометить грязным и разбудить поток. Не подписан на неё — тихо
-        пропускаем.
-
-        Зовётся только когда merge реально что-то сделал: 1С регистрирует изменение объекта на
-        любую перезапись, и в пакет приезжает масса записей, идентичных тому, что уже лежит в БД.
-        Пустой прогон обработчику дал бы пустой SELECT — звать незачем.
-        """
-        if object_name not in self.handler.on:
-            return
-        if source == SOURCE_FULL_LOAD and not self.handler.on_full_load:
-            return
-        with self._lock:
-            self._dirty_objects.add(object_name)
-            self._dirty_sources.add(source)
-        logger.debug("Signal %s (%s) → %s", object_name, source, self.name)
-        self._wakeup.set()
-
-    def request_full_rebuild(self, object_name: str, reason: str) -> None:
-        """
-        Просит собрать витрину заново: ставит full_rebuild_is_required. Не подписан на объект —
-        ничего не делаем.
-
-        Единственный автоматический повод — новая колонка в таблице объекта (added_fields из
-        dbmerge). Инкремент её появления не видит в принципе: окно строится по merged_on, а
-        merged_on двигается только у строк, у которых изменились ЗНАЧЕНИЯ; добавление колонки не
-        меняет ни одного значения, и все уже лежащие строки остаются левее окна навсегда.
-        """
-        if object_name not in self.handler.on:
-            return
-        with self.engine.begin() as conn:
-            conn.execute(update(self.table).where(self.table.c.name == self.name)
-                         .values(full_rebuild_is_required=True))
-        logger.info("Full rebuild requested for %s (%s)", self.name, reason)
+            else:
+                conn.execute(update(self.table).where(self.table.c.name == self.name)
+                             .values(update_on=update_on,
+                                     on_full_load=self.handler.on_full_load))
+        logger.info("Handler %s (update_on=%s, on_full_load=%s, min_interval=%ss)",
+                    self.name, update_on, self.handler.on_full_load, self.handler.min_interval)
 
     # --- исполнение --------------------------------------------------------------------------
 
-    def is_running(self) -> bool:
-        """Работает ли поток исполнения (в режиме одиночного run_once его нет)."""
-        return self._thread is not None
-
-    def start(self) -> None:
+    def run_forever(self, poll_interval: float = IDLE_POLL) -> None:
         """
-        Заявляет о себе как о пользователе раннера: поток поднимается на первом вызове, дальше
-        вызовы только увеличивают счётчик.
+        Блокирующий цикл обработчика — та же форма, что у Replicator1C.run_forever: где ему
+        крутиться, решает точка входа, а не библиотека.
 
-        Счётчик, а не флаг, потому что раннер может быть общим у нескольких репликаторов (несколько
-        планов обмена — один обработчик). Каждый из них делает одно и то же на входе в run_forever
-        и на выходе; «владельца», который один имеет право гасить поток, нет. Иначе завершение
-        одного репликатора оборвало бы обработчика остальным, причём молча: соседи продолжают
-        принимать изменения и копить грязные отметки, а разбирать их уже некому.
+        Опрос, а не ожидание события: сигнал приходит флагом в handlers_1c, поднять его может любой
+        процесс, и подписаться на такое изменение нечем. Заодно опрос сам подхватывает всё
+        остальное, что меняется в таблице снаружи, — enabled, заказ пересборки, обнулённую отметку.
 
-        Под локом здесь не арифметика счётчика, а связка «посчитать → проверить → создать»: без
-        неё два одновременных start могут оба увидеть отсутствие потока и завести по своему,
-        а два потока на один обработчик — это параллельные merge в одну целевую таблицу.
+        Останавливается по SIGTERM/SIGINT (перехват процессный, см. stop_signal) либо точечно через
+        request_stop(). Текущий прогон при этом доработает: цикл прерывается между прогонами, а не
+        посреди merge.
         """
-        with self._lifecycle_lock:
-            self._users += 1
-            if self._thread is not None:
-                return
-            self._stop.clear()
-            self._thread = threading.Thread(target=self._loop, name=f'handler:{self.name}',
-                                            daemon=True)
-            self._thread.start()
-
-    def stop(self, timeout: float | None = None) -> None:
-        """
-        Снимает свою заявку. Когда уходит последний пользователь, поток получает команду на выход
-        и дожидается ТЕКУЩЕГО прогона — он не обрывается на середине merge.
-
-        Пока остаётся хоть один пользователь, поток продолжает работать: репликатор, закончившийся
-        по max_iterations, не должен глушить обработчика соседу.
-        """
-        with self._lifecycle_lock:
-            if self._users == 0:
-                return
-            self._users -= 1
-            if self._users > 0 or self._thread is None:
-                return
-            self._stop.set()
-            self._wakeup.set()
-            self._thread.join(timeout)
-            self._thread = None
-
-    def _loop(self) -> None:
+        stop = StopSignal()
+        self._stop_signal = stop
         with load_mode(LOAD_MODE_HANDLER):
-            logger.info("Handler %s thread started", self.name)
-            while not self._stop.is_set():
-                # Событие сбрасываем ДО прогона: сигналы, пришедшие во время работы обработчика,
-                # взведут его снова и не потеряются (набор грязных объектов у них общий).
-                self._wakeup.clear()
+            logger.info("Handler %s started", self.name)
+            while not stop.requested:
                 try:
                     self.run_if_pending()
                 except Exception:
                     logger.exception("Handler %s dispatch failed", self.name)
-                # Ждём сигнала, но с таймаутом: прогон могли отложить MIN_INTERVAL или ещё не
-                # отпустившая граница окна — их наступление событием не сообщается.
-                self._wakeup.wait(IDLE_POLL)
-            logger.info("Handler %s thread stopped", self.name)
+                stop.wait(poll_interval)
+            logger.info("Handler %s stopped", self.name)
+
+    def request_stop(self) -> None:
+        """Просит идущий run_forever завершиться после текущего прогона — то же, что SIGTERM, но
+        программно. Нужна циклу в рабочем потоке: своего перехвата сигналов у него нет."""
+        if self._stop_signal is not None:
+            self._stop_signal.requested = True
 
     def run_if_pending(self) -> None:
         """
-        Прогон, если обработчик ждёт запуска. Публичный: в режиме одиночного run_once отдельного
-        потока нет, и репликатор вызывает этот метод синхронно.
+        Один оборот цикла: прогон, если обработчик ждёт запуска, иначе ничего.
+
+        Публичный, потому что цикл — не единственный способ его крутить: обработчика можно
+        запускать и по расписанию снаружи (cron, вызов из своего кода), не поднимая run_forever.
         """
-        enabled, last_run_at, full_rebuild = self._read_state()
+        enabled, last_run_at, full_rebuild, update_required = self._read_state()
         if not enabled:
             # Выключен в таблице — грязные отметки не копим, иначе после включения он получит
             # окно, накопленное за всё время простоя, и посчитает его одним прогоном.
             self._take_dirty()
             return
+        if update_required:
+            # Репликатор увидел изменение подписанной таблицы и поднял флаг. Какая именно таблица —
+            # не важно: выбирать данные всё равно по окну. Флаг снимется вместе с записью
+            # last_run_at, и только при успехе (см. _save_success).
+            self._mark_dirty(set(self.handler.on), {SOURCE_DB_SIGNAL})
         if full_rebuild:
             # Заказ пересборки сам ставит обработчик в очередь. Иначе он бы дожидался сигнала
             # об изменении подписанных объектов, а изменений может не быть неделями — флаг,
@@ -665,20 +835,24 @@ class HandlerRunner:
             self._mark_dirty(set(self.handler.on), {SOURCE_REBUILD})
         if time.monotonic() < self._next_allowed_at:
             return
-        self._run(last_run_at, full_rebuild)
+        self._run(last_run_at, full_rebuild, update_required)
 
-    def _read_state(self) -> tuple[bool, datetime | None, bool]:
-        """Состояние обработчика из БД: (включён, last_run_at, заказана ли пересборка).
-        Читается на каждый проход — все три меняются снаружи, руками или чужим процессом."""
+    def _read_state(self) -> tuple[bool, datetime | None, bool, bool]:
+        """Состояние обработчика из БД: (включён, last_run_at, заказана ли пересборка, ждёт ли
+        обновления). Читается на каждый проход — всё это меняется снаружи: руками, репликатором
+        или чужим процессом."""
         t = self.table
         with self.engine.connect() as conn:
-            row = conn.execute(select(t.c.enabled, t.c.last_run_at, t.c.full_rebuild_is_required)
+            row = conn.execute(select(t.c.enabled, t.c.last_run_at, t.c.full_rebuild_is_required,
+                                      t.c.update_is_required)
                                .where(t.c.name == self.name)).first()
         if row is None:
-            return False, None, False
-        return bool(row.enabled), row.last_run_at, bool(row.full_rebuild_is_required)
+            return False, None, False, False
+        return (bool(row.enabled), row.last_run_at, bool(row.full_rebuild_is_required),
+                bool(row.update_is_required))
 
-    def _run(self, last_run_at: datetime | None, full_rebuild_requested: bool) -> None:
+    def _run(self, last_run_at: datetime | None, full_rebuild_requested: bool,
+             update_requested: bool = False) -> None:
         # Грязные отметки забираем ПЕРЕД расчётом границы, а не после: сигнал приходит уже после
         # коммита своего merge, поэтому всё, что не попало в это окно, пришлёт сигнал позже и
         # взведёт обработчик заново. В обратном порядке такой сигнал мог бы быть съеден вместе со
@@ -735,7 +909,7 @@ class HandlerRunner:
             # обработчика, окажется правее неё и попадёт в следующее окно, а не потеряется.
             elapsed = time.monotonic() - started
             if self._save_success(boundary, last_run_at, full_rebuild_requested,
-                                  full_rebuild, elapsed):
+                                  full_rebuild, elapsed, update_requested):
                 logger.info("Handler %s finished in %.1fs (objects=%s)",
                             self.name, elapsed, sorted(objects))
             else:
@@ -767,7 +941,8 @@ class HandlerRunner:
             self._dirty_sources |= sources
 
     def _save_success(self, boundary: datetime, expected_last_run_at: datetime | None,
-                      expected_rebuild: bool, full_rebuild: bool, elapsed: float) -> bool:
+                      expected_rebuild: bool, full_rebuild: bool, elapsed: float,
+                      update_requested: bool = False) -> bool:
         """
         Двигает отметку обработчика — но только если его состояние не поменяли снаружи, пока он
         работал (`expected_*` — значения, с которыми он стартовал). False, если не сдвинул.
@@ -788,6 +963,12 @@ class HandlerRunner:
         unchanged = (t.c.last_run_at.is_(None) if expected_last_run_at is None
                      else t.c.last_run_at == expected_last_run_at)
         values = {'last_run_at': boundary, 'last_error': None}
+        if update_requested:
+            # Флаг снимаем только вместе с успешной отметкой: упавший прогон должен остаться
+            # «ждущим обновления», иначе изменение, о котором сообщил репликатор, потерялось бы.
+            # Сигналы, пришедшие за время прогона, не теряются — они поднимут флаг заново, и
+            # условие ниже (update_is_required == expected) их не даст затереть.
+            values['update_is_required'] = False
         if full_rebuild:
             values.update(full_rebuild_is_required=False, last_full_rebuild_dt=func.now(),
                           last_full_rebuild_minutes=round(elapsed / 60, 3))
@@ -795,7 +976,8 @@ class HandlerRunner:
             result = conn.execute(
                 update(t)
                 .where(t.c.name == self.name, unchanged,
-                       t.c.full_rebuild_is_required == expected_rebuild)
+                       t.c.full_rebuild_is_required == expected_rebuild,
+                       t.c.update_is_required == update_requested)
                 .values(**values))
         return result.rowcount > 0
 

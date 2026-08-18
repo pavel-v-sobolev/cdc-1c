@@ -1,6 +1,7 @@
 """
 Живой smoke-тест Replicator1C против реального сервера 1С (тестовая база торговли) и
-dev-Postgres. Параметры подключения — те же, что в debug.py.
+dev-Postgres. Параметры подключения берутся из debug.py — там они и правятся, чтобы контуры не
+разъезжались (раньше здесь стояла своя копия, и адрес 1С успел разойтись с отладочным).
 
 Гоняет полный цикл Replicator1C.run_once(notify_changes=False): read → save БЕЗ notify, чтобы
 не списывать изменения из очереди обмена 1С и оставить прогон повторяемым. Проверяет, что
@@ -17,15 +18,8 @@ from sqlalchemy import create_engine, inspect
 
 from cdc_1c import Replicator1C
 
-# Параметры из debug.py — тестовый/dev-контур, не боевой.
-ODATA_URL = "http://192.168.56.101/trade_demo/odata/standard.odata"
-ODATA_USER = "admin"
-ODATA_PASSWORD = "admin"
-EXCHANGE_NAME = "ДляODATA"
-QUEUE_GUID = "a9bc23c5-3689-11f1-926c-0800270bc6cb"
-DB_URL = "postgresql+psycopg2://postgres:postgres@localhost:5432/cdc_1c"
-DB_SCHEMA = "cdc_1c_trade_demo"
-
+# Тестовый/dev-контур, не боевой (debug.py лежит рядом и импортируется как обычный модуль).
+from debug import DB_SCHEMA, DB_URL, EXCHANGE_NAME, ODATA_AUTH, ODATA_URL, QUEUE_GUID
 
 
 @pytest.mark.integration
@@ -33,7 +27,7 @@ def test_run_once_against_live_1c():
 
     repl = Replicator1C(
         odata_url=ODATA_URL,
-        odata_auth=(ODATA_USER, ODATA_PASSWORD),
+        odata_auth=ODATA_AUTH,
         exchange_name=EXCHANGE_NAME,
         queue_guid=QUEUE_GUID,
         engine=create_engine(DB_URL),

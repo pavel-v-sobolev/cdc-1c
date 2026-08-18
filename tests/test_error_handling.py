@@ -8,7 +8,6 @@ import logging
 
 import pytest
 import requests
-from sqlalchemy import create_engine
 
 from cdc_1c import Replicator1C
 from cdc_1c.common_functions import MAX_ERROR_BODY_CHARS, extract_error_text, raise_for_status
@@ -168,7 +167,7 @@ def _run_and_collect_delays(db, monkeypatch, error: Exception, waits: int, inter
         raise error
 
     monkeypatch.setattr(repl, 'run_once', fake_run_once)
-    monkeypatch.setattr('cdc_1c.replicator._StopSignal.wait', lambda self, d: delays.append(d))
+    monkeypatch.setattr('cdc_1c.stop_signal.StopSignal.wait', lambda self, d: delays.append(d))
     repl.run_forever(interval=interval, max_iterations=waits + 1)
     return delays
 
@@ -207,7 +206,7 @@ def test_backoff_resets_after_success(db, monkeypatch):
 
     monkeypatch.setattr(repl, 'run_once', flaky_run_once)
     monkeypatch.setattr(repl, '_dispatch_full_loads', lambda executor: None)
-    monkeypatch.setattr('cdc_1c.replicator._StopSignal.wait', lambda self, d: delays.append(d))
+    monkeypatch.setattr('cdc_1c.stop_signal.StopSignal.wait', lambda self, d: delays.append(d))
     repl.run_forever(interval=60.0, max_iterations=4)
 
     assert delays == [120.0, 240.0, 60.0]
