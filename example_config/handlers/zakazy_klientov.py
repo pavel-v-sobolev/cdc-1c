@@ -130,7 +130,7 @@ class ZakazyKlientov(Handler1C):
                     source_condition=and_(period >= begin, period < end),
                     delete_condition=and_(target_period >= begin, target_period < end))
 
-            context.logger.info("Витрина пересобрана за %s", label)
+            context.logger.info("Data Mart updated for %s", label)
             yield label
 
     def handle(self, context):
@@ -199,5 +199,6 @@ class ZakazyKlientov(Handler1C):
             #  - индекс по колонке соединения со справочником (Nomenklatura_Key) — репликатор
             #    заводит только merged_on, поэтому этот индекс создаётся в setup().
 
-        context.logger.info("Витрина обновлена за окно (%s, %s]",
-                            self.since(context), context.boundary)
+        context.logger.info(
+            f'Data Mart changes applied since {self.since(context)}; '
+            f'Next run will apply since {context.boundary}')
