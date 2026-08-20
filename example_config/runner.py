@@ -1,5 +1,5 @@
 """
-Точка входа: здесь собирается всё — подключения, параметры цикла и список обработчиков.
+Точка входа: здесь собирается всё — подключения, параметры цикла и сами обработчики.
 
 Запускается как обычный скрипт: `python runner.py`. Пакет handlers/ лежит рядом — Python кладёт
 каталог скрипта в sys.path, поэтому импорт ниже его находит.
@@ -16,8 +16,10 @@
 базовой» полагаться нельзя.
 
 Репликатор обработчиков не запускает и о них не знает: сигналы идут через таблицу handlers_1c.
-Здесь они просто живут в одном процессе с ним — так проще. Нужно разнести по контейнерам —
-берите runner_handlers.py, менять в обработчиках ничего не придётся.
+Здесь они просто живут в одном процессе с ним — так проще. Отсюда и обе другие раскладки, каждая
+правкой этого файла: разнести по контейнерам — убрать репликатор, останутся одни циклы обработчиков;
+несколько планов обмена — завести второй Replicator1C и отправить его в тот же пул. В самих
+обработчиках при этом не меняется ничего.
 
 Запускаются все одинаково: у репликатора и у обработчика блокирующий run_forever, и оба уходят
 в пул потоков. Останавливает всех SIGTERM.
@@ -64,12 +66,10 @@ replicator = Replicator1C(
 )
 
 with ThreadPoolExecutor(max_workers=3, thread_name_prefix='cdc') as pool:
-    replicator_loop = pool.submit(replicator.run_forever, interval=POLL_INTERVAL)
-    zakazy_klientov_loop = pool.submit(handler_zakazy_klientov.run_forever)
-    zakazy_klientov_grouped_loop = pool.submit(handler_zakazy_klientov_grouped.run_forever)
+    replicator_task = pool.submit(replicator.run_forever, interval=POLL_INTERVAL)
+    zakazy_klientov_task = pool.submit(handler_zakazy_klientov.run_forever)
+    zakazy_klientov_grouped_task = pool.submit(handler_zakazy_klientov_grouped.run_forever)
 
-    # Результат забираем обязательно: исключение, с которым цикл упал, иначе осталось бы лежать
-    # внутри задачи непрочитанным, и процесс молча продолжил бы работать остальными.
-    replicator_loop.result()
-    zakazy_klientov_loop.result()
-    zakazy_klientov_grouped_loop.result()
+    replicator_task.result()
+    zakazy_klientov_task.result()
+    zakazy_klientov_grouped_task.result()
