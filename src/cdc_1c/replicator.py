@@ -14,7 +14,7 @@ from cdc_1c.change_reader import ChangeReader1C
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.db_writer import DBWriter1C, save_order_key
 from cdc_1c.db_logs import Replicator1CLog, LOAD_TYPE_CHANGES, LOAD_TYPE_FULL
-from cdc_1c.handlers import (HandlerSignals, SharedMergeTracker,
+from cdc_1c.handlers import (HandlerSignals, WriteTracker,
                              SOURCE_CHANGES, SOURCE_FULL_LOAD)
 from cdc_1c.stop_signal import StopSignal, install_signal_handlers
 from cdc_1c.logging_config import _ensure_handler, get_logger, load_mode, LOAD_MODE_CHANGES, LOAD_MODE_FULL
@@ -165,7 +165,7 @@ class Replicator1C:
 
         # Реестр идущих merge — в БД, а не в памяти: обработчик может считать витрину в другом
         # процессе, и границу своего окна он обязан прижимать к НАШИМ незавершённым merge.
-        self.merges = SharedMergeTracker(self.engine, self.db_schema, self._exchange_name)
+        self.writes = WriteTracker(self.engine, self.db_schema, self._exchange_name)
         # Сигналы обработчикам идут через handlers_1c, а не через объекты: репликатору не нужны
         # ни их код, ни общий с ними процесс (см. HandlerSignals).
         self.handler_signals = HandlerSignals(self.engine, self.db_schema)
@@ -242,7 +242,7 @@ class Replicator1C:
             log_id = self.replicator_log.start(
                 self.changes.exchange_name, object_name, self.changes.message_no, LOAD_TYPE_CHANGES)
             table_name = self._handler_key(object_name)
-            with self.merges.track(table_name):
+            with self.writes.track(table_name):
                 result = self.writer.save(object_name, data_object)
             # Одно сохранение на строку лога: счётчики и завершение — одним запросом.
             self.replicator_log.write_result(log_id, result, finish=True)
@@ -376,7 +376,7 @@ class Replicator1C:
             for obj_name, data_object in reader.items():
                 # Много страниц/объектов пишутся в одну строку лога — счётчики суммируются в БД.
                 table_name = self._handler_key(obj_name)
-                with self.merges.track(table_name):
+                with self.writes.track(table_name):
                     result = self.writer.save(obj_name, data_object, full_load_started_at=started_at)
                 self.replicator_log.write_result(log_id, result)
                 rows_modified += _rows_modified(result)
@@ -538,7 +538,7 @@ class Replicator1C:
         self._stop_signal = stop
         logger.info("Starting replication loop (interval=%ss, max_iterations=%s, timeout=%ss)",
                     interval, max_iterations, self._request_timeout)
-        # Отметку живости незавершённых merge ведёт сам реестр (SharedMergeTracker), а не этот
+        # Отметку живости незавершённых merge ведёт сам реестр (WriteTracker), а не этот
         # цикл: строки появляются и в одиночном run_once, и в вызванном руками full_load, где
         # никакого цикла нет.
         self._replication_loop(stop, interval, max_iterations, max_backoff)

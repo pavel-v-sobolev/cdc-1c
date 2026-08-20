@@ -2,11 +2,12 @@
 from datetime import datetime
 
 from sqlalchemy import (Engine, Index, MetaData, Table, Integer, Numeric,
-                        tuple_, select, or_, and_, exists, func)
+                        tuple_, select, or_, and_, exists)
 from dbmerge import dbmerge, mergeResult
 
 from cdc_1c.data_reader import (DataObject1C, EXCHANGE_MESSAGE_NO_FIELD,
                                 IS_DELETED_OR_EMPTY_FIELD, VERSION_FIELDS)
+from cdc_1c.common_functions import DB_NOW_WITHOUT_TIMEZONE
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.logging_config import get_logger
 
@@ -186,16 +187,10 @@ class DBWriter1C:
         merged_on, который dbmerge штампует тем же now(). Вызывать один раз на прогон, до чтения
         первой страницы: старт заведомо раньше любого чтения, поэтому guard защищает с запасом.
 
-        Отметка возвращается БЕЗ часового пояса. PostgreSQL now() отдаёт timestamptz, то есть
-        offset-aware datetime, а merged_on и handlers_1c.last_run_at лежат в колонках без часового
-        пояса и читаются offset-naive. Сравнить их в Python нельзя — «can't compare offset-naive and
-        offset-aware datetimes», — а сравнивает их как раз HandlerLoop (boundary против
-        last_run_at). Смещение отбрасываем, а не приводим к UTC: драйвер уже перевёл значение в
-        часовой пояс сессии, и ровно так же PostgreSQL приводит timestamptz к timestamp при записи.
+        Отметка возвращается БЕЗ часового пояса — см. DB_NOW_WITHOUT_TIMEZONE.
         """
         with self.engine.connect() as conn:
-            value = conn.scalar(select(func.now()))
-        return value.replace(tzinfo=None) if getattr(value, 'tzinfo', None) else value
+            return conn.scalar(select(DB_NOW_WITHOUT_TIMEZONE))
 
     # Guard'ы полной выгрузки по merged_on. Смысл один на все три: снимок читается долго и к моменту
     # записи может устареть, поэтому он не трогает то, что переписали уже после старта его прогона.

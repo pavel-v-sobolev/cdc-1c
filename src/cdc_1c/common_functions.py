@@ -2,10 +2,23 @@ import json
 import re
 
 import requests
+from sqlalchemy import DateTime, func
 
 from cdc_1c.logging_config import get_logger
 
 ODATA_PREFIX = 'StandardODATA.'
+
+# Часы БД без часового пояса. Просто now() не годится: PostgreSQL отдаёт timestamptz, драйвер —
+# offset-aware datetime, а merged_on, started_at и handlers_1c.last_run_at лежат в колонках без
+# пояса и читаются offset-naive. Сравнить такие значения в Python нельзя — «can't compare
+# offset-naive and offset-aware datetimes», — а сравниваются они постоянно (граница окна против
+# last_run_at, guard'ы полной выгрузки против merged_on).
+#
+# Приведение делает сама БД, а не Python: там же, где живут эти часы, и ровно так же, как при
+# записи timestamptz в колонку timestamp — перевод в часовой пояс сессии, затем отбрасывание
+# смещения. Значение при этом не меняется, меняется только его тип.
+DB_NOW_WITHOUT_TIMEZONE = func.now().cast(DateTime)
+
 
 logger = get_logger(__name__)
 

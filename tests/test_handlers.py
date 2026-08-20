@@ -12,15 +12,15 @@
 
 import time
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 import pytest
 from dbmerge import mergeResult
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from cdc_1c import Handler1C
-from cdc_1c.handlers import (SOURCE_CHANGES, SOURCE_DB_SIGNAL, SOURCE_FULL_LOAD, HandlerLoop,
-                             HandlerSignals, SharedMergeTracker, as_handler)
+from cdc_1c.handlers import (EPOCH, SOURCE_CHANGES, SOURCE_DB_SIGNAL, SOURCE_FULL_LOAD, HandlerLoop,
+                             HandlerSignals, WriteTracker, as_handler)
 from cdc_1c.name_mapper import NameMapper1C
 
 
@@ -51,7 +51,7 @@ class Spy(Handler1C):
 def _runner(db, handler):
     """HandlerLoop на одного обработчика — как в боевом коде, с настоящим реестром merge."""
     runner = HandlerLoop(engine=db.engine, schema=db.schema, handler=handler)
-    return runner, runner.merges
+    return runner, runner.writes
 
 
 def _replicator(db, exchange="План", **kwargs):
@@ -144,34 +144,27 @@ def test_handlers_are_signalled_by_table_name(db, monkeypatch):
 
 
 def test_db_now_drops_the_time_zone(db):
-    # PostgreSQL now() отдаёт timestamptz, драйвер — offset-aware datetime. А merged_on и
-    # handlers_1c.last_run_at лежат в колонках без часового пояса и читаются offset-naive.
-    # Сравнить их в Python нельзя, и HandlerLoop падал на boundary <= last_run_at с
-    # «can't compare offset-naive and offset-aware datetimes».
+    # PostgreSQL now() отдаёт timestamptz, драйвер — offset-aware datetime. А merged_on, started_at
+    # и handlers_1c.last_run_at лежат в колонках без пояса и читаются offset-naive. Сравнить их в
+    # Python нельзя, и HandlerLoop падал на boundary <= last_run_at с «can't compare offset-naive
+    # and offset-aware datetimes». Приведение делает сама БД (DB_NOW_WITHOUT_TIMEZONE).
     from cdc_1c.db_writer import DBWriter1C
 
-    aware = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=3)))
+    with db.engine.connect() as conn:
+        aware = conn.scalar(select(func.now()))
+    assert aware.tzinfo is not None, 'иначе тест ничего не проверяет'
 
-    class _Conn:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def scalar(self, _statement):
-            return aware
-
-    class _Engine:
-        def connect(self):
-            return _Conn()
-
-    writer = DBWriter1C(engine=_Engine(), name_mapper=NameMapper1C())
-    now = writer.db_now()
-
+    now = DBWriter1C(engine=db.engine, name_mapper=NameMapper1C(), schema=db.schema).db_now()
     assert now.tzinfo is None
-    assert now == aware.replace(tzinfo=None), 'смещение отбрасываем, а не переводим в UTC'
-    assert now > datetime(2026, 1, 1), 'сравнение с naive-отметкой больше не падает'
+    assert now == aware.replace(tzinfo=None).replace(microsecond=now.microsecond), \
+        'смещение отбрасываем, а не переводим в UTC'
+
+    # И граница окна сравнивается с отметкой из колонки без пояса, ничего не роняя.
+    tracker = WriteTracker(db.engine, db.schema, 'План1')
+    try:
+        assert tracker.boundary(["Catalog_X"]) > EPOCH
+    finally:
+        tracker.close()
 
 
 def test_failure_before_handle_keeps_the_handler_in_the_queue(db):
@@ -184,7 +177,7 @@ def test_failure_before_handle_keeps_the_handler_in_the_queue(db):
 
     spy = Spy()
     runner, _ = _runner(db, spy)
-    runner._merges = BrokenMerges()
+    runner._writes = BrokenMerges()
 
     runner.run_if_pending()
 
@@ -372,12 +365,19 @@ def test_handler_waits_when_window_would_be_inverted(db):
 
 
 def test_failed_handler_keeps_window_and_records_error(db):
-    spy = Spy(fail=True)
+    spy = Spy()
     runner, _ = _runner(db, spy)
+    runner.run_if_pending()          # первый прогон — пересборка, она проходит
+    before = _last_run_at(runner, spy.name)
+    spy.calls.clear()
+
+    spy.fail = True
+    _signal(db, "Catalog_X", SOURCE_CHANGES)
+    runner._next_allowed_at = 0.0
     runner.run_if_pending()
 
     assert len(spy.calls) == 1
-    assert _last_run_at(runner, spy.name) is None, 'упавший обработчик окно не двигает'
+    assert _last_run_at(runner, spy.name) == before, 'упавший обработчик окно не двигает'
     with runner.engine.connect() as conn:
         error = conn.execute(select(runner.table.c.last_error)
                              .where(runner.table.c.name == spy.name)).scalar()
@@ -481,8 +481,10 @@ def test_full_rebuild_requested_during_a_run_is_not_lost(db):
     assert state.last_run_at == before, 'граница не сдвинулась — прогон будет повторён'
 
     runner.handler = original
+    spy.calls.clear()
     runner.run_if_pending()
-    assert spy.calls[-1].last_run_at is None, 'и следующий прогон идёт с начала времён'
+    assert spy.calls[0].last_run_at is None, 'и следующий прогон идёт с начала времён'
+    assert spy.calls[0].full_rebuild is True
 
 
 def test_replicator_signals_only_on_real_changes(db, monkeypatch):
@@ -536,7 +538,7 @@ def test_signals_from_several_replicators_reach_one_handler(db):
     assert not _state(runner, spy.name).update_is_required, 'флаг снят успешным прогоном'
 
 
-def test_boundary_covers_merges_of_another_process(db):
+def test_boundary_covers_writes_of_another_process(db):
     # Главная гарантия всей затеи: незакоммиченный merge ЧУЖОГО репликатора прижимает границу окна
     # обработчику. Иначе строки этого merge, у которых merged_on уже в прошлом, оказались бы левее
     # записанной отметки и потерялись бы молча. Реестр общий, потому что лежит в БД, — обработчик
@@ -551,7 +553,7 @@ def test_boundary_covers_merges_of_another_process(db):
     spy.calls.clear()
 
     rep2._signal_handlers("Document_ZakazKlienta", _result(updated=1), SOURCE_CHANGES)
-    with rep1.merges.track("Catalog_Nomenklatura") as merge:
+    with rep1.writes.track("Catalog_Nomenklatura") as merge:
         runner.run_if_pending()
     assert spy.calls[0].boundary == merge.started_at
 
@@ -659,9 +661,9 @@ def test_update_flag_survives_a_failed_run(db):
 def test_dead_replicator_does_not_freeze_the_boundary(db):
     # Строки брошенного процесса не должны морозить границу навсегда: раз процесса нет, его
     # транзакции откатились. Отсекаем по отметке живости.
-    from cdc_1c.handlers import HEARTBEAT_TTL, SharedMergeTracker
+    from cdc_1c.handlers import HEARTBEAT_TTL, WriteTracker
 
-    tracker = SharedMergeTracker(db.engine, db.schema, 'dead-replicator')
+    tracker = WriteTracker(db.engine, db.schema, 'dead-replicator')
     tracked = tracker.track("Catalog_Nomenklatura")
     assert tracker.boundary(["Catalog_Nomenklatura"]) == tracked.started_at
 
@@ -676,35 +678,35 @@ def test_dead_replicator_does_not_freeze_the_boundary(db):
 def test_abandoned_rows_of_a_gone_replicator_are_removed(db):
     # Брошенные строки при расчёте границы игнорируются, но удалить их некому: процесс может не
     # вернуться никогда — репликатор переименовали или выключили. Иначе они копились бы вечно.
-    from cdc_1c.handlers import ABANDONED_TTL, SharedMergeTracker
+    from cdc_1c.handlers import ABANDONED_TTL, WriteTracker
 
-    gone = SharedMergeTracker(db.engine, db.schema, 'renamed-away')
+    gone = WriteTracker(db.engine, db.schema, 'renamed-away')
     tracked = gone.track("Catalog_Nomenklatura")
     with db.engine.begin() as conn:
         conn.execute(gone.table.update().values(
             heartbeat_at=tracked.started_at - timedelta(seconds=ABANDONED_TTL + 60)))
 
     # Уборка идёт при старте любого другого трекера — своего процесса у брошенного уже нет.
-    SharedMergeTracker(db.engine, db.schema, 'План1')
+    WriteTracker(db.engine, db.schema, 'План1')
     with db.engine.connect() as conn:
         assert conn.execute(select(gone.table)).all() == []
 
 
-def test_restart_forgets_own_stale_merges(db):
+def test_restart_forgets_own_stale_writes(db):
     # Свои строки от прошлого запуска чистим сразу: ждать по ним TTL после каждого рестарта незачем.
-    from cdc_1c.handlers import SharedMergeTracker
+    from cdc_1c.handlers import WriteTracker
 
     def own_rows(tracker):
         with db.engine.connect() as conn:
             return conn.execute(select(tracker.table)
-                                .where(tracker.table.c.replicator == tracker.replicator)).all()
+                                .where(tracker.table.c.owner == tracker.owner)).all()
 
-    tracker = SharedMergeTracker(db.engine, db.schema, 'План1')
+    tracker = WriteTracker(db.engine, db.schema, 'План1')
     try:
         tracker.track("Catalog_Nomenklatura")
         assert own_rows(tracker)
 
-        restarted = SharedMergeTracker(db.engine, db.schema, 'План1')
+        restarted = WriteTracker(db.engine, db.schema, 'План1')
         assert own_rows(restarted) == []
         assert restarted.boundary(["Catalog_Nomenklatura"]) is not None
     finally:
@@ -719,7 +721,7 @@ def test_merge_heartbeat_works_without_a_replication_loop(db, monkeypatch):
     from cdc_1c.handlers import HEARTBEAT_TTL
 
     monkeypatch.setattr(handlers_module, 'HEARTBEAT_PERIOD', 0.05)
-    tracker = SharedMergeTracker(db.engine, db.schema, 'План1')
+    tracker = WriteTracker(db.engine, db.schema, 'План1')
     try:
         with tracker.track("Catalog_Nomenklatura") as tracked:
             # Отматываем отметку далеко в прошлое: если её никто не обновляет, merge считается
@@ -753,7 +755,7 @@ def test_heartbeat_thread_is_started_once(db, monkeypatch):
     from cdc_1c import handlers as handlers_module
 
     monkeypatch.setattr(handlers_module, 'HEARTBEAT_PERIOD', 0.05)
-    tracker = SharedMergeTracker(db.engine, db.schema, 'План1')
+    tracker = WriteTracker(db.engine, db.schema, 'План1')
     started = threading.Barrier(4)
 
     def track_one():
@@ -786,7 +788,7 @@ def test_the_heartbeat_thread_goes_away_when_nothing_is_in_flight(db, monkeypatc
     from cdc_1c import handlers as handlers_module
 
     monkeypatch.setattr(handlers_module, 'HEARTBEAT_PERIOD', 0.01)
-    tracker = SharedMergeTracker(db.engine, db.schema, 'План1')
+    tracker = WriteTracker(db.engine, db.schema, 'План1')
     try:
         with tracker.track("Catalog_Nomenklatura"):
             assert tracker._heartbeat_thread is not None
@@ -823,3 +825,133 @@ def test_constructors_install_signal_handlers(db, monkeypatch):
     finally:
         for sig, previous_handler in previous.items():
             signal_module.signal(sig, previous_handler)
+
+
+class BlockSpy(Handler1C):
+    """Обработчик с пересборкой по блокам: три года, по блоку на год."""
+
+    ON = ["Catalog_X"]
+    BLOCKS = ['2024', '2025', '2026']
+
+    def __init__(self, name=None, fail_at=None):
+        super().__init__(name)
+        self.fail_at = fail_at
+        self.calls = []          # контексты обычных прогонов
+        self.blocks = []         # метки завершённых блоков
+        self.rebuild_from = []   # с чем пришла каждая пересборка
+
+    def handle(self, context):
+        self.calls.append(context)
+
+    def rebuild(self, context):
+        self.rebuild_from.append(context.rebuild_from)
+        for label in self.BLOCKS:
+            if context.rebuild_from and label <= context.rebuild_from:
+                continue
+            if label == self.fail_at:
+                raise RuntimeError(f'block {label} failed on purpose')
+            self.blocks.append(label)
+            yield label
+
+
+def test_rebuild_goes_block_by_block(db):
+    # Смысл всей затеи: пересборка нарезана обработчиком, и библиотека идёт по его блокам.
+    spy = BlockSpy()
+    runner = _runner_for(db, spy)
+    runner.run_if_pending()
+
+    assert spy.blocks == ['2024', '2025', '2026']
+    assert spy.rebuild_from == [None], 'первая пересборка начинается с начала'
+    state = _state(runner, spy.name)
+    assert state.rebuild_cursor is None, 'курсор снимается по завершении'
+    assert state.last_full_rebuild_dt is not None
+    assert state.last_full_rebuild_minutes is not None
+
+
+def test_changes_are_applied_between_rebuild_blocks(db):
+    # Ради этого пересборка и разбита на блоки: витрина не стоит холодной всю пересборку.
+    # Изменение, пришедшее в середине, применяется, не дожидаясь последнего блока.
+    spy = BlockSpy()
+    runner = _runner_for(db, spy)
+
+    signalled = []
+    original_rebuild = runner.handler.rebuild
+
+    def rebuild_with_a_change_midway(context):
+        for label in original_rebuild(context):
+            if label == '2024':
+                # Пока идёт пересборка, репликатор сохранил изменение подписанной таблицы.
+                _signal(db, "Catalog_X", SOURCE_CHANGES)
+            signalled.append((label, len(spy.calls)))
+            yield label
+
+    runner.handler = replace(runner.handler, rebuild=rebuild_with_a_change_midway)
+    runner.run_if_pending()
+
+    assert spy.blocks == ['2024', '2025', '2026']
+    # signalled снимается ДО того, как драйвер применит изменения за этот блок, поэтому
+    # ненулевой счётчик на строке '2025' означает: инкремент прошёл именно МЕЖДУ блоками,
+    # а не после всей пересборки. Ради этого блоки и заведены.
+    by_label = dict(signalled)
+    assert by_label['2024'] == 0, 'до сигнала обработчик по окну не звали'
+    assert by_label['2025'] >= 1, 'изменение ждало конца пересборки, а не применилось между блоками'
+    assert len(spy.calls) >= 1
+    assert spy.calls[0].last_run_at is not None, 'это инкремент, а не ещё одна пересборка'
+    assert spy.calls[0].full_rebuild is False
+    assert not _state(runner, spy.name).update_is_required, 'флаг снят успешным прогоном'
+
+
+def test_rebuild_resumes_from_the_cursor_after_a_restart(db):
+    # Генератор блоков живёт в памяти и перезапуска не переживает, поэтому место остановки
+    # хранится в БД: пересборка на десятки минут не должна начинаться заново из-за рестарта.
+    spy = BlockSpy(fail_at='2026')
+    runner = _runner_for(db, spy)
+    runner.run_if_pending()
+
+    assert spy.blocks == ['2024', '2025'], 'дошли до падающего блока'
+    state = _state(runner, spy.name)
+    assert state.rebuild_cursor == '2025', 'место остановки записано'
+    assert 'block 2026 failed' in state.last_error
+
+    # Новый процесс: свой HandlerLoop, состояние только из БД.
+    resumed = BlockSpy()
+    restarted = _runner_for(db, resumed)
+    restarted.run_if_pending()
+
+    assert resumed.rebuild_from == ['2025'], 'обработчику вернули место остановки'
+    assert resumed.blocks == ['2026'], 'сделанные блоки заново не считаются'
+    assert _state(restarted, resumed.name).rebuild_cursor is None
+
+
+def test_rebuild_requested_during_a_rebuild_is_not_swallowed(db):
+    # Заказ мог прийти из-за новой колонки уже после того, как часть блоков посчиталась старой
+    # логикой. Снять его завершением текущей пересборки — значит оставить витрину неполной.
+    spy = BlockSpy()
+    runner = _runner_for(db, spy)
+    original_rebuild = runner.handler.rebuild
+
+    def rebuild_with_a_request_midway(context):
+        for label in original_rebuild(context):
+            if label == '2024':
+                HandlerSignals(db.engine, db.schema).request_full_rebuild(
+                    "Catalog_X", "new column arrived mid-rebuild")
+            yield label
+
+    runner.handler = replace(runner.handler, rebuild=rebuild_with_a_request_midway)
+    runner.run_if_pending()
+
+    state = _state(runner, spy.name)
+    assert state.full_rebuild_is_required, 'заказ пережил завершение текущей пересборки'
+    assert state.rebuild_cursor is None, 'но текущая — закончена'
+
+
+def test_handler_without_blocks_rebuilds_in_one_go(db):
+    # Нарезать пересборку не обязательно: не объявил rebuild — прежнее поведение, один проход.
+    spy = Spy()
+    runner = _runner_for(db, spy)
+    runner.run_if_pending()
+
+    assert len(spy.calls) == 1
+    assert spy.calls[0].full_rebuild is True
+    assert spy.calls[0].last_run_at is None
+    assert _state(runner, spy.name).rebuild_cursor is None

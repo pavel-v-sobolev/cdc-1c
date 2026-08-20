@@ -23,6 +23,17 @@
 Соединения — LEFT, потому что объекты 1С приезжают в обмене независимо: движения регистра могут
 доехать раньше своего документа или номенклатуры. INNER JOIN спрятал бы такие строки до прибытия
 документа; LEFT показывает их сразу, ценой NULL в ключе группы — отсюда COALESCE ниже.
+
+Пересборка нарезана по месяцам периода регистра (см. rebuild), и та же вычисляемость ключа делает
+блок не таким прямолинейным, как хотелось бы. Взять «строки месяца» нельзя: группа собирается из
+строк, и месяц отрезал бы от неё часть, а удаляем мы группой. Поэтому блок отбирает ГРУППЫ — и ровно
+тем же PREVIOUS/CURRENT, что и инкремент: что регистраторы этого месяца давали раньше (по массивам
+"*_Keys" витрины) и что дают сейчас. Без половины PREVIOUS пересборка была бы неполной: группу,
+которую покинули ещё до её начала, не нашёл бы ни один блок.
+
+Второе следствие проявляется уже во время самой пересборки: она идёт минутами, и за это время
+документ может переехать в группу, чей блок давно позади. Убирает покинутую группу ИНКРЕМЕНТ,
+который цикл выполняет между блоками, — тем же механизмом и без всякой доработки.
 """
 
 from sqlalchemy import text, tuple_
@@ -45,6 +56,9 @@ SELECT
 	s."merged_on",
 	z."merged_on" "ZakazKlienta_merged_on",
 	n."merged_on" "Nomenklatura_merged_on",
+	--Период движения: по нему нарезана пересборка (блок = месяц). В агрегат он не идёт — в ключе
+	--витрины его нет, он нужен только чтобы отобрать группы блока.
+	s."Period",
 	--Ссылки на источники: ниже они сворачиваются в массивы, по которым ищутся покинутые группы.
 	--Регистратор и документ — один и тот же GUID, поэтому колонка одна на оба источника.
 	s."Recorder",
@@ -107,6 +121,10 @@ CREATE INDEX IF NOT EXISTS "ix_Document_ZakazKlienta_Number" ON
 -- только merged_on, а что с чем соединяется, знает витрина, а не он.
 CREATE INDEX IF NOT EXISTS "ix_AccumulationRegister_ZakazyKlientov_Nomenklatura_Key" ON
 	{schema}."AccumulationRegister_ZakazyKlientov" USING btree ("Nomenklatura_Key");
+
+-- Индекс по периоду: по нему нарезана пересборка (см. rebuild ниже), блок = месяц.
+CREATE INDEX IF NOT EXISTS "ix_AccumulationRegister_ZakazyKlientov_Period" ON
+	{schema}."AccumulationRegister_ZakazyKlientov" USING btree ("Period");
 """
 
 # Группы, которые надо пересобрать за окно (:since — конец прошлого прогона):
@@ -150,6 +168,48 @@ SELECT "Number", "Year" FROM {schema}."ZakazyKlientovGrouped_rows_view"
 """
 
 
+# Месяцы, за которые в регистре есть движения. Нарезаем по периоду РЕГИСТРА, а не по дате
+# документа: период есть у любой строки, включая те, чей документ ещё не доехал (у них Year=0 и
+# пустой Number — в нарезку по дате документа они бы просто не попали).
+#
+# Метка YYYY-MM сравнивается как строка, и такой формат сортируется правильно сам по себе.
+# Арифметику календаря делает БД: прибавить месяц к дате в Python — либо лишняя зависимость, либо
+# трюк вроде «28-е плюс четыре дня».
+REBUILD_BLOCKS_SQL = """
+SELECT DISTINCT to_char(date_trunc('month', "Period"), 'YYYY-MM') AS label,
+       date_trunc('month', "Period")::date AS begins,
+       (date_trunc('month', "Period") + interval '1 month')::date AS ends
+  FROM {schema}."AccumulationRegister_ZakazyKlientov"
+ WHERE "Period" IS NOT NULL
+ ORDER BY label
+"""
+
+# Группы одного блока пересборки. Форма та же, что у GROUPS_TO_REBUILD_SQL, — меняется только
+# способ отбора: там «что изменилось за окно», здесь «что лежит в этом месяце».
+#
+# PREVIOUS нужен по той же причине, что и в инкременте, и без него пересборка была бы неполной.
+# Ключ группы ВЫЧИСЛЯЕТСЯ из даты документа, поэтому группа умеет переезжать: правка даты через
+# границу года переносит строки из (N, 2025) в (N, 2026). Новую группу видно в источнике, старой
+# нет уже нигде — и удалить её можно только через массивы "*_Keys" витрины.
+GROUPS_IN_BLOCK_SQL = """
+WITH block_recorders AS (
+    SELECT DISTINCT "Recorder" AS id
+      FROM {schema}."AccumulationRegister_ZakazyKlientov"
+     WHERE "Period" >= :begins AND "Period" < :ends
+)
+
+-- PREVIOUS: что регистраторы этого месяца давали раньше
+SELECT "Number", "Year" FROM {schema}."ZakazyKlientovGrouped"
+ WHERE "Recorder_Keys" && ARRAY(SELECT id FROM block_recorders)
+
+UNION ALL
+
+-- CURRENT: что они дают сейчас
+SELECT "Number", "Year" FROM {schema}."ZakazyKlientovGrouped_rows_view"
+ WHERE "Period" >= :begins AND "Period" < :ends
+"""
+
+
 class ZakazyKlientovGrouped(Handler1C):
     # Имена ТАБЛИЦ в целевой БД (транслит), а не имена объектов 1С — те же, что стоят в SQL выше:
     #   AccumulationRegister_ZakazyKlientov  ← РегистрНакопления.ЗаказыКлиентов
@@ -162,14 +222,44 @@ class ZakazyKlientovGrouped(Handler1C):
     def setup(self, context):
         self.execute(context, DDL)
 
+    def merge(self, context):
+        """Один и тот же merge для инкремента и для блока пересборки — различаются они только
+        условиями, которые уходят в exec()."""
+        return dbmerge(context.engine, table_name="ZakazyKlientovGrouped", schema=context.schema,
+                       source_table_name="ZakazyKlientovGrouped_view", source_schema=context.schema,
+                       delete_mode='delete')
+
+    def rebuild(self, context):
+        """
+        Пересборка ПО МЕСЯЦАМ. Между блоками цикл применяет накопившиеся изменения, поэтому витрина
+        не стоит холодной все те десятки минут, что идёт пересборка (см. Handler1C.rebuild).
+
+        Единица блока — не строка витрины, а ГРУППА, как и в инкременте: удаляем мы группой, значит
+        и пересобирать обязаны группой целиком. Взять «строки месяца» нельзя — группа собирается из
+        строк, и месяц отрезал бы от неё часть.
+        """
+        for label, begins, ends in self.query(context, REBUILD_BLOCKS_SQL):
+            if context.rebuild_from and label <= context.rebuild_from:
+                continue                  # этот месяц уже посчитан до перезапуска процесса
+
+            groups = text(GROUPS_IN_BLOCK_SQL.format(schema=self.schema_prefix(context))
+                          ).bindparams(begins=begins, ends=ends)
+
+            with self.merge(context) as merge:
+                source_key = tuple_(merge.source_table.c["Number"], merge.source_table.c["Year"])
+                target_key = tuple_(merge.table.c["Number"], merge.table.c["Year"])
+                merge.exec(source_condition=source_key.in_(groups),
+                           delete_condition=target_key.in_(groups))
+
+            context.logger.info("Витрина пересобрана за %s", label)
+            yield label
+
     def handle(self, context):
         groups_to_rebuild = text(
             GROUPS_TO_REBUILD_SQL.format(schema=self.schema_prefix(context))
         ).bindparams(since=self.since(context))
 
-        with dbmerge(context.engine, table_name="ZakazyKlientovGrouped", schema=context.schema,
-                     source_table_name="ZakazyKlientovGrouped_view", source_schema=context.schema,
-                     delete_mode='delete') as merge:
+        with self.merge(context) as merge:
             # Ключ группы составной, поэтому сравнение row-value: (Number, Year) IN (SELECT
             # Number, Year ...). В остальном ничего не меняется по сравнению с одиночным ключом.
             source_key = tuple_(merge.source_table.c["Number"], merge.source_table.c["Year"])

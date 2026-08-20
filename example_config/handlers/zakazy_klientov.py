@@ -11,7 +11,7 @@ merged_on регистра, строка, дождавшаяся своей но
 останется с NULL-артикулом.
 """
 
-from sqlalchemy import select, tuple_, union_all
+from sqlalchemy import and_, select, tuple_, union_all
 from dbmerge import dbmerge
 
 from cdc_1c import Handler1C
@@ -24,6 +24,7 @@ SELECT
 	s."Recorder",
 	s."Recorder_Type",
 	s."LineNumber",
+	s."Period",
 	s."Zakazano" * (NOT s."is_deleted_or_empty")::int * --обнулим значение для удаленных строк
 		(CASE WHEN s."RecordType"='Receipt' THEN 1 ELSE -1 END) --проверим тип операции + или -
     		"Zakazano",
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS {schema}."ZakazyKlientov" (
 	"Recorder" uuid,
 	"Recorder_Type" varchar,
 	"LineNumber" int8,
+	"Period" timestamp,
 	"Zakazano" numeric,
 	"Artikul" varchar,
 	"merged_on" timestamp,
@@ -59,6 +61,26 @@ CREATE INDEX IF NOT EXISTS "ix_ZakazyKlientov_merged_on" ON
 -- заводит только merged_on, а что с чем соединяется, знает витрина, а не он.
 CREATE INDEX IF NOT EXISTS "ix_AccumulationRegister_ZakazyKlientov_Nomenklatura_Key" ON
 	{schema}."AccumulationRegister_ZakazyKlientov" USING btree ("Nomenklatura_Key");
+
+-- Индекс по периоду: по нему нарезана пересборка (см. rebuild ниже), блок = месяц.
+CREATE INDEX IF NOT EXISTS "ix_AccumulationRegister_ZakazyKlientov_Period" ON
+	{schema}."AccumulationRegister_ZakazyKlientov" USING btree ("Period");
+"""
+
+
+# Месяцы, за которые в регистре есть движения, по возрастанию. Порядок важен: метка последнего
+# блока — это точка возобновления, и «всё, что меньше» должно быть уже сделано. Метка в формате
+# YYYY-MM именно поэтому: она сравнивается как строка, и такой формат сортируется правильно сам.
+#
+# Арифметику календаря делает БД: прибавить месяц к дате в Python — либо лишняя зависимость, либо
+# трюк вроде «28-е плюс четыре дня».
+REBUILD_BLOCKS_SQL = """
+SELECT DISTINCT to_char(date_trunc('month', "Period"), 'YYYY-MM') AS label,
+       date_trunc('month', "Period")::date AS begins,
+       (date_trunc('month', "Period") + interval '1 month')::date AS ends
+  FROM {schema}."AccumulationRegister_ZakazyKlientov"
+ WHERE "Period" IS NOT NULL
+ ORDER BY label
 """
 
 
@@ -75,10 +97,44 @@ class ZakazyKlientov(Handler1C):
         # CREATE OR REPLACE VIEW на каждую страницу брал бы блокировки на пустом месте.
         self.execute(context, DDL)
 
+    def merge(self, context):
+        """Один и тот же merge для инкремента и для блока пересборки — различаются они только
+        условиями, которые передаются в exec()."""
+        return dbmerge(context.engine, table_name="ZakazyKlientov", schema=context.schema,
+                       source_table_name="ZakazyKlientov_view", source_schema=context.schema,
+                       delete_mode='delete')
+
+    def rebuild(self, context):
+        """
+        Пересборка ПО МЕСЯЦАМ. Между блоками цикл применяет накопившиеся изменения, поэтому витрина
+        не стоит холодной все те десятки минут, что идёт пересборка (см. Handler1C.rebuild).
+
+        Блок читает данные АКТУАЛЬНЫЕ на момент своего выполнения — никакого снимка на старте
+        пересборки. Иначе блок затёр бы изменения, применённые между блоками.
+        """
+        for label, begin, end in self.query(context, REBUILD_BLOCKS_SQL):
+            if context.rebuild_from and label <= context.rebuild_from:
+                continue                      # этот месяц уже посчитан до перезапуска процесса
+
+            with self.merge(context) as merge:
+                target_period = merge.table.c["Period"]
+                period = merge.source_table.c["Period"]
+                # Блок берёт из источника ВЕСЬ месяц, поэтому и удалять можно весь месяц: что не
+                # приехало в staging, того в источнике больше нет. Инкременту так нельзя — он
+                # видит лишь часть строк месяца и снёс бы остальные.
+                #
+                # Заодно это чинит переезд строки между месяцами (поправили дату документа): из
+                # старого месяца её удалит его блок, в новом создаст его собственный. Удаляй мы
+                # только по регистраторам из staging, в старом месяце осталась бы копия.
+                merge.exec(
+                    source_condition=and_(period >= begin, period < end),
+                    delete_condition=and_(target_period >= begin, target_period < end))
+
+            context.logger.info("Витрина пересобрана за %s", label)
+            yield label
+
     def handle(self, context):
-        with dbmerge(context.engine, table_name="ZakazyKlientov", schema=context.schema,
-                     source_table_name="ZakazyKlientov_view", source_schema=context.schema,
-                     delete_mode='delete') as merge:
+        with self.merge(context) as merge:
 
             # Единица пересчёта — не строка, а ГРУППА (Recorder), потому что удаляем мы тоже
             # группой. Берём ключи групп, у которых стал свежее хоть один источник.
