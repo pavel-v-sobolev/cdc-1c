@@ -251,7 +251,7 @@ class ZakazyKlientovGrouped(Handler1C):
                 merge.exec(source_condition=source_key.in_(groups),
                            delete_condition=target_key.in_(groups))
 
-            context.logger.info("Витрина пересобрана за %s", label)
+            context.logger.info("Data Mart updated for %s", label)
             yield label
 
     def handle(self, context):
@@ -272,5 +272,6 @@ class ZakazyKlientovGrouped(Handler1C):
             merge.exec(source_condition=source_key.in_(groups_to_rebuild),
                        delete_condition=target_key.in_(groups_to_rebuild))
 
-        context.logger.info("Витрина обновлена за окно (%s, %s]",
-                            self.since(context), context.boundary)
+        context.logger.info(
+            f'Data Mart changes applied since {self.since(context)}; '
+            f'Next run will apply since {context.boundary}')
