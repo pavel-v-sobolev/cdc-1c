@@ -17,6 +17,7 @@ from cdc_1c import DataObject1C
 from cdc_1c.data_reader import DataReader1C
 from cdc_1c.metadata_reader import MetadataObject1C, MetadataReader1C
 from cdc_1c.replicator import Replicator1C
+from conftest import TEST_QUEUE_GUID
 
 # Нулевой результат merge — writer.save в тестах замокан, но full_load агрегирует его результат.
 _ZERO_RESULT = mergeResult(0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -32,7 +33,7 @@ def _response(status_code: int):
 def _replicator(db):
     engine = db.engine
     rep = Replicator1C(odata_url="http://x", odata_auth=None,
-                       exchange_name="E", queue_guid="Q", engine=engine, db_schema=db.schema)
+                       exchange_name="E", queue_guid=TEST_QUEUE_GUID, engine=engine, db_schema=db.schema)
     # Метаданные «уже загружены» — full_load не пойдёт в сеть; primary_key даёт $orderby.
     rep.metadata.is_loaded = True
     rep.metadata["Catalog_X"] = MetadataObject1C("Catalog_X", {"Ref_Key": "Guid"},

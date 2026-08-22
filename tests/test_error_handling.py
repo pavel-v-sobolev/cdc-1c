@@ -13,6 +13,7 @@ from cdc_1c import Replicator1C
 from cdc_1c.common_functions import MAX_ERROR_BODY_CHARS, extract_error_text, raise_for_status
 from cdc_1c.replicator import _log_failure
 from cdc_1c.replicator import DEFAULT_MAX_BACKOFF
+from conftest import TEST_QUEUE_GUID
 
 
 class _Resp:
@@ -151,7 +152,7 @@ def _replicator(db):
         odata_url='http://1c/odata',
         odata_auth=('u', 'p'),
         exchange_name='X',
-        queue_guid='guid',
+        queue_guid=TEST_QUEUE_GUID,
         engine=db.engine,
         db_schema=db.schema,
     )

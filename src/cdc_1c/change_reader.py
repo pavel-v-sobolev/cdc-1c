@@ -20,6 +20,9 @@ class ChangeReader1C(DataReader1C):
         self.message_no = 0
 
     def read_changes(self):
+        # Узел не задан — дальше идти бессмысленно: подсказываем, из чего выбирать.
+        if not self.queue_guid:
+            self._raise_no_queue_guid()
         # Сбрасываем накопленные данные предыдущего цикла (важно для run_forever).
         self.clear()
         self.message_no = self.get_last_received_no()+1
@@ -56,16 +59,52 @@ class ChangeReader1C(DataReader1C):
         logger.info(f"Changes confirmed for queue {self.queue_guid} (message {self.message_no})")
 
 
-    def get_last_received_no(self)->int:
+    def read_nodes(self) -> list[dict]:
         """
-        Получить номер последнего пакета обмена, который был получен и подтвержден
+        Все узлы плана обмена (как их отдаёт OData), включая ЭтотУзел.
         """
         url = f"{self.odata_url}/ExchangePlan_{self.exchange_name}?$format=json"
         response = requests.get(url,auth=self.odata_auth,timeout=resolve_timeout(self.request_timeout))
         raise_for_status(response, f'ExchangePlan_{self.exchange_name}')
-        queues_data = response.json()
+        return response.json().get('value') or []
 
-        queues = queues_data.get('value') or []
+    def available_nodes(self) -> list[dict]:
+        """
+        Узлы, которые можно указать в queue_guid: всё, кроме ЭтотУзел (ThisNode) — он описывает
+        саму базу-источник, подписаться на его изменения нельзя.
+        """
+        return [node for node in self.read_nodes() if not node.get('ThisNode')]
+
+    def _raise_no_queue_guid(self):
+        """
+        queue_guid не задан: выводим в лог список узлов плана обмена, чтобы guid можно было взять
+        прямо отсюда, не открывая конфигуратор и не имея обработки в 1С.
+        """
+        try:
+            nodes = self.available_nodes()
+        except Exception as error:
+            # Список не получили (нет связи / неверный exchange_name) — сообщение об этом не должно
+            # подменять собой главную ошибку: она всё равно ниже.
+            logger.warning("Could not list nodes of exchange plan %s: %s", self.exchange_name, error)
+        else:
+            if nodes:
+                logger.error("queue_guid is not set. Available nodes of exchange plan %s:%s",
+                             self.exchange_name,
+                             ''.join(f"\n    {node.get('Ref_Key')}  {node.get('Code') or ''}"
+                                     f"  {node.get('Description') or ''}".rstrip()
+                                     for node in nodes))
+            else:
+                logger.error("queue_guid is not set, and exchange plan %s has no nodes besides "
+                             "ThisNode: create a node for this replication in 1C",
+                             self.exchange_name)
+        raise ValueError(f"queue_guid is not set (exchange plan {self.exchange_name}): "
+                         "specify the Ref_Key of the exchange node")
+
+    def get_last_received_no(self)->int:
+        """
+        Получить номер последнего пакета обмена, который был получен и подтвержден
+        """
+        queues = self.read_nodes()
         receive_no = 0
         found = False
 

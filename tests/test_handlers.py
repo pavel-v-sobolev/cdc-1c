@@ -22,6 +22,7 @@ from cdc_1c import Handler1C
 from cdc_1c.handlers import (EPOCH, SOURCE_CHANGES, SOURCE_DB_SIGNAL, SOURCE_FULL_LOAD, HandlerLoop,
                              HandlerSignals, WriteTracker, as_handler)
 from cdc_1c.name_mapper import NameMapper1C
+from conftest import TEST_QUEUE_GUID
 
 
 class Spy(Handler1C):
@@ -58,7 +59,7 @@ def _replicator(db, exchange="План", **kwargs):
     from cdc_1c.replicator import Replicator1C
     kwargs.setdefault("db_schema", db.schema)
     return Replicator1C(odata_url="http://x", odata_auth=None, exchange_name=exchange,
-                        queue_guid="Q", engine=db.engine, **kwargs)
+                        queue_guid=TEST_QUEUE_GUID, engine=db.engine, **kwargs)
 
 
 def _runner_for(db, handler):

@@ -1,4 +1,5 @@
 import functools
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -58,6 +59,116 @@ def _is_permanent_error(exc: BaseException) -> bool:
     response = getattr(exc, 'response', None)
     status = getattr(response, 'status_code', None)
     return status in PERMANENT_HTTP_CODES
+
+
+# Проверка параметров конструктора: ошибка в них иначе всплывает далеко от места, где её
+# допустили — 404 от 1С посреди цикла, KeyError в чужом коде, а то и молча неверная работа.
+# Проверяем на месте вызова и сообщением говорим, что именно передать.
+_UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+
+
+def _check_odata_url(odata_url) -> str:
+    """URL корня OData: http(s)://host/base/odata/standard.odata (без слеша на конце — к нему
+    везде дописывается /<ресурс>)."""
+    if not isinstance(odata_url, str) or not odata_url.strip():
+        raise ValueError("odata_url is required: URL of the 1C OData root, e.g. "
+                         "http://host/base/odata/standard.odata")
+    url = odata_url.strip().rstrip('/')
+    if not url.startswith(('http://', 'https://')):
+        raise ValueError(f"odata_url must start with http:// or https:// (got {odata_url!r})")
+    if not url.endswith('/odata/standard.odata'):
+        # Не ошибка: адрес публикации бывает нестандартным. Но чаще это забытый хвост пути.
+        logger.warning("odata_url %s does not end with /odata/standard.odata — is this the OData "
+                       "root and not the base URL?", url)
+    return url
+
+
+def _check_odata_auth(odata_auth):
+    """(user, password) либо None. Часто передают одну строку или один элемент — с таким requests
+    уходит в 1С без авторизации или падает не по делу."""
+    if odata_auth is None:
+        return None
+    if (isinstance(odata_auth, (tuple, list)) and len(odata_auth) == 2
+            and all(isinstance(part, str) for part in odata_auth)):
+        return tuple(odata_auth)
+    raise ValueError("odata_auth must be a (user, password) tuple of strings, or None for "
+                     f"anonymous access (got {odata_auth!r})")
+
+
+def _check_exchange_name(exchange_name) -> str:
+    """Имя плана обмена так, как оно уходит в URL: ExchangePlan_<имя>. Префикс/точечное имя
+    (ПланОбмена.Х, ExchangePlan_Х) снимаем: в URL их дописывает сам ChangeReader1C."""
+    if not isinstance(exchange_name, str) or not exchange_name.strip():
+        raise ValueError("exchange_name is required: name of the 1C exchange plan "
+                         "(as in the configuration, e.g. ДляВитрины)")
+    name = exchange_name.strip()
+    for prefix in ('ExchangePlan_', 'ПланОбмена.', 'ExchangePlan.'):
+        if name.startswith(prefix):
+            logger.warning("exchange_name %r: dropping the %r prefix, the plain plan name is "
+                           "expected", exchange_name, prefix)
+            name = name[len(prefix):]
+    if '/' in name or ' ' in name:
+        raise ValueError(f"exchange_name must be a bare exchange plan name (got {exchange_name!r})")
+    return name
+
+
+def _check_queue_guid(queue_guid) -> str:
+    """Ref_Key узла обмена. Пустой — допустим: чтение изменений тогда выведет в лог список узлов
+    (см. ChangeReader1C._raise_no_queue_guid). Непустой обязан быть guid: имя или код узла в URL
+    даст ответ 1С, по которому это не угадать."""
+    if queue_guid is None:
+        return ''
+    if not isinstance(queue_guid, str):
+        raise ValueError(f"queue_guid must be a string Ref_Key of the exchange node (got {queue_guid!r})")
+    guid = queue_guid.strip().strip('{}')
+    if guid and not _UUID_RE.match(guid):
+        raise ValueError(f"queue_guid must be the Ref_Key (guid) of the exchange node, not its "
+                         f"code or name (got {queue_guid!r}). Leave it empty to log the list of "
+                         f"available nodes")
+    return guid
+
+
+def _check_engine(engine) -> Engine:
+    """Готовый Engine, а не строка подключения: пул и опции задаёт вызывающий (см. docstring)."""
+    if isinstance(engine, Engine):
+        return engine
+    if isinstance(engine, str):
+        raise ValueError("engine must be a SQLAlchemy Engine, not a connection string: "
+                         f"pass create_engine({engine!r})")
+    raise ValueError(f"engine must be a SQLAlchemy Engine (got {type(engine).__name__})")
+
+
+def _check_db_schema(db_schema):
+    """Имя схемы БД либо None (схема по умолчанию). Пустая строка — почти наверняка незаполненная
+    переменная окружения, а не осознанный выбор."""
+    if db_schema is None:
+        return None
+    if not isinstance(db_schema, str):
+        raise ValueError(f"db_schema must be a schema name string or None (got {db_schema!r})")
+    return db_schema.strip() or None
+
+
+def _check_full_load_workers(full_load_workers) -> int:
+    """Число потоков полной выгрузки: >= 1 (0 остановил бы выгрузку молча)."""
+    if isinstance(full_load_workers, bool) or not isinstance(full_load_workers, int):
+        raise ValueError(f"full_load_workers must be an int >= 1 (got {full_load_workers!r})")
+    if full_load_workers < 1:
+        raise ValueError(f"full_load_workers must be >= 1 (got {full_load_workers})")
+    return full_load_workers
+
+
+def _check_request_timeout(request_timeout):
+    """Таймаут requests: число секунд либо (connect, read). None — значение по умолчанию
+    (DEFAULT_REQUEST_TIMEOUT). Явный 0/None внутри кортежа — вечное ожидание, это не таймаут."""
+    if request_timeout is None:
+        return None
+    values = request_timeout if isinstance(request_timeout, (tuple, list)) else (request_timeout,)
+    if (len(values) not in (1, 2)
+            or not all(isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+                       for v in values)):
+        raise ValueError("request_timeout must be a positive number of seconds or a "
+                         f"(connect, read) pair of them (got {request_timeout!r})")
+    return tuple(values) if isinstance(request_timeout, (tuple, list)) else request_timeout
 
 
 def _rows_modified(result) -> int:
@@ -129,15 +240,17 @@ class Replicator1C:
         # stop_signal). Конструктор же зовётся из главного.
         install_signal_handlers(quiet=False)
 
-        self.engine = engine
-        self.db_schema = db_schema
-        self._odata_url = odata_url
-        self._exchange_name = exchange_name
-        self._queue_guid = queue_guid
+        # Параметры проверяем здесь, а не по месту использования: неверный адрес или не тот guid
+        # иначе оборачиваются ошибкой 1С посреди первого цикла, где уже не видно, что не так.
+        self.engine = _check_engine(engine)
+        self.db_schema = _check_db_schema(db_schema)
+        self._odata_url = _check_odata_url(odata_url)
+        self._exchange_name = _check_exchange_name(exchange_name)
+        self._queue_guid = _check_queue_guid(queue_guid)
         # odata_auth — кортеж (user, password) либо None, как в ридерах (передаётся им как есть).
-        self._odata_auth = odata_auth
+        self._odata_auth = _check_odata_auth(odata_auth)
         # None → таймаут не задан явно: ридеры подставят DEFAULT_REQUEST_TIMEOUT (metadata_reader).
-        self._request_timeout = request_timeout
+        self._request_timeout = _check_request_timeout(request_timeout)
 
         # Компоненты строятся сразу, но в сеть не ходят: MetadataReader1C создаётся пустым,
         # метаданные подгрузятся лениво при первом run_once. MetadataReader1C получает engine —
@@ -148,7 +261,7 @@ class Replicator1C:
         self.name_mapper = NameMapper1C()
 
         # Фоновая полная выгрузка: пул потоков и защита от повторного сабмита одного объекта.
-        self._full_load_workers = full_load_workers
+        self._full_load_workers = _check_full_load_workers(full_load_workers)
         self._full_load_in_progress: set[str] = set()
         # Размер страницы, который 1С реально осилила по этому объекту (см. FULL_LOAD_MIN_BATCH).
         # Пишет только поток самой выгрузки, а он на объект один (_full_load_in_progress).

@@ -59,7 +59,8 @@ replicator = Replicator1C(
     odata_url=os.environ["CDC1C_ODATA_URL"],
     odata_auth=(os.environ["CDC1C_ODATA_USER"], os.environ["CDC1C_ODATA_PASSWORD"]),
     exchange_name=os.environ["CDC1C_EXCHANGE_NAME"],
-    queue_guid=os.environ["CDC1C_QUEUE_GUID"],
+    # Не знаете guid узла — оставьте пустым: в лог выведется список узлов плана обмена.
+    queue_guid=os.environ.get("CDC1C_QUEUE_GUID", ""),
     engine=engine,
     db_schema=DB_SCHEMA,
     full_load_workers=FULL_LOAD_WORKERS,

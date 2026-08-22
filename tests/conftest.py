@@ -19,6 +19,10 @@ from dataclasses import dataclass
 import pytest
 from sqlalchemy import Engine, create_engine, text
 
+# Узел обмена в тестах: конструктор Replicator1C требует именно guid (см. _check_queue_guid),
+# поэтому фиктивные "Q"/"guid" не подойдут.
+TEST_QUEUE_GUID = "11111111-2222-3333-4444-555555555555"
+
 TEST_DB_URL = os.environ.get(
     "CDC1C_TEST_DB_URL", "postgresql+psycopg2://postgres:postgres@localhost:5432/cdc_1c")
 

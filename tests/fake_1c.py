@@ -27,6 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+THIS_NODE_GUID = "00000000-0000-0000-0000-000000000000"
+
 EMPTY_FEED = (b'<?xml version="1.0" encoding="UTF-8"?>\n'
               b'<feed xmlns="http://www.w3.org/2005/Atom"></feed>')
 
@@ -43,7 +45,13 @@ class Fake1C:
         self.received_no = 0  # синтезированное состояние очереди обмена
 
     def exchange_plan_json(self) -> bytes:
-        payload = {"value": [{"Ref_Key": self.queue_guid, "ReceivedNo": str(self.received_no)}]}
+        payload = {"value": [
+            # ЭтотУзел (сама база) в плане обмена есть всегда — подписаться на него нельзя.
+            {"Ref_Key": THIS_NODE_GUID, "Code": "БАЗА", "Description": "Эта база",
+             "ThisNode": True, "ReceivedNo": "0"},
+            {"Ref_Key": self.queue_guid, "Code": "CDC", "Description": "Витрина",
+             "ThisNode": False, "ReceivedNo": str(self.received_no)},
+        ]}
         return json.dumps(payload).encode("utf-8")
 
     def select_changes(self, message_no: int) -> bytes:
