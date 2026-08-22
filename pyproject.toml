@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
+    "croniter>=6.0.0",
     "dbmerge>=1.0.22",
     "requests>=2.33.0",
     "sqlalchemy>=2.0.49",

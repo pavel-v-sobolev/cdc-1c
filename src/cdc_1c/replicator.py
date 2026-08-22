@@ -3,6 +3,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 
 import requests
@@ -698,10 +699,38 @@ class Replicator1C:
                 stop.wait(delay)
             logger.info("Replication loop stopping, waiting for full loads to finish")
 
+    @contextmanager
+    def claim_full_load(self, object_full_name: str):
+        """
+        Занимает объект под полную выгрузку на время блока: отдаёт True, если объект свободен, и
+        False, если его уже выгружает кто-то другой (фоновая выгрузка репликатора или другое
+        расписание). Множество занятых — общее с _dispatch_full_loads, поэтому claim видят обе
+        стороны.
+
+        Нужен вызывающим извне цикла — прежде всего FullLoadCron: две одновременные выгрузки одного
+        объекта данные не портят (у каждого снимка свой full_load_started_at, см. DBWriter1C.save),
+        но дают 1С двойную работу и две параллельные строки в replicator_1c_log.
+
+        Сам full_load намеренно не охраняется: прямой вызов «выгрузи вот это прямо сейчас» должен
+        отрабатывать всегда.
+        """
+        with self._in_progress_lock:
+            claimed = object_full_name not in self._full_load_in_progress
+            if claimed:
+                self._full_load_in_progress.add(object_full_name)
+        try:
+            yield claimed
+        finally:
+            if claimed:
+                with self._in_progress_lock:
+                    self._full_load_in_progress.discard(object_full_name)
+
     def _dispatch_full_loads(self, executor: ThreadPoolExecutor) -> None:
         """
         Ставит в пул полные выгрузки объектов с full_load_is_required, кроме уже выполняющихся.
-        Защита от повторного сабмита — множество _full_load_in_progress (под локом).
+        Защита от повторного сабмита — множество _full_load_in_progress (под локом). Claim берётся
+        здесь, а не внутри задания, чтобы объект не сабмитился повторно, пока ждёт своего воркера;
+        снимается он в _run_full_load (finally).
         """
         for object_full_name in self.metadata.list_full_load_required():
             with self._in_progress_lock:

@@ -12,7 +12,9 @@ from .name_mapper import NameMapper1C
 from .db_writer import DBWriter1C
 from .handlers import Handler1C, HandlerContext, HandlerLoop
 from .replicator import Replicator1C
+from .cron_runner import FullLoadCron
 
 __all__ = ["MetadataReader1C", "DataReader1C", "DataObject1C", "ChangeReader1C", "NameMapper1C",
-           "DBWriter1C", "Handler1C", "HandlerContext", "HandlerLoop", "Replicator1C", "__version__"]
+           "DBWriter1C", "Handler1C", "HandlerContext", "HandlerLoop", "Replicator1C",
+           "FullLoadCron", "__version__"]
 
