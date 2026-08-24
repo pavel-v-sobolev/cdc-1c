@@ -57,6 +57,10 @@ type_mapping = {'Guid':Uuid(),
 IGNORED_TYPES = ('Collection', 'Stream')
 
 GUESS_UUID_TYPES = True
+
+# Постфикс соседней колонки для нессылочных значений составного типа
+# (см. _read_metadata_item и DataObjects1C._get_record_fields).
+COMPOSITE_VALUE_SUFFIX = '_Value'
 # Проблема в том, что 1С часть GUID полей присылает как строки в описании метаданных.
 # В этом модуле есть логика, которая определяет тип UUID поля, по имени поля "Recorder" 
 # или по наличию другого поля с постфиксом "_Type" для составных типов данных.
@@ -226,7 +230,8 @@ class MetadataReader1C(UserDict):
                 logger.error(f'Property {item_name}.{property_name} has unknown type {property_type}')
             
         if GUESS_UUID_TYPES:
-            for property_name in properties.keys():
+            # list(): ниже в properties добавляется соседняя колонка <поле>_Value.
+            for property_name in list(properties.keys()):
                 # Если мы видим что есть поле с постфиксом Type, то значит
                 # ищем такое же поле без постфикса, т.к. в этом случае это составной тип и нужно
                 # изменить поле на Uuid т.к. 1С почему-то присылает String
@@ -234,6 +239,13 @@ class MetadataReader1C(UserDict):
                     uuid_property_name = property_name.removesuffix('_Type')
                     if uuid_property_name in properties.keys():
                         properties[uuid_property_name] = 'Guid'
+                        # Составной тип бывает не только ссылочным: у «Дополнительных реквизитов»
+                        # в Значение лежат и ссылки, и числа/строки/даты (тип видно в Значение_Type).
+                        # Ссылки остаются в uuid-колонке — иначе развалятся джойны с другими
+                        # таблицами, — а всё остальное уходит сюда текстом как есть. Колонка
+                        # заводится всегда, чтобы состав таблицы не зависел от того, попался ли
+                        # примитив в первой прочитанной пачке.
+                        properties[uuid_property_name + COMPOSITE_VALUE_SUFFIX] = 'String'
 
 
         return properties

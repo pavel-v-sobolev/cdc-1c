@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 import requests
 from dbmerge import mergeResult
 from sqlalchemy import Engine, Integer, Numeric
-from sqlalchemy.exc import NoSuchTableError
+from sqlalchemy.exc import NoSuchTableError, OperationalError
 
 from cdc_1c.metadata_reader import MetadataReader1C
 from cdc_1c.common_functions import format_duration
@@ -147,6 +147,32 @@ def _check_engine(engine) -> Engine:
     raise ValueError(f"engine must be a SQLAlchemy Engine (got {type(engine).__name__})")
 
 
+def _check_db_connection(engine: Engine) -> Engine:
+    """
+    Проверяет, что БД отвечает, — до того, как её тронет первый же компонент (журнал загрузок
+    создаёт свою таблицу прямо в конструкторе).
+
+    Смысл в сообщении, а не в проверке: недоступная база даёт полтораста строк трейса сквозь пул
+    SQLAlchemy и psycopg2, где полезна ровно одна строка — «хост не резолвится» или «отказано в
+    соединении». Для того, кто запускает контейнер, это нечитаемо. Поднимаем ту же ошибку, но с
+    коротким текстом и без чужого трейса (`from None`), добавив к ней адрес БД без пароля.
+
+    Проверка одноразовая, на старте: разрыв связи в работающем цикле — дело обычное, его ловит
+    run_forever и повторяет с backoff.
+    """
+    try:
+        with engine.connect():
+            pass
+    except OperationalError as exc:
+        # orig — исключение драйвера: у psycopg2 в нём та самая единственная полезная строка.
+        reason = str(exc.orig or exc).strip().splitlines()[0] if exc.orig else str(exc)
+        url = engine.url.render_as_string(hide_password=True)
+        # ConnectionError, а не OperationalError: та печатает себя вместе с SQL-контекстом,
+        # которого здесь нет, — соединение не открылось вовсе.
+        raise ConnectionError(f"cannot connect to the database {url}: {reason}") from None
+    return engine
+
+
 def _check_db_schema(db_schema):
     """Имя схемы БД либо None (схема по умолчанию). Пустая строка — почти наверняка незаполненная
     переменная окружения, а не осознанный выбор."""
@@ -202,12 +228,16 @@ def _log_failure(exc: BaseException, message: str, *args) -> None:
 
     - HTTPError: описание уже выведено raise_for_status строкой выше, не дублируем;
     - прочие ошибки requests (таймаут, обрыв): traceback не нужен, но текст выводим — его нигде нет;
+    - OperationalError от БД (упала, перезапустилась, кончились соединения): то же самое, полезна
+      строка драйвера, а не сто строк внутренностей SQLAlchemy;
     - остальное: это уже похоже на ошибку в коде, traceback оставляем.
     """
     if isinstance(exc, requests.HTTPError):
         logger.error(message, *args)
     elif isinstance(exc, requests.RequestException):
         logger.error(f'{message}: %s', *args, exc)
+    elif isinstance(exc, OperationalError):
+        logger.error(f'{message}: %s', *args, str(exc.orig or exc).strip().splitlines()[0])
     else:
         logger.exception(message, *args)
 
@@ -260,7 +290,7 @@ class Replicator1C:
 
         # Параметры проверяем здесь, а не по месту использования: неверный адрес или не тот guid
         # иначе оборачиваются ошибкой 1С посреди первого цикла, где уже не видно, что не так.
-        self.engine = _check_engine(engine)
+        self.engine = _check_db_connection(_check_engine(engine))
         self.db_schema = _check_db_schema(db_schema)
         # Схема промежуточных таблиц dbmerge. Не задана — та же, что у данных. Отдельная схема
         # (например cdc_1c_tmp) держит их в стороне от таблиц с данными: в ней по определению нет

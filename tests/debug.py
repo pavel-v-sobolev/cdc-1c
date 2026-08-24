@@ -15,8 +15,8 @@ from sqlalchemy import create_engine
 
 from cdc_1c import ChangeReader1C, DBWriter1C, MetadataReader1C, NameMapper1C, Replicator1C
 
-ODATA_URL = "http://192.168.56.102/trade_demo/odata/standard.odata"
-ODATA_AUTH = ('admin', 'admin')
+ODATA_URL = "http://192.168.56.101/trade_demo/odata/standard.odata"
+ODATA_AUTH = ('odata_user', 'secret')
 EXCHANGE_NAME = 'ДляODATA'
 QUEUE_GUID = 'a9bc23c5-3689-11f1-926c-0800270bc6cb'
 DB_URL = "postgresql+psycopg2://postgres:postgres@localhost:5432/cdc_1c"

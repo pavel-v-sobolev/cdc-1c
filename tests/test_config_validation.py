@@ -65,3 +65,25 @@ def test_empty_queue_guid_logs_available_nodes(db, caplog):
     listing = "\n".join(record.getMessage() for record in caplog.records)
     assert fake.queue_guid in listing
     assert fake_1c.THIS_NODE_GUID not in listing
+
+
+def test_unreachable_db_reports_plainly(db):
+    """
+    Недоступная БД должна давать одну понятную строку, а не сто с лишним строк трейса сквозь пул
+    SQLAlchemy и psycopg2 (в контейнере это единственное, что видит запускающий). Проверяем и то,
+    что пароль в сообщении не светится: адрес БД в лог попадает.
+    """
+    from sqlalchemy import create_engine
+
+    # Порт 1 на локальном интерфейсе: отказ приходит сразу, без ожидания DNS или таймаута.
+    engine = create_engine("postgresql+psycopg2://postgres:sekret@127.0.0.1:1/nowhere")
+
+    with pytest.raises(ConnectionError) as err:
+        _make(db, engine=engine)
+
+    message = str(err.value)
+    assert "cannot connect to the database" in message
+    assert "127.0.0.1:1" in message
+    assert "sekret" not in message
+    # Причина от драйвера — ради неё всё и затевалось.
+    assert "onnection refused" in message or "не удалось" in message.lower()

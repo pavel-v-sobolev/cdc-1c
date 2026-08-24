@@ -9,8 +9,8 @@ import uuid
 
 import xmltodict
 
-from cdc_1c.metadata_reader import (ENTITY_TYPES, REGISTER_TYPES, SUPPORTED_TYPES,
-                                    MetadataReader1C, resolve_timeout)
+from cdc_1c.metadata_reader import (COMPOSITE_VALUE_SUFFIX, ENTITY_TYPES, REGISTER_TYPES,
+                                    SUPPORTED_TYPES, MetadataReader1C, resolve_timeout)
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.common_functions import format_bytes, parse_object_full_name, raise_for_status
 from cdc_1c.logging_config import get_logger
@@ -30,6 +30,9 @@ def _json_safe(value: Any) -> Any:
 # поддерживаемых классов объектов должен быть один на всю библиотеку.
 METADATA_POSTFIXES = ('_RecordType','_RowType','_Balance','_Turnover','_BalanceAndTurnover')
 ODATA_PREFIX = 'StandardODATA.'
+# Примитивные типы OData в поле <поле>_Type: значение составного типа — не ссылка (число, строка,
+# дата, булево), и в uuid-колонку оно не ложится.
+EDM_TYPE_PREFIX = 'Edm.'
 
 # Поле 1С с пометкой удаления у документов и справочников.
 DELETION_MARK_FIELD = 'DeletionMark'
@@ -197,6 +200,30 @@ class DataObject1C(UserDict):
             
 
 
+def _composite_primitive_fields(raw: dict, metadata_obj) -> dict:
+    """
+    Находит составные поля, в которых у ЭТОЙ записи лежит не ссылка, и отдаёт {поле: сырое значение}.
+
+    Тип конкретного значения приходит в парном <поле>_Type: у ссылок это имя объекта 1С, у
+    примитивов — Edm.Double / Edm.String / Edm.DateTime и т.п. Метаданные OData объявляют само поле
+    строкой и о составе типа не говорят ничего, поэтому решать приходится по каждой записи.
+
+    Такие значения уходят в соседнюю колонку <поле>_Value текстом, а в uuid-колонке остаётся NULL.
+    Почему не одной текстовой колонкой на всё: ссылки в ней перестали бы джойниться с ключами
+    других таблиц, а это основной сценарий. Почему не только uuid: непреобразуемое значение роняло
+    вставку всей пачки, и объект не грузился вовсе («Дополнительные реквизиты» с числом в Значение).
+    """
+    primitives = {}
+    for field_name, value in raw.items():
+        if not field_name.endswith('_Type') or not isinstance(value, str):
+            continue
+        base_name = field_name.removesuffix('_Type')
+        if base_name in raw and base_name + COMPOSITE_VALUE_SUFFIX in metadata_obj.keys():
+            if value.startswith(EDM_TYPE_PREFIX):
+                primitives[base_name] = raw[base_name]
+    return primitives
+
+
 class DataReader1C(UserDict):
     def __init__(self, odata_url: str, metadata: MetadataReader1C,
                  odata_auth: tuple[str, str] | None = None,
@@ -338,7 +365,7 @@ class DataReader1C(UserDict):
                 self[object_name] = DataObject1C(metadata_obj=metadata_obj, records=new_records)
 
     @staticmethod
-    def _convert_value(value: Any, type_name: str) -> Any:
+    def _convert_value(value: Any, type_name: str, context: str = '') -> Any:
         # Конвертируем значение в нужный тип данных на основе метаданных.
         if value is None:
             return None
@@ -360,7 +387,12 @@ class DataReader1C(UserDict):
                 else:
                     return uuid.UUID(value)
         except (ValueError, TypeError) as e:
-            logger.warning(f'Failed to convert value {value!r} to type {type_name}: {e}')
+            # Раньше здесь возвращалось исходное значение — и падала вся пачка на вставке
+            # (одно '6.4' в uuid-колонке останавливало загрузку объекта навсегда). Пишем NULL:
+            # объект грузится, а строка с проблемой видна и в логе, и в БД.
+            logger.warning('Failed to convert %s value %r to type %s: %s — writing NULL',
+                           context or 'field', value, type_name, e)
+            return None
         return value
 
     def _get_record_fields(self, properties: dict, object_name: str | None = None) -> dict:
@@ -372,43 +404,59 @@ class DataReader1C(UserDict):
         
         metadata_obj = self.metadata[object_name]
 
-        fields = {}
+        # Сырые значения собираем до конвертации: у составного поля тип значения виден только
+        # из парного <поле>_Type, а решать надо ДО приведения к Guid — иначе число уже потеряно.
+        raw = {}
         for k, v in properties.items():
             if k.startswith('d:') and isinstance(v, str):
-
                 field_name = k.removeprefix('d:')
+                # У поля _Type в значении полное имя типа ("StandardODATA.Catalog_Контрагенты");
+                # префикс убираем, остаётся имя объекта 1С либо примитив вида Edm.Double.
+                raw[field_name] = v.removeprefix(ODATA_PREFIX) if field_name.endswith('_Type') else v
 
-                if field_name.endswith('_Type'):
-                    # если поле заканчивается на _Type, то это поле составного типа
-                    # и в значении будет полное имя типа, например "StandardODATA.СправочникСсылка.Контрагенты"
-                    # для удобства убираем префикс и оставляем только имя типа, например "СправочникСсылка.Контрагенты"
-                    value = v.removeprefix(ODATA_PREFIX)
-                else:
-                    value = v
+        primitives = _composite_primitive_fields(raw, metadata_obj)
 
+        fields = {}
+        for field_name, value in raw.items():
+            if field_name not in metadata_obj.keys():
+                # поле не найдено в метаданных, пробуем их перечитать — но не более одного раза
+                # на объект, иначе поле, которого в $metadata нет вовсе (например, отброшенный
+                # по неизвестному типу реквизит), даёт по запросу метаданных на каждую запись.
+                if object_name not in self._metadata_refreshed_for:
+                    self._metadata_refreshed_for.add(object_name)
+                    self.metadata.get_metadata()
+                    metadata_obj = self.metadata[object_name]
                 if field_name not in metadata_obj.keys():
-                    # поле не найдено в метаданных, пробуем их перечитать — но не более одного раза
-                    # на объект, иначе поле, которого в $metadata нет вовсе (например, отброшенный
-                    # по неизвестному типу реквизит), даёт по запросу метаданных на каждую запись.
-                    if object_name not in self._metadata_refreshed_for:
-                        self._metadata_refreshed_for.add(object_name)
-                        self.metadata.get_metadata()
-                        metadata_obj = self.metadata[object_name]
-                    if field_name not in metadata_obj.keys():
-                        logger.warning(f'Metadata field {field_name} not found for object {object_name}')
+                    logger.warning(f'Metadata field {field_name} not found for object {object_name}')
 
 
-                type_name = metadata_obj.get(field_name) or 'String'
+            type_name = metadata_obj.get(field_name) or 'String'
 
-                converted = self._convert_value(value, type_name)
+            if field_name in primitives:
+                # Не ссылка: в uuid-колонке ей места нет — значение уходит в соседнюю
+                # текстовую <поле>_Value как есть, здесь остаётся NULL.
+                fields[field_name + COMPOSITE_VALUE_SUFFIX] = value
+                fields[field_name] = None
+                continue
 
-                if converted is None and field_name in metadata_obj.primary_key:
-                    # Поля первичного ключа в целевой таблице NOT NULL, а пустую ссылку 1С
-                    # (нулевой GUID) _convert_value превращает в None — для ключа оставляем
-                    # дефолт по типу (нулевой GUID), иначе строка не вставится.
-                    converted = self._default_key_value(type_name)
+            converted = self._convert_value(value, type_name,
+                                            context=f'{object_name}.{field_name}')
 
-                fields[field_name] = converted
+            if converted is None and field_name in metadata_obj.primary_key:
+                # Поля первичного ключа в целевой таблице NOT NULL, а пустую ссылку 1С
+                # (нулевой GUID) _convert_value превращает в None — для ключа оставляем
+                # дефолт по типу (нулевой GUID), иначе строка не вставится.
+                converted = self._default_key_value(type_name)
+
+            fields[field_name] = converted
+
+        # Соседняя колонка составного поля заполняется у КАЖДОЙ записи, даже когда значение —
+        # ссылка и колонка остаётся пустой: иначе состав полей плавал бы от записи к записи.
+        for field_name in raw:
+            if field_name.endswith('_Type'):
+                value_name = field_name.removesuffix('_Type') + COMPOSITE_VALUE_SUFFIX
+                if value_name in metadata_obj.keys():
+                    fields.setdefault(value_name, None)
 
         # Спец-поле «строку не учитывать»: пометка удаления у документа/справочника либо
         # неактивная запись регистра. Active сравниваем именно с False: у объектов его нет вовсе,

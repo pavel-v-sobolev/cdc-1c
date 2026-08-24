@@ -38,7 +38,7 @@ from cdc_1c import Replicator1C
 
 # pool_size >= full_load_workers + 2 (+1 на каждого обработчика и каждое расписание) —
 # почему столько, см. «Сколько нужно соединений к БД»
-engine = create_engine("postgresql+psycopg2://user:pass@localhost:5432/dwh", pool_size=5)
+engine = create_engine("postgresql+psycopg2://user:pass@localhost:5432/cdc_1c", pool_size=5)
 
 rep = Replicator1C(
     odata_url="http://host/base/odata/standard.odata",
@@ -112,17 +112,46 @@ Python сам кладёт каталог скрипта в `sys.path`, поэт
 с версией пакета на PyPI. Внутри только python и cdc-1c: ни 1С, ни Postgres он не поднимает.
 
 **Без своего кода.** Контейнер запускает тот же entrypoint `cdc-1c` и читает переменные из
-таблицы выше:
+таблицы выше. Первый запуск удобно сделать без `-d`, чтобы лог шёл прямо в терминал:
 
 ```bash
-docker run -d --name cdc-1c \
-  -e CDC1C_ODATA_URL="http://host/base/odata/standard.odata" \
-  -e CDC1C_ODATA_USER=odata -e CDC1C_ODATA_PASSWORD=secret \
+docker run --rm --network host \
+  -e CDC1C_ODATA_URL="http://192.168.56.101/trade_demo/odata/standard.odata" \
+  -e CDC1C_ODATA_USER=odata_user -e CDC1C_ODATA_PASSWORD=secret \
   -e CDC1C_EXCHANGE_NAME="ДляODATA" \
   -e CDC1C_QUEUE_GUID="a9bc23c5-3689-11f1-926c-0800270bc6cb" \
-  -e CDC1C_DB_URL="postgresql+psycopg2://user:pass@dbhost:5432/dwh" \
+  -e CDC1C_DB_URL="postgresql+psycopg2://postgres:postgres@localhost:5432/cdc_1c" \
   -e CDC1C_DB_SCHEMA=cdc_1c -e CDC1C_DB_TEMP_SCHEMA=cdc_1c_tmp \
-  sobolevp/cdc-1c:0.1.18
+  sobolevp/cdc-1c:latest
+```
+
+Адреса и пароли здесь — из тестового контура, подставьте свои.
+
+**`--network host` — про доступ к базе на той же машине.** У контейнера свой сетевой стек, поэтому
+`localhost` внутри него означает сам контейнер, а не хост. Postgres, установленный на хосте, по
+умолчанию слушает только `127.0.0.1`, то есть из контейнера недоступен ни как `localhost`, ни через
+адрес docker-шлюза (`172.17.0.1`) — на том интерфейсе он ничего не слушает. `--network host` отдаёт
+контейнеру сетевой стек хоста целиком: `localhost:5432` начинает означать вашу базу, а заодно
+становятся видны все сети, которые видит хост (например, host-only сеть VirtualBox с 1С).
+Альтернатива, если этот режим не подходит, — разрешить Postgres слушать docker-интерфейс
+(`listen_addresses` + строка для `172.17.0.0/16` в `pg_hba.conf`) и подключаться на `172.17.0.1`;
+доступ при этом открывается шире, поэтому для локальной работы проще первый вариант.
+
+Когда БД и 1С стоят на других серверах, `--network host` не нужен вовсе: их адреса резолвятся
+из контейнера как обычно.
+
+Так контейнер работает постоянно: цикл опроса раз в `CDC1C_POLL_INTERVAL` секунд, недоступные
+1С или БД не роняют его — ошибка пишется в лог, и попытка повторяется с нарастающей паузой.
+Разово проверить доступы, не уходя в вечный цикл, можно с `-e CDC1C_MODE=once` — один цикл
+read → save → notify, и выход.
+
+Убедились, что работает — запускайте в фоне: `-d --name cdc-1c` вместо `--rm`. С `-d` docker
+печатает только id контейнера и сразу возвращает управление, поэтому смотреть, что происходит,
+надо в логах:
+
+```bash
+docker logs -f cdc-1c        # что делает; Ctrl-C выходит из просмотра, контейнер работает дальше
+docker ps -a --filter name=cdc-1c   # если «ничего не произошло» — здесь видно, что контейнер вышел
 ```
 
 **Со своим кодом.** Обработчики и расписания объявляются кодом, поэтому свой `runner.py` и пакет
@@ -130,9 +159,9 @@ docker run -d --name cdc-1c \
 не нужно:
 
 ```bash
-docker run --rm sobolevp/cdc-1c:0.1.18 tar c -C /opt/cdc-1c config | tar x
+docker run --rm sobolevp/cdc-1c:latest tar c -C /opt/cdc-1c config | tar x
 # правим config/runner.py и config/handlers/, дальше:
-docker run -d --name cdc-1c --env-file .env -v "$PWD/config:/config:ro" sobolevp/cdc-1c:0.1.18
+docker run -d --name cdc-1c --env-file .env -v "$PWD/config:/config:ro" sobolevp/cdc-1c:latest
 ```
 
 Если `/config/runner.py` есть — запускается он (и все параметры можно задавать прямо в нём,
@@ -152,7 +181,7 @@ docker run -d --name cdc-1c --env-file .env -v "$PWD/config:/config:ro" sobolevp
 ```yaml
 services:
   cdc-1c:
-    image: sobolevp/cdc-1c:0.1.18
+    image: sobolevp/cdc-1c:0.1.19
     restart: unless-stopped
     env_file: .env
     environment:

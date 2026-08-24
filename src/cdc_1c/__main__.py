@@ -15,6 +15,7 @@ CDC1C_DB_SCHEMA, CDC1C_DB_TEMP_SCHEMA, CDC1C_FULL_LOAD_WORKERS, CDC1C_POLL_INTER
 import logging
 import os
 
+import requests
 from sqlalchemy import create_engine
 
 from cdc_1c.replicator import Replicator1C
@@ -44,6 +45,7 @@ def _number(name: str, default: str, cast=float):
 
 def main() -> None:
     odata_user = os.environ.get("CDC1C_ODATA_USER")
+    odata_url = _required("CDC1C_ODATA_URL")
     full_load_workers = _number("CDC1C_FULL_LOAD_WORKERS", "2", int)
 
     mode = os.environ.get("CDC1C_MODE", "loop")
@@ -58,19 +60,24 @@ def main() -> None:
 
     # Параметры присваиваются явно, по одному — как и в config/runner.py: сборка одинаково
     # читается и здесь, и в пользовательском коде, где значения будут литералами.
-    replicator = Replicator1C(
-        odata_url=_required("CDC1C_ODATA_URL"),
-        odata_auth=(odata_user, os.environ.get("CDC1C_ODATA_PASSWORD", "")) if odata_user else None,
-        exchange_name=_required("CDC1C_EXCHANGE_NAME"),
-        # Без узла обмена работать нельзя, но KeyError тут ничего не подскажет: пустое значение
-        # дойдёт до чтения изменений, и оно выведет в лог список узлов плана обмена.
-        queue_guid=os.environ.get("CDC1C_QUEUE_GUID", ""),
-        engine=engine,
-        db_schema=os.environ.get("CDC1C_DB_SCHEMA"),
-        # Схема промежуточных таблиц dbmerge; не задана — та же, что у данных.
-        db_temp_schema=os.environ.get("CDC1C_DB_TEMP_SCHEMA"),
-        full_load_workers=full_load_workers,
-    )
+    # Недоступная БД — не ошибка в коде, а состояние окружения: показываем строку, ради которой
+    # человек и полез бы в стотридцатистрочный трейс (см. _check_db_connection в replicator).
+    try:
+        replicator = Replicator1C(
+            odata_url=odata_url,
+            odata_auth=(odata_user, os.environ.get("CDC1C_ODATA_PASSWORD", "")) if odata_user else None,
+            exchange_name=_required("CDC1C_EXCHANGE_NAME"),
+            # Без узла обмена работать нельзя, но KeyError тут ничего не подскажет: пустое значение
+            # дойдёт до чтения изменений, и оно выведет в лог список узлов плана обмена.
+            queue_guid=os.environ.get("CDC1C_QUEUE_GUID", ""),
+            engine=engine,
+            db_schema=os.environ.get("CDC1C_DB_SCHEMA"),
+            # Схема промежуточных таблиц dbmerge; не задана — та же, что у данных.
+            db_temp_schema=os.environ.get("CDC1C_DB_TEMP_SCHEMA"),
+            full_load_workers=full_load_workers,
+        )
+    except ConnectionError as exc:
+        raise SystemExit(str(exc))
 
     # Уровень логирования — после конструктора: он вешает обработчик на логгер cdc_1c
     # (по умолчанию INFO), а тут переопределяем на заданный (например, DEBUG/WARNING).
@@ -83,10 +90,15 @@ def main() -> None:
                          "(expected DEBUG/INFO/WARNING/ERROR/CRITICAL)")
     logging.getLogger("cdc_1c").setLevel(level)
 
-    if mode == "once":
-        replicator.run_once()
-    else:
-        replicator.run_forever(interval=_number("CDC1C_POLL_INTERVAL", "60"))
+    # run_forever недоступную 1С переживает сам (логирует и повторяет с backoff), а run_once
+    # обязан отдать ошибку наружу — здесь она и превращается в строку вместо трейса.
+    try:
+        if mode == "once":
+            replicator.run_once()
+        else:
+            replicator.run_forever(interval=_number("CDC1C_POLL_INTERVAL", "60"))
+    except requests.RequestException as exc:
+        raise SystemExit(f"1C is not available at {odata_url}: {exc}")
 
 
 if __name__ == "__main__":

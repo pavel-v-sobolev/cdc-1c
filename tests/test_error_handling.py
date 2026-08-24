@@ -211,3 +211,4 @@ def test_backoff_resets_after_success(db, monkeypatch):
     repl.run_forever(interval=60.0, max_iterations=4)
 
     assert delays == [120.0, 240.0, 60.0]
+
