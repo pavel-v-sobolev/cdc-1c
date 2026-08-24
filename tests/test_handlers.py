@@ -100,7 +100,7 @@ def test_as_handler_accepts_instances_modules_and_functions(db):
     send_to_queue.ON = ["Catalog_X"]
     assert as_handler(send_to_queue).name == 'send_to_queue'
 
-    from example_config.handlers import zakazy_klientov as module_handler
+    from config.handlers import zakazy_klientov as module_handler
     assert as_handler(module_handler.ZakazyKlientov()).on == frozenset(
         ["AccumulationRegister_ZakazyKlientov", "Catalog_Nomenklatura"])
 

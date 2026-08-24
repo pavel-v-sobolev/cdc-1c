@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cdc-1c"
-version = "0.1.18"
+version = "0.1.19"
 description = "Change data capture (CDC) from 1C:Enterprise to your data warehouse"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -68,7 +68,7 @@ Issues = "https://github.com/pavel-v-sobolev/cdc_1C/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Корень репозитория в sys.path: тесты обработчиков импортируют example_config.handlers, чтобы
+# Корень репозитория в sys.path: тесты обработчиков импортируют config.handlers, чтобы
 # примеры не разъезжались с контрактом молча.
 pythonpath = ["."]
 # По умолчанию не гоняем тесты, которым нужна живая 1С. Postgres нужен всем тестам без

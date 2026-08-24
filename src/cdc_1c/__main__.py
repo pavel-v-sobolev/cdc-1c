@@ -9,7 +9,7 @@ CDC1C_QUEUE_GUID не знаете — запустите без него: в л
 CDC1C_DB_SCHEMA, CDC1C_DB_TEMP_SCHEMA, CDC1C_FULL_LOAD_WORKERS, CDC1C_POLL_INTERVAL, CDC1C_LOG_LEVEL, CDC1C_MODE.
 
 Обработчиков здесь нет: они объявляются кодом, а тут кода пользователя нет. Нужны обработчики —
-берите за основу example_config/runner.py: там ровно та же сборка, плюс по HandlerLoop на каждого
+берите за основу config/runner.py: там ровно та же сборка, плюс по HandlerLoop на каждого
 обработчика, а значения при желании заменяются литералами.
 """
 import logging
@@ -56,7 +56,7 @@ def main() -> None:
     # здесь нет — были бы, добавилось бы по соединению на каждого.
     engine = create_engine(_required("CDC1C_DB_URL"), pool_size=full_load_workers + 2)
 
-    # Параметры присваиваются явно, по одному — как и в example_config/runner.py: сборка одинаково
+    # Параметры присваиваются явно, по одному — как и в config/runner.py: сборка одинаково
     # читается и здесь, и в пользовательском коде, где значения будут литералами.
     replicator = Replicator1C(
         odata_url=_required("CDC1C_ODATA_URL"),
@@ -75,10 +75,13 @@ def main() -> None:
     # Уровень логирования — после конструктора: он вешает обработчик на логгер cdc_1c
     # (по умолчанию INFO), а тут переопределяем на заданный (например, DEBUG/WARNING).
     log_level = os.environ.get("CDC1C_LOG_LEVEL", "INFO").strip().upper() or "INFO"
-    if log_level not in logging.getLevelNamesMapping():
+    # getLevelName на известное имя отвечает числом, на неизвестное — строкой "Level FOO".
+    # Не getLevelNamesMapping(): он появился только в 3.11, а поддерживаем с 3.10.
+    level = logging.getLevelName(log_level)
+    if not isinstance(level, int):
         raise SystemExit(f"Unknown CDC1C_LOG_LEVEL={log_level!r} "
                          "(expected DEBUG/INFO/WARNING/ERROR/CRITICAL)")
-    logging.getLogger("cdc_1c").setLevel(log_level)
+    logging.getLogger("cdc_1c").setLevel(level)
 
     if mode == "once":
         replicator.run_once()

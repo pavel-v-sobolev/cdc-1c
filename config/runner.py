@@ -1,12 +1,17 @@
 """
-Точка входа: здесь собирается всё — подключения, параметры цикла и сами обработчики.
+Шаблон конфига: здесь собирается всё — подключения, параметры цикла, обработчики и расписания.
 
 Запускается как обычный скрипт: `python runner.py`. Пакет handlers/ лежит рядом — Python кладёт
-каталог скрипта в sys.path, поэтому импорт ниже его находит.
+каталог скрипта в sys.path, поэтому импорт его находит. В контейнере этот каталог монтируется
+в /config, и файл исполняется тем же способом, без единой правки путей.
+
+Как есть файл уже работает: поднимается репликатор, читает изменения и пишет их в целевую БД.
+Всё, что дальше является ПРИМЕРОМ — обработчики витрин и полные выгрузки по расписанию, —
+закомментировано: раскомментируйте нужное и замените на своё. Обработчики в handlers/ рядом —
+тоже примеры, разобранные в README.
 
 Параметры присваиваются явно, по одному, чтобы на этом экране было видно, что именно передано в
-репликатор. Значения взяты из окружения (удобно для контейнера), но любое можно заменить литералом —
-для python-приложения так и делается:
+репликатор. Значения взяты из окружения (удобно для контейнера), но любое можно заменить литералом:
 
     odata_url="http://server/base/odata/standard.odata",
     odata_auth=("odata", "secret"),   # None, если 1С опубликована без авторизации
@@ -16,30 +21,36 @@
 базовой» полагаться нельзя.
 
 Репликатор обработчиков не запускает и о них не знает: сигналы идут через таблицу handlers_1c.
-Здесь они просто живут в одном процессе с ним — так проще. Отсюда и обе другие раскладки, каждая
+Здесь они просто живут в одном процессе с ним — так проще. Отсюда и другие раскладки, каждая
 правкой этого файла: разнести по контейнерам — убрать репликатор, останутся одни циклы обработчиков;
-несколько планов обмена — завести второй Replicator1C и отправить его в тот же пул. В самих
-обработчиках при этом не меняется ничего.
+несколько планов обмена — завести второй Replicator1C и отправить его в тот же пул; только полные
+выгрузки без чтения изменений — собрать Replicator1C (он исполнитель full_load: метаданные,
+пагинация, запись, журнал) и просто не отправлять его run_forever в пул. В самих обработчиках при
+этом не меняется ничего.
 
-Запускаются все одинаково: у репликатора и у обработчика блокирующий run_forever, и оба уходят
-в пул потоков. Останавливает всех SIGTERM.
+Запускаются все одинаково: у репликатора, у обработчика и у расписания блокирующий run_forever,
+и все они уходят в пул потоков. Останавливает всех SIGTERM.
 """
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+# Нужен расписаниям (FullLoadCron ниже), когда грузится не весь объект, а свежий хвост.
+# from datetime import timedelta
 
 from sqlalchemy import create_engine
 
-from cdc_1c import HandlerLoop, Replicator1C
+from cdc_1c import FullLoadCron, HandlerLoop, Replicator1C
 
-from handlers import ZakazyKlientov, ZakazyKlientovGrouped
+# from handlers import ZakazyKlientov, ZakazyKlientovGrouped
 
 FULL_LOAD_WORKERS = 2
 POLL_INTERVAL = 60
 
-# Пул соединений: цикл изменений, страницы полной выгрузки, поток отметки живости и каждый
-# обработчик своим потоком. Здесь обработчиков два, отсюда FULL_LOAD_WORKERS + 2 + 2.
-engine = create_engine(os.environ["CDC1C_DB_URL"], pool_size=FULL_LOAD_WORKERS + 4)
+# Пул соединений: цикл изменений, страницы полной выгрузки, поток отметки живости — и СВЕРХ ТОГО
+# по соединению на каждый обработчик и каждое расписание, каждое из которых работает своим потоком.
+# Сейчас их нет, отсюда FULL_LOAD_WORKERS + 2; раскомментируете два обработчика и два расписания
+# ниже — станет FULL_LOAD_WORKERS + 6 (подробнее в README, «Сколько нужно соединений к БД»).
+engine = create_engine(os.environ["CDC1C_DB_URL"], pool_size=FULL_LOAD_WORKERS + 2)
 
 DB_SCHEMA = os.environ.get("CDC1C_DB_SCHEMA")
 # Схема промежуточных таблиц dbmerge — своя, отдельно от данных. Не обязательна (не задана — та же,
@@ -47,22 +58,6 @@ DB_SCHEMA = os.environ.get("CDC1C_DB_SCHEMA")
 # определению нет ничего ценного, поэтому таблицу, оставшуюся после падения процесса, там видно и не
 # жалко удалить. Схему создаёт сам dbmerge.
 DB_TEMP_SCHEMA = os.environ.get("CDC1C_DB_TEMP_SCHEMA")
-
-handler_zakazy_klientov = HandlerLoop(
-    engine=engine,
-    schema=DB_SCHEMA,
-    # Обработчик получит её в context.temp_schema и передаст в свой dbmerge.
-    temp_schema=DB_TEMP_SCHEMA,
-    handler=ZakazyKlientov(),
-)
-
-handler_zakazy_klientov_grouped = HandlerLoop(
-    engine=engine,
-    schema=DB_SCHEMA,
-    # Обработчик получит её в context.temp_schema и передаст в свой dbmerge.
-    temp_schema=DB_TEMP_SCHEMA,
-    handler=ZakazyKlientovGrouped(),
-)
 
 replicator = Replicator1C(
     odata_url=os.environ["CDC1C_ODATA_URL"],
@@ -76,11 +71,59 @@ replicator = Replicator1C(
     full_load_workers=FULL_LOAD_WORKERS,
 )
 
-with ThreadPoolExecutor(max_workers=3, thread_name_prefix='cdc') as pool:
+# --- Обработчики витрин: ПРИМЕР, замените на свои ------------------------------------------------
+# Считают витрины из уже загруженных таблиц, каждый своим циклом. Классы — в handlers/ рядом.
+#
+# handler_zakazy_klientov = HandlerLoop(
+#     engine=engine,
+#     schema=DB_SCHEMA,
+#     # Обработчик получит её в context.temp_schema и передаст в свой dbmerge.
+#     temp_schema=DB_TEMP_SCHEMA,
+#     handler=ZakazyKlientov(),
+# )
+#
+# handler_zakazy_klientov_grouped = HandlerLoop(
+#     engine=engine,
+#     schema=DB_SCHEMA,
+#     temp_schema=DB_TEMP_SCHEMA,
+#     handler=ZakazyKlientovGrouped(),
+# )
+
+# --- Полные выгрузки по расписанию: ПРИМЕР, замените на свои --------------------------------------
+# Зачем это нужно. Цикл изменений догоняет данные событиями, а полная выгрузка — сверяет: она читает
+# объект из 1С и возвращает число РЕАЛЬНО изменённых строк, то есть при исправном CDC отвечает нулём.
+# Ночная перегрузка свежего хвоста (последние сутки-двое) стоит недорого, а расхождение показывает
+# сразу — и тут же его выравнивает.
+#
+# На объект приходится две строки: что грузим и по какому расписанию. Имена — те, что видны в БД
+# (латиница), как и у обработчиков: настраивая выгрузку, смотрят в базу и в реестр
+# metadata_objects_1c (колонки object_full_name_en / fields_en). Оригинальные имена 1С
+# ("Document_ЗаказКлиента") тоже принимаются. Расписание — обычная crontab-строка, время локальное:
+# в контейнере задавайте TZ.
+#
+# Каждую ночь в 03:00 — хвост за трое суток по документу, где важна свежесть. Граница timedelta
+# считается в момент срабатывания, поэтому окно едет вместе с процессом. Фильтр по периоду заодно
+# делает выгрузку устойчивее: документы листаются через $skip, и выборка за пару прошедших суток,
+# в отличие от всего объекта, почти не меняется под ногами.
+#
+# zakazy_cron = FullLoadCron(replicator, "Document_ZakazKlienta", cron="0 3 * * *",
+#                            date_field="Date", date_from=timedelta(days=3))
+#
+# По воскресеньям в 02:00 — справочник целиком: он маленький, границы не нужны вовсе.
+#
+# nomenklatura_cron = FullLoadCron(replicator, "Catalog_Nomenklatura", cron="0 2 * * 0")
+
+# max_workers — по потоку на каждый run_forever ниже. Сейчас он один; с двумя обработчиками
+# и двумя расписаниями будет max_workers=5.
+with ThreadPoolExecutor(max_workers=1, thread_name_prefix='cdc') as pool:
     replicator_task = pool.submit(replicator.run_forever, interval=POLL_INTERVAL)
-    zakazy_klientov_task = pool.submit(handler_zakazy_klientov.run_forever)
-    zakazy_klientov_grouped_task = pool.submit(handler_zakazy_klientov_grouped.run_forever)
+    # zakazy_klientov_task = pool.submit(handler_zakazy_klientov.run_forever)
+    # zakazy_klientov_grouped_task = pool.submit(handler_zakazy_klientov_grouped.run_forever)
+    # zakazy_cron_task = pool.submit(zakazy_cron.run_forever)
+    # nomenklatura_cron_task = pool.submit(nomenklatura_cron.run_forever)
 
     replicator_task.result()
-    zakazy_klientov_task.result()
-    zakazy_klientov_grouped_task.result()
+    # zakazy_klientov_task.result()
+    # zakazy_klientov_grouped_task.result()
+    # zakazy_cron_task.result()
+    # nomenklatura_cron_task.result()

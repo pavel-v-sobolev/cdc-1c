@@ -1,0 +1,8 @@
+# В контекст сборки нужны только config/ и docker-entrypoint.sh: сам пакет ставится с PyPI.
+*
+
+!config
+!docker-entrypoint.sh
+
+# .pyc демо-обработчиков в образе не нужны — иначе уедут вместе с config/.
+**/__pycache__

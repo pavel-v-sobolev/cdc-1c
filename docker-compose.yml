@@ -1,0 +1,23 @@
+# Пример развёртывания. Целевой Postgres сюда не включён: база у вас своя.
+services:
+  cdc-1c:
+    image: sobolevp/cdc-1c:0.1.18
+    restart: unless-stopped
+
+    # Переменные CDC1C_* — список в README_ENV.md. Пароли держим в .env, а не в этом файле.
+    env_file: .env
+
+    # Расписания FullLoadCron считаются в локальном времени — задавайте свой пояс.
+    environment:
+      TZ: Europe/Moscow
+
+    # Свой конфиг: runner.py + handlers/. Шаблон достаётся из самого образа:
+    #   docker run --rm sobolevp/cdc-1c:0.1.18 tar c -C /opt/cdc-1c config | tar x
+    # Без этого тома контейнер работает в env-режиме, без обработчиков и расписаний.
+    # ro: конфиг читается и не должен меняться изнутри контейнера.
+    volumes:
+      - ./config:/config:ro
+
+    # По SIGTERM цикл дорабатывает текущую итерацию и только потом выходит: подтверждение пакета
+    # в 1С и незавершённые merge не должны обрываться. Мало времени — docker добьёт SIGKILL.
+    stop_grace_period: 60s
