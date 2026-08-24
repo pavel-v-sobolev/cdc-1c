@@ -6,7 +6,7 @@ Entrypoint для запуска из окружения без единой с�
 Обязательные: CDC1C_ODATA_URL, CDC1C_EXCHANGE_NAME, CDC1C_QUEUE_GUID, CDC1C_DB_URL.
 CDC1C_QUEUE_GUID не знаете — запустите без него: в лог выведется список узлов плана обмена.
 Необязательные: CDC1C_ODATA_USER, CDC1C_ODATA_PASSWORD (без пользователя — без авторизации),
-CDC1C_DB_SCHEMA, CDC1C_FULL_LOAD_WORKERS, CDC1C_POLL_INTERVAL, CDC1C_LOG_LEVEL, CDC1C_MODE.
+CDC1C_DB_SCHEMA, CDC1C_DB_TEMP_SCHEMA, CDC1C_FULL_LOAD_WORKERS, CDC1C_POLL_INTERVAL, CDC1C_LOG_LEVEL, CDC1C_MODE.
 
 Обработчиков здесь нет: они объявляются кодом, а тут кода пользователя нет. Нужны обработчики —
 берите за основу example_config/runner.py: там ровно та же сборка, плюс по HandlerLoop на каждого
@@ -67,6 +67,8 @@ def main() -> None:
         queue_guid=os.environ.get("CDC1C_QUEUE_GUID", ""),
         engine=engine,
         db_schema=os.environ.get("CDC1C_DB_SCHEMA"),
+        # Схема промежуточных таблиц dbmerge; не задана — та же, что у данных.
+        db_temp_schema=os.environ.get("CDC1C_DB_TEMP_SCHEMA"),
         full_load_workers=full_load_workers,
     )
 

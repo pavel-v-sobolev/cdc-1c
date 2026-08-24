@@ -101,6 +101,9 @@ class ZakazyKlientov(Handler1C):
         """Один и тот же merge для инкремента и для блока пересборки — различаются они только
         условиями, которые передаются в exec()."""
         return dbmerge(context.engine, table_name="ZakazyKlientov", schema=context.schema,
+                       # Промежуточную таблицу merge кладём туда же, куда её кладёт репликатор
+                       # (см. runner.py): не задана — схема данных.
+                       temp_schema=context.temp_schema,
                        source_table_name="ZakazyKlientov_view", source_schema=context.schema,
                        delete_mode='delete')
 

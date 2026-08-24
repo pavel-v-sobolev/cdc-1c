@@ -43,16 +43,25 @@ POLL_INTERVAL = 60
 engine = create_engine(os.environ["CDC1C_DB_URL"], pool_size=FULL_LOAD_WORKERS + 6)
 
 DB_SCHEMA = os.environ.get("CDC1C_DB_SCHEMA")
+# Схема промежуточных таблиц dbmerge — своя, отдельно от данных. Не обязательна (не задана — та же,
+# что у данных), но так таблицы с данными и рабочие таблицы merge не перемешиваются: в этой схеме по
+# определению нет ничего ценного, поэтому таблицу, оставшуюся после падения процесса, там видно и не
+# жалко удалить. Схему создаёт сам dbmerge.
+DB_TEMP_SCHEMA = os.environ.get("CDC1C_DB_TEMP_SCHEMA")
 
 handler_zakazy_klientov = HandlerLoop(
     engine=engine,
     schema=DB_SCHEMA,
+    # Обработчик получит её в context.temp_schema и передаст в свой dbmerge.
+    temp_schema=DB_TEMP_SCHEMA,
     handler=ZakazyKlientov(),
 )
 
 handler_zakazy_klientov_grouped = HandlerLoop(
     engine=engine,
     schema=DB_SCHEMA,
+    # Обработчик получит её в context.temp_schema и передаст в свой dbmerge.
+    temp_schema=DB_TEMP_SCHEMA,
     handler=ZakazyKlientovGrouped(),
 )
 
@@ -64,6 +73,7 @@ replicator = Replicator1C(
     queue_guid=os.environ.get("CDC1C_QUEUE_GUID", ""),
     engine=engine,
     db_schema=DB_SCHEMA,
+    db_temp_schema=DB_TEMP_SCHEMA,
     full_load_workers=FULL_LOAD_WORKERS,
 )
 

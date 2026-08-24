@@ -51,13 +51,17 @@ class FullLoadCron:
     прогон разводится claim'ом: занятый объект — срабатывание пропускается, ждём следующего по
     расписанию. Догонять пропущенное незачем: следующий прогон прочитает тот же период заново.
 
+    mark_missing=True — пометить строки, которых в 1С больше нет (физическое удаление объекта в
+    обмен не приходит вовсе, см. full_load). При заданном периоде кандидаты перед пометкой
+    перепроверяются в 1С: из окна строка могла уехать, а не исчезнуть.
+
     Время локальное — в контейнере задавайте TZ, иначе "0 3 * * *" сработает по UTC.
     """
 
     def __init__(self, replicator, table_name: str, *, cron: str,
                  date_field: str | None = None,
                  date_from: DateBound = None, date_to: DateBound = None,
-                 batch_size: int = 1000):
+                 batch_size: int = 1000, mark_missing: bool = False):
         # Перехват SIGTERM/SIGINT — по той же причине, что у Replicator1C и HandlerLoop: run_forever
         # уходит в пул потоков, а поставить перехват можно только из главного (см. stop_signal).
         install_signal_handlers(quiet=False)
@@ -77,6 +81,9 @@ class FullLoadCron:
         self.date_from = date_from
         self.date_to = date_to
         self.batch_size = batch_size
+        # Помечать строки, которых в 1С не оказалось (см. full_load). По умолчанию выключено:
+        # прогон становится дороже, а нужно это не всем.
+        self.mark_missing = mark_missing
 
         # Разрешённые имена 1С (объект и поле даты): требуют $metadata, то есть сетевого запроса,
         # поэтому считаются при первом прогоне — конструкторы в проекте в сеть не ходят.
@@ -148,7 +155,7 @@ class FullLoadCron:
             date_to = _bound(self.date_to)
             rows_modified = self.replicator.full_load(
                 object_name, batch_size=self.batch_size, date_field=date_field,
-                date_from=date_from, date_to=date_to)
+                date_from=date_from, date_to=date_to, mark_missing=self.mark_missing)
         logger.info("Scheduled full load of %s (%s..%s) modified %s rows",
                     self.table_name, date_from or '', date_to or '', rows_modified)
         return rows_modified

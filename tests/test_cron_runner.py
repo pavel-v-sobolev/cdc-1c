@@ -28,9 +28,10 @@ def _replicator(db, calls, rows_modified=0):
     rep.metadata[OBJECT_1C] = MetadataObject1C(OBJECT_1C, properties, {"Ref_Key": "Guid"})
 
     def fake_full_load(object_name, batch_size=1000, date_field=None,
-                       date_from=None, date_to=None):
+                       date_from=None, date_to=None, mark_missing=False):
         calls.append({"object_name": object_name, "batch_size": batch_size,
-                      "date_field": date_field, "date_from": date_from, "date_to": date_to})
+                      "date_field": date_field, "date_from": date_from, "date_to": date_to,
+                      "mark_missing": mark_missing})
         return rows_modified
 
     rep.full_load = fake_full_load
@@ -91,6 +92,15 @@ def test_fixed_bounds_are_passed_as_is(db):
     cron.run_once()
     assert calls[0]["date_from"] == date(2026, 6, 1)
     assert calls[0]["date_to"] == datetime(2026, 6, 30, 23, 59, 59)
+
+
+def test_mark_missing_is_passed_through_and_off_by_default(db):
+    # Пометка пропавших строк делает прогон дороже, поэтому включается явно.
+    calls = []
+    rep = _replicator(db, calls)
+    FullLoadCron(rep, TABLE, cron="0 3 * * *").run_once()
+    FullLoadCron(rep, TABLE, cron="0 3 * * *", mark_missing=True).run_once()
+    assert [c["mark_missing"] for c in calls] == [False, True]
 
 
 def test_config_errors_raise_in_constructor(db):

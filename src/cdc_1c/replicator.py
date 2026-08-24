@@ -3,19 +3,23 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import date, datetime, timedelta
 
 import requests
-from sqlalchemy import Engine
+from dbmerge import mergeResult
+from sqlalchemy import Engine, Integer, Numeric
+from sqlalchemy.exc import NoSuchTableError
 
 from cdc_1c.metadata_reader import MetadataReader1C
 from cdc_1c.common_functions import format_duration
-from cdc_1c.data_reader import DataReader1C, RECORDER_FIELDS
+from cdc_1c.data_reader import (DataReader1C, IS_DELETED_OR_EMPTY_FIELD,
+                                RECORDER_FIELDS, _odata_literal)
 from cdc_1c.change_reader import ChangeReader1C
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.db_writer import DBWriter1C, save_order_key
 from cdc_1c.db_logs import Replicator1CLog, LOAD_TYPE_CHANGES, LOAD_TYPE_FULL
+from cdc_1c.full_load_keys import FullLoadKeys
 from cdc_1c.handlers import (HandlerSignals, WriteTracker,
                              SOURCE_CHANGES, SOURCE_FULL_LOAD)
 from cdc_1c.stop_signal import StopSignal, install_signal_handlers
@@ -53,6 +57,10 @@ FULL_LOAD_MIN_BATCH = 1
 # файлов на сервере приложений, и запрос падает ещё до того, как мы узнаем вес entry.
 FULL_LOAD_TARGET_BYTES = 32 * 1024 * 1024
 FULL_LOAD_PROBE_BATCH = 20
+
+# Перепроверка кандидатов на пометку (mark_missing при выгрузке за период): сколько ключей уходит
+# в один $filter. Ключи объединяются через OR, и слишком длинный URL 1С не примет.
+RECHECK_KEYS_PER_REQUEST = 20
 
 
 def _is_permanent_error(exc: BaseException) -> bool:
@@ -179,6 +187,14 @@ def _rows_modified(result) -> int:
     return result.inserted_row_count + result.updated_row_count + result.deleted_row_count
 
 
+def _marked_result(marked: int) -> mergeResult:
+    """Результат шага пометки пропавших строк в терминах mergeResult: журнал и сигнал обработчикам
+    принимают именно его, а пометка — это ровно то, что dbmerge считает deleted_row_count."""
+    return mergeResult(total_row_count=marked, inserted_row_count=0, updated_row_count=0,
+                       deleted_row_count=marked, total_time=0.0, temp_insert_time=0.0,
+                       insert_time=0.0, update_time=0.0, delete_time=0.0)
+
+
 def _log_failure(exc: BaseException, message: str, *args) -> None:
     """
     Пишет в лог падение цикла. Для ошибок обмена traceback не нужен: он целиком состоит из
@@ -232,6 +248,7 @@ class Replicator1C:
     def __init__(self, odata_url: str, odata_auth: tuple[str, str] | None,
                  exchange_name: str, queue_guid: str,
                  engine: Engine, db_schema: str | None = None,
+                 db_temp_schema: str | None = None,
                  request_timeout: float | None = None,
                  full_load_workers: int = 2):
         # Включаем вывод логов, если приложение не настроило логирование само.
@@ -245,6 +262,10 @@ class Replicator1C:
         # иначе оборачиваются ошибкой 1С посреди первого цикла, где уже не видно, что не так.
         self.engine = _check_engine(engine)
         self.db_schema = _check_db_schema(db_schema)
+        # Схема промежуточных таблиц dbmerge. Не задана — та же, что у данных. Отдельная схема
+        # (например cdc_1c_tmp) держит их в стороне от таблиц с данными: в ней по определению нет
+        # ничего ценного, поэтому таблицу, оставшуюся после падения процесса, там видно и не жалко.
+        self.db_temp_schema = _check_db_schema(db_temp_schema)
         self._odata_url = _check_odata_url(odata_url)
         self._exchange_name = _check_exchange_name(exchange_name)
         self._queue_guid = _check_queue_guid(queue_guid)
@@ -258,7 +279,8 @@ class Replicator1C:
         # он же ведёт реестр объектов metadata_objects_1c (состояние полной выгрузки).
         self.metadata = MetadataReader1C(self._odata_url, odata_auth=self._odata_auth,
                                          request_timeout=self._request_timeout,
-                                         engine=self.engine, schema=self.db_schema)
+                                         engine=self.engine, schema=self.db_schema,
+                                         temp_schema=self.db_temp_schema)
         self.name_mapper = NameMapper1C()
 
         # Фоновая полная выгрузка: пул потоков и защита от повторного сабмита одного объекта.
@@ -272,7 +294,7 @@ class Replicator1C:
                                       self.metadata, odata_auth=self._odata_auth,
                                       request_timeout=self._request_timeout)
         self.writer = DBWriter1C(engine=self.engine, name_mapper=self.name_mapper,
-                                 schema=self.db_schema)
+                                 schema=self.db_schema, temp_schema=self.db_temp_schema)
         # Лог загрузки (строка на объект) пишет оркестратор: только здесь есть контекст обмена
         # (exchange_name/message_no), а writer универсален и может делать и полную перевыгрузку.
         self.replicator_log = Replicator1CLog(self.engine, self.db_schema)
@@ -409,7 +431,8 @@ class Replicator1C:
     def full_load(self, object_name: str, batch_size: int = 1000,
                   date_field: str | None = None,
                   date_from: date | datetime | str | None = None,
-                  date_to: date | datetime | str | None = None) -> int:
+                  date_to: date | datetime | str | None = None,
+                  mark_missing: bool = False) -> int:
         """
         Полная постраничная выгрузка объекта 1С в целевую таблицу: по batch_size записей за запрос,
         каждая страница сразу сохраняется через writer.save(full_load_started_at=...). Идемпотентно — повторный
@@ -437,6 +460,15 @@ class Replicator1C:
         документов, Period у регистров), date_from/date_to — границы (datetime/date/ISO-строка,
         включительно). Транслируется в OData $filter `date_field ge …[ and date_field le …]` и
         объединяется с keyset-курсором по AND. Полезно для ручной догрузки за нужный период.
+
+        mark_missing=True — пометить строки, которых в 1С не оказалось (см. full_load_keys). Нужно
+        затем, что физическое удаление объекта в обмен не приходит вовсе, и такая строка иначе
+        остаётся в таблице навсегда. Ключи прогона копятся в отдельной таблице, и после успешного
+        завершения строки, которых там нет, помечаются (is_deleted_or_empty), а не удаляются:
+        обработчик замечает изменение только по merged_on. Если задан период, каждый кандидат перед
+        пометкой перепроверяется запросом в 1С — из окна он мог не исчезнуть, а уехать (у документа
+        изменилась дата, у независимого регистра — поле ключа). По умолчанию выключено: прогон
+        становится дороже, а нужен он не всем.
 
         Возвращает число РЕАЛЬНО изменённых строк (вставлено + обновлено + удалено, по всем
         страницам и вложенным объектам). Это проверка самого CDC: если изменения доезжают исправно,
@@ -468,51 +500,173 @@ class Replicator1C:
         skip = 0
         total = 0
         rows_modified = 0
+        # Ключи прогона: собираются постранично, в конце по ним помечаются пропавшие строки.
+        # ExitStack — чтобы одноразовая таблица гарантированно удалилась и при ошибке прогона.
+        keys = self._full_load_keys(object_name) if mark_missing else None
+        stack = ExitStack()
         # Начинаем с размера, подобранного по этому объекту раньше, иначе — с пробной страницы.
         page_size = min(batch_size,
                         self._full_load_page_size.get(object_name, FULL_LOAD_PROBE_BATCH))
-        while True:
-            try:
-                page = reader.read_object(object_name, top=page_size, key_fields=key_fields,
-                                          after_values=after_values, key_types=key_types,
-                                          extra_filter=date_filter,
-                                          skip=None if use_keyset else skip)
-            except requests.HTTPError as exc:
-                # Страница не по зубам серверу 1С (упирается в память/временные файлы) —
-                # уменьшаем её и повторяем с того же места. Курсор/смещение не сдвигались.
-                if _is_permanent_error(exc) or page_size <= FULL_LOAD_MIN_BATCH:
-                    raise
-                page_size = max(FULL_LOAD_MIN_BATCH, page_size // FULL_LOAD_BATCH_DIVISOR)
-                self._full_load_page_size[object_name] = page_size
-                logger.warning("Full load of %s: page failed, retrying with batch_size=%s",
-                               object_name, page_size)
-                continue
-            for obj_name, data_object in reader.items():
-                # Много страниц/объектов пишутся в одну строку лога — счётчики суммируются в БД.
-                table_name = self._handler_key(obj_name)
-                with self.writes.track(table_name):
-                    result = self.writer.save(obj_name, data_object, full_load_started_at=started_at)
-                self.replicator_log.write_result(log_id, result)
-                rows_modified += _rows_modified(result)
-                # Флаг на каждую страницу, а не один в конце прогона: он булев, тысяча страниц
-                # поднимет его один раз, зато витрина начинает наполняться после первой же
-                # страницы, а не через часы, когда выгрузка закончится.
-                self._signal_handlers(table_name, result, SOURCE_FULL_LOAD)
-            total += page
-            if page < page_size:
-                break
-            if use_keyset:
-                # Курсор следующей страницы — значения ключевых полей последней записи.
-                data = reader[object_name].data
-                after_values = [data[f][-1] for f in key_fields]
-            else:
-                skip += page
-            page_size = self._next_page_size(object_name, page_size, page,
-                                             reader.last_response_bytes, batch_size)
+        with stack:
+            if keys is not None:
+                stack.enter_context(keys)
+            while True:
+                try:
+                    page = reader.read_object(object_name, top=page_size, key_fields=key_fields,
+                                              after_values=after_values, key_types=key_types,
+                                              extra_filter=date_filter,
+                                              skip=None if use_keyset else skip)
+                except requests.HTTPError as exc:
+                    # Страница не по зубам серверу 1С (упирается в память/временные файлы) —
+                    # уменьшаем её и повторяем с того же места. Курсор/смещение не сдвигались.
+                    if _is_permanent_error(exc) or page_size <= FULL_LOAD_MIN_BATCH:
+                        raise
+                    page_size = max(FULL_LOAD_MIN_BATCH, page_size // FULL_LOAD_BATCH_DIVISOR)
+                    self._full_load_page_size[object_name] = page_size
+                    logger.warning("Full load of %s: page failed, retrying with batch_size=%s",
+                                   object_name, page_size)
+                    continue
+                if keys is not None:
+                    # Ключи страницы — до сохранения: если save упадёт, прогон не закончится и
+                    # пометки не будет вовсе, а лишние ключи в одноразовой таблице никому не мешают.
+                    keys.add(self._page_keys(object_name, reader))
+                for obj_name, data_object in reader.items():
+                    # Много страниц/объектов пишутся в одну строку лога — счётчики суммируются в БД.
+                    table_name = self._handler_key(obj_name)
+                    with self.writes.track(table_name):
+                        result = self.writer.save(obj_name, data_object,
+                                                  full_load_started_at=started_at)
+                    self.replicator_log.write_result(log_id, result)
+                    rows_modified += _rows_modified(result)
+                    # Флаг на каждую страницу, а не один в конце прогона: он булев, тысяча страниц
+                    # поднимет его один раз, зато витрина начинает наполняться после первой же
+                    # страницы, а не через часы, когда выгрузка закончится.
+                    self._signal_handlers(table_name, result, SOURCE_FULL_LOAD)
+                total += page
+                if page < page_size:
+                    break
+                if use_keyset:
+                    # Курсор следующей страницы — значения ключевых полей последней записи.
+                    data = reader[object_name].data
+                    after_values = [data[f][-1] for f in key_fields]
+                else:
+                    skip += page
+                page_size = self._next_page_size(object_name, page_size, page,
+                                                 reader.last_response_bytes, batch_size)
+            if keys is not None:
+                # Пометка — только здесь, после последней страницы: прогон, упавший на середине,
+                # объявил бы «пропавшим» весь непрочитанный хвост объекта.
+                rows_modified += self._mark_missing_rows(object_name, keys, started_at, reader,
+                                                         recheck=date_filter is not None,
+                                                         log_id=log_id)
         self.replicator_log.write_result(log_id, finish=True)
         logger.info("Full load of %s finished (%s records, %s rows modified)",
                     object_name, total, rows_modified)
         return rows_modified
+
+
+    def _primary_key_columns(self, object_name: str) -> dict:
+        """Первичный ключ объекта в терминах целевой таблицы: {колонка: тип SQLAlchemy}. По нему
+        собираются ключи прогона и по нему же идёт анти-join пометки."""
+        metadata_obj = self.metadata.get(object_name)
+        column_types = metadata_obj.get_column_types()
+        return {self.name_mapper.map_field_name(field): column_types[field]
+                for field in metadata_obj.primary_key}
+
+    def _full_load_keys(self, object_name: str) -> FullLoadKeys:
+        """Одноразовая таблица ключей прогона (см. full_load_keys)."""
+        return FullLoadKeys(self.engine, target_table_name=self._handler_key(object_name),
+                            key_columns=self._primary_key_columns(object_name),
+                            schema=self.db_temp_schema or self.db_schema)
+
+    def _page_keys(self, object_name: str, reader: DataReader1C) -> list[dict]:
+        """Ключи строк одной страницы — только самого объекта: табличные части приезжают вложенно и
+        помечаются вместе с владельцем (own-or-skip группы), отдельного снимка по ним нет."""
+        data_object = reader.get(object_name)
+        if data_object is None or data_object.data_length == 0:
+            return []
+        data = data_object.data
+        fields = self.metadata.get(object_name).primary_key
+        columns = [(field, self.name_mapper.map_field_name(field)) for field in fields]
+        return [{column: data[field][i] for field, column in columns}
+                for i in range(data_object.data_length)]
+
+    def _mark_missing_rows(self, object_name: str, keys: FullLoadKeys, started_at,
+                           reader: DataReader1C, recheck: bool, log_id: int | None = None) -> int:
+        """
+        Помечает строки, которых прогон в 1С не увидел, и сообщает об этом обработчикам.
+
+        recheck=True (выгрузка шла за период) — кандидаты сперва перепроверяются в 1С: из окна
+        строка могла не исчезнуть, а уехать (у документа изменилась дата, у независимого регистра —
+        поле, входящее в ключ). Ответ перепроверки авторитетнее снимка: он свежее.
+        """
+        table_name = self._handler_key(object_name)
+        try:
+            target = self.writer.target_table(table_name)
+        except NoSuchTableError:
+            # Таблицы нет: объект пуст и в 1С, и в БД (её создаёт первая же сохранённая страница).
+            # Помечать нечего.
+            logger.info("Full load of %s: nothing to mark, table %s does not exist yet",
+                        object_name, table_name)
+            return 0
+        mark_field = self.name_mapper.map_field_name(IS_DELETED_OR_EMPTY_FIELD)
+        if recheck:
+            candidates = keys.missing_rows(target, started_at, mark_field)
+            if candidates:
+                alive = self._still_in_1c(object_name, candidates, reader)
+                logger.info("Full load of %s: %s of %s candidates are still in 1C (moved out of "
+                            "the period, not deleted)", object_name, len(alive), len(candidates))
+                keys.add(alive)
+        with self.writes.track(table_name):
+            marked = keys.mark_missing(target, started_at, mark_field,
+                                       reset_values=self._resource_reset_values(object_name, target))
+        if marked:
+            logger.info("Full load of %s: %s rows are gone from 1C and were marked deleted",
+                        object_name, marked)
+            # В журнал пометка идёт как deleted_row_count — тем же счётчиком, которым dbmerge
+            # считает строки, помеченные удалёнными.
+            if log_id is not None:
+                self.replicator_log.write_result(log_id, _marked_result(marked))
+            self.handler_signals.signal(table_name, SOURCE_FULL_LOAD)
+        return marked
+
+    def _resource_reset_values(self, object_name: str, target) -> dict:
+        """Числовые ресурсы регистра гасим в NULL вместе с пометкой — ровно как при выпадении
+        строки из набора (см. DBWriter1C._resource_reset_values): SUM игнорирует NULL, и итог
+        остаётся верным даже в запросе, забывшем фильтр по is_deleted_or_empty."""
+        metadata_obj = self.metadata.get(object_name)
+        column_types = metadata_obj.get_column_types()
+        values = {}
+        for resource in metadata_obj.resources:
+            column = self.name_mapper.map_field_name(resource)
+            if column in target.c and isinstance(column_types.get(resource), (Integer, Numeric)):
+                values[column] = None
+        return values
+
+    def _still_in_1c(self, object_name: str, candidates: list[dict],
+                     reader: DataReader1C) -> list[dict]:
+        """
+        Кандидаты, которые в 1С всё-таки есть: запрашиваем их по ключу пачками
+        (RECHECK_KEYS_PER_REQUEST) и возвращаем те, что пришли в ответе.
+
+        Запрос идёт БЕЗ фильтра по периоду — в том и смысл: проверяем существование объекта, а не
+        попадание в окно.
+        """
+        metadata_obj = self.metadata.get(object_name)
+        fields = [(field, self.name_mapper.map_field_name(field), type_name)
+                  for field, type_name in metadata_obj.primary_key.items()]
+        alive = []
+        for start in range(0, len(candidates), RECHECK_KEYS_PER_REQUEST):
+            batch = candidates[start:start + RECHECK_KEYS_PER_REQUEST]
+            terms = []
+            for row in batch:
+                conj = ' and '.join(f"{field} eq {_odata_literal(row[column], type_name)}"
+                                    for field, column, type_name in fields)
+                terms.append(f"({conj})" if ' and ' in conj else conj)
+            reader.read_object(object_name, extra_filter=' or '.join(terms),
+                               key_fields=[fields[0][0]])
+            alive.extend(self._page_keys(object_name, reader))
+        return alive
 
     @staticmethod
     def _odata_datetime(value: date | datetime | str) -> str:

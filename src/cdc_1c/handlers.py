@@ -163,6 +163,9 @@ class HandlerContext:
 
     engine: Engine
     schema: str | None
+    # Схема промежуточных таблиц dbmerge, если обработчик пишет витрину через него: передайте её
+    # в dbmerge(..., temp_schema=context.temp_schema). None — та же схема, что у данных.
+    temp_schema: str | None
     # Границы окна по часам БД: (last_run_at, boundary]. last_run_at=None — с начала времён.
     last_run_at: datetime | None
     boundary: datetime
@@ -754,6 +757,7 @@ class HandlerLoop:
     """
 
     def __init__(self, engine: Engine, schema: str | None, handler,
+                 temp_schema: str | None = None,
                  write_tracker: "WriteTracker | None" = None):
         # Перехват SIGTERM/SIGINT — по той же причине, что у Replicator1C: run_forever уходит в
         # пул потоков, а поставить перехват можно только из главного (см. stop_signal).
@@ -767,6 +771,10 @@ class HandlerLoop:
         self.engine = engine
         self.schema_name = _check_create_schema(engine, schema)
         self.schema = schema
+        # Схема промежуточных таблиц dbmerge — обработчику она нужна затем же, зачем репликатору
+        # (см. Replicator1C): держать их в стороне от таблиц с данными. Сам цикл её не использует,
+        # он лишь передаёт её обработчику в контексте.
+        self.temp_schema = temp_schema
         # Реестр незавершённых merge. По умолчанию — общий, из таблицы writes_in_process_1c
         # (см. свойство writes); подменяется только в тестах.
         self._writes = write_tracker
@@ -982,7 +990,8 @@ class HandlerLoop:
 
     def _context(self, window_start, boundary, objects, sources, full_rebuild, rebuild_from):
         return HandlerContext(
-            engine=self.engine, schema=self.schema, last_run_at=window_start, boundary=boundary,
+            engine=self.engine, schema=self.schema, temp_schema=self.temp_schema,
+            last_run_at=window_start, boundary=boundary,
             objects=frozenset(objects), sources=frozenset(sources), full_rebuild=full_rebuild,
             rebuild_from=rebuild_from or None,
             logger=get_logger(f'cdc_1c.handler.{self.name}'))

@@ -171,7 +171,8 @@ class MetadataObject1C(UserDict):
 class MetadataReader1C(UserDict):
     def __init__(self, odata_url:str, odata_auth: tuple[str, str] | None = None,
                  request_timeout: float | None = None,
-                 engine: Engine | None = None, schema: str | None = None):
+                 engine: Engine | None = None, schema: str | None = None,
+                 temp_schema: str | None = None):
         super().__init__()
         self.odata_url=odata_url
         self.odata_auth=odata_auth
@@ -191,6 +192,8 @@ class MetadataReader1C(UserDict):
         # Таблицу создаёт сам dbmerge при первой sync; objects_table — её Table-описание оттуда же.
         self.engine = engine
         self.schema = schema
+        # Схема промежуточных таблиц dbmerge (см. DBWriter1C); None — схема данных.
+        self.temp_schema = temp_schema
         self.objects_table = None
 
 
@@ -365,6 +368,7 @@ class MetadataReader1C(UserDict):
         with dbmerge(engine=self.engine, table_name=METADATA_OBJECTS_TABLE, data=data,
                      key=['object_full_name'], delete_mode='delete', 
                      merged_on_field='merged_on', schema=self.schema,
+                     temp_schema=self.temp_schema,
                      data_types={'object_full_name': String(),
                                  'object_name': String(),
                                  'object_type': String(),

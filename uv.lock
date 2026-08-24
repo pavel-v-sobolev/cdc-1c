@@ -246,15 +246,15 @@ wheels = [
 
 [[package]]
 name = "dbmerge"
-version = "1.0.22"
+version = "1.0.23"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "alembic" },
     { name = "sqlalchemy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7a/65/95bcf30047d2b8c2a2343d21d919fb1f080df3924caf84743c576a642b0c/dbmerge-1.0.22.tar.gz", hash = "sha256:95ccdf5e716d12881f69a59602f12525a7197fccd26f03929a1c9a293457601b", size = 40299, upload-time = "2026-08-16T10:37:14.052Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/70/08/40e2dda51d9c25eb7cf2f080a2022b58454d2a0691c6248a7b7fa9c4915f/dbmerge-1.0.23.tar.gz", hash = "sha256:176b53e17657035d5c1ed9ade6f2cc063efdd828d2bdca686e520c9129d54980", size = 42653, upload-time = "2026-08-24T06:20:59.049Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/52/d5/ef9f3a39b0012d09f3b0e923d14f1b1c92d305adb64fa888fa3990123a08/dbmerge-1.0.22-py3-none-any.whl", hash = "sha256:aaeedc68b0e8f92209a24d9bee295eaa9a005052574742ab67c5913947a2101b", size = 25910, upload-time = "2026-08-16T10:37:12.236Z" },
+    { url = "https://files.pythonhosted.org/packages/55/9a/3255c6847167b638fcc9d02ffa65ddbaf345bfa8b7de73aa764f44cef106/dbmerge-1.0.23-py3-none-any.whl", hash = "sha256:4d57d6f0dab8faab27e319be18874de775ae3446151b2fba9543a1b6de6bdcc0", size = 26907, upload-time = "2026-08-24T06:20:57.311Z" },
 ]
 
 [[package]]
@@ -341,11 +341,11 @@ wheels = [
 
 [[package]]
 name = "idna"
-version = "3.18"
+version = "3.19"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/cd/63/9496c57188a2ee585e0f1db071d75089a11e98aa86eb99d9d7618fc1edce/idna-3.18.tar.gz", hash = "sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848", size = 196711, upload-time = "2026-06-02T14:34:07.794Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5f/f7/abb373e5757eaec4b922b92f97ec8d6d7e057cf06778247604fbc4e7c3f3/idna-3.19.tar.gz", hash = "sha256:5e0811a4383b21dc5838069f801c4fb62113b7447663d2530d2bd6e77b49bf15", size = 215237, upload-time = "2026-08-18T05:14:24.27Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1e/5e/d4e9f1a599fb8e573b7b87160658329fbf28d19eac2718f51fc3def3aa5a/idna-3.18-py3-none-any.whl", hash = "sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2", size = 65455, upload-time = "2026-06-02T14:34:06.319Z" },
+    { url = "https://files.pythonhosted.org/packages/57/b0/0e52c878c53f245edd3a11020f20979b3f490f245af532c7cae3027754b5/idna-3.19-py3-none-any.whl", hash = "sha256:815e7be7a7806d54abb586dc943addc79e8b2ee16915059658cbeff4b1b43bf4", size = 68550, upload-time = "2026-08-18T05:14:22.343Z" },
 ]
 
 [[package]]

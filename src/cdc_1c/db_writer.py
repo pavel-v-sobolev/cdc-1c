@@ -52,10 +52,15 @@ class DBWriter1C:
     в порядке пакетов, поэтому guard'ами не ограничиваются.
     """
 
-    def __init__(self, engine: Engine, name_mapper: NameMapper1C, schema: str | None = None):
+    def __init__(self, engine: Engine, name_mapper: NameMapper1C, schema: str | None = None,
+                 temp_schema: str | None = None):
         self.engine = engine
         self.name_mapper = name_mapper
         self.schema = schema
+        # Схема промежуточных таблиц dbmerge. None — та же, что у данных (умолчание dbmerge).
+        # Отдельная схема удобна тем, что в ней по определению нет ничего ценного: временную
+        # таблицу, оставшуюся после падения процесса, там видно и не жалко удалить.
+        self.temp_schema = temp_schema
         # Таблицы, для которых индекс по merged_on уже обеспечен в этом процессе (чтобы не рефлексить
         # и не дёргать checkfirst на каждом save).
         self._indexed_tables: set[str] = set()
@@ -113,7 +118,8 @@ class DBWriter1C:
                          key=key, data_types=data_types,
                          merged_on_field=MERGED_ON_FIELD, inserted_on_field=INSERTED_ON_FIELD,
                          skip_compare_fields=skip_compare,
-                         delete_mode='no', schema=self.schema) as merge:
+                         delete_mode='no', schema=self.schema,
+                         temp_schema=self.temp_schema) as merge:
                 result = merge.exec(
                     update_condition=self._not_touched_since(merge.table, started_at)
                                      if started_at is not None else None)
@@ -130,7 +136,7 @@ class DBWriter1C:
                          delete_mode='mark',
                          delete_mark_field=self.name_mapper.map_field_name(IS_DELETED_OR_EMPTY_FIELD),
                          delete_mark_values=self._resource_reset_values(metadata_obj, records),
-                         schema=self.schema) as merge:
+                         schema=self.schema, temp_schema=self.temp_schema) as merge:
                 scoped = self._scoped_delete_condition(merge.table, merge.temp_table, mapped_object_key)
                 if started_at is not None:
                     # own-or-skip группы: не трогаем то, что переписано после старта прогона.
@@ -222,6 +228,11 @@ class DBWriter1C:
         conds = [g.c[col] == merge.temp_table.c[col] for col in mapped_object_key]
         conds.append(g.c[MERGED_ON_FIELD] >= started_at)
         return ~exists().where(and_(*conds))
+
+    def target_table(self, table_name: str) -> Table:
+        """Table-описание целевой таблицы по отражению из БД. Нужно тем, кто пишет в неё не через
+        dbmerge, — например пометке пропавших строк полной выгрузки (см. full_load_keys)."""
+        return Table(table_name, MetaData(), schema=self.schema, autoload_with=self.engine)
 
     def _ensure_merged_on_index(self, table_name: str) -> None:
         """
