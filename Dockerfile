@@ -1,5 +1,5 @@
 # Образ ставит cdc-1c с PyPI по версии: версия пакета = версия образа, собирать нечего.
-#   docker build --build-arg CDC1C_VERSION=0.1.18 -t sobolevp/cdc-1c:0.1.18 .
+#   docker build --build-arg CDC1C_VERSION=0.1.22 -t sobolevp/cdc-1c:0.1.22 -t sobolevp/cdc-1c:latest .
 # Версия должна быть уже опубликована на PyPI, иначе pip внутри сборки её не найдёт.
 FROM python:3.13-slim
 
@@ -25,7 +25,7 @@ RUN test -n "${CDC1C_VERSION}" || (echo "build-arg CDC1C_VERSION is required" >&
     && pip install --no-cache-dir "cdc-1c[postgres]==${CDC1C_VERSION}"
 
 # Шаблон конфига внутри образа: достаётся из него же, версия шаблона совпадает с версией библиотеки.
-#   docker run --rm sobolevp/cdc-1c:<version> tar c -C /opt/cdc-1c config | tar x
+#   docker run --rm sobolevp/cdc-1c:latest tar c -C /opt/cdc-1c config | tar x
 COPY config /opt/cdc-1c/config
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 755 /usr/local/bin/docker-entrypoint.sh

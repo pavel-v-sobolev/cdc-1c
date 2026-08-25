@@ -181,7 +181,7 @@ docker run -d --name cdc-1c --env-file .env -v "$PWD/config:/config:ro" sobolevp
 ```yaml
 services:
   cdc-1c:
-    image: sobolevp/cdc-1c:0.1.19
+    image: sobolevp/cdc-1c:latest
     restart: unless-stopped
     env_file: .env
     environment:
