@@ -718,10 +718,10 @@ def test_merge_heartbeat_works_without_a_replication_loop(db, monkeypatch):
     # Отметку живости раньше вёл только run_forever репликатора. Но строки реестра появляются и в
     # одиночном run_once, и в вызванном руками full_load — там цикла нет вовсе, и merge, идущий
     # дольше HEARTBEAT_TTL, признавался бы брошенным: обработчик перешагнул бы его строки.
-    from cdc_1c import handlers as handlers_module
+    from cdc_1c import write_tracker as tracker_module
     from cdc_1c.handlers import HEARTBEAT_TTL
 
-    monkeypatch.setattr(handlers_module, 'HEARTBEAT_PERIOD', 0.05)
+    monkeypatch.setattr(tracker_module, 'HEARTBEAT_PERIOD', 0.05)
     tracker = WriteTracker(db.engine, db.schema, 'План1')
     try:
         with tracker.track("Catalog_Nomenklatura") as tracked:
@@ -753,9 +753,9 @@ def test_heartbeat_thread_is_started_once(db, monkeypatch):
     # одновременно, иначе заводят по потоку каждый.
     import threading
 
-    from cdc_1c import handlers as handlers_module
+    from cdc_1c import write_tracker as tracker_module
 
-    monkeypatch.setattr(handlers_module, 'HEARTBEAT_PERIOD', 0.05)
+    monkeypatch.setattr(tracker_module, 'HEARTBEAT_PERIOD', 0.05)
     tracker = WriteTracker(db.engine, db.schema, 'План1')
     started = threading.Barrier(4)
 
@@ -786,9 +786,9 @@ def test_the_heartbeat_thread_goes_away_when_nothing_is_in_flight(db, monkeypatc
     # незачем: поток нужен ровно пока есть что продлевать.
     import threading
 
-    from cdc_1c import handlers as handlers_module
+    from cdc_1c import write_tracker as tracker_module
 
-    monkeypatch.setattr(handlers_module, 'HEARTBEAT_PERIOD', 0.01)
+    monkeypatch.setattr(tracker_module, 'HEARTBEAT_PERIOD', 0.01)
     tracker = WriteTracker(db.engine, db.schema, 'План1')
     try:
         with tracker.track("Catalog_Nomenklatura"):

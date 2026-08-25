@@ -78,10 +78,13 @@ def test_full_load_paging(db, monkeypatch):
     assert all(c["after_values"] is None for c in calls)
     assert all(c["top"] == 2 for c in calls)
     assert all(c["key_fields"] == ["Ref_Key"] and c["key_types"] == ["Guid"] for c in calls)
-    # каждая страница сохранена в режиме полной выгрузки (с моментом старта прогона, общим на все
-    # страницы); всего 2+2+1 записей.
+    # каждая страница сохранена в режиме полной выгрузки, и отметка у неё СВОЯ: guard'ы снимка
+    # спрашивают «не переписали ли строку после того, как мы прочитали эти данные», а данные
+    # читаются постранично. С общей отметкой на прогон группа, разрезанная границей страниц,
+    # блокировала сама себя — её остаток молча не вставлялся. Всего 2+2+1 записей.
     assert all(s[2] is not None for s in saved)
-    assert len({s[2] for s in saved}) == 1
+    assert len({s[2] for s in saved}) == len(saved)
+    assert [s[2] for s in saved] == sorted(s[2] for s in saved)
     assert sum(s[1] for s in saved) == 5
 
     # одна строка лога: это не пакет обмена (message_no=NULL), загрузка завершена (finished_at set).
@@ -455,3 +458,37 @@ def test_read_object_combines_keyset_and_extra_filter(db, monkeypatch):
     assert "Ref_Key%20gt%20guid'11111111-1111-1111-1111-111111111111'" in url
     assert "%20and%20" in url
     assert "Date%20ge%20datetime'2026-06-01T00:00:00'" in url  # ':' оставлены как есть
+
+
+def test_page_timestamp_is_clamped_to_unfinished_merges(db, monkeypatch):
+    """
+    Отметка страницы прижимается к незавершённым merge — той же границей, что и окно обработчика.
+
+    merged_on штампуется ВНУТРИ merge-транзакции, а коммитится позже. Чужой merge, начавшийся до
+    нашего чтения и закоммиченный после, оставил бы merged_on левее «сейчас»: guard счёл бы строку
+    старой, и снимок затёр бы свежее изменение. Поэтому точка отсчёта — не «сейчас», а старт самого
+    раннего живого незавершённого merge по таблицам этого объекта.
+    """
+    rep = _replicator(db)
+    meta = rep.metadata["Catalog_X"]
+
+    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
+                         key_types=None, extra_filter=None, skip=None):
+        self.clear()
+        self[object_name] = DataObject1C(meta, [{"Ref_Key": uuid.UUID(int=1)}])
+        return 1
+
+    monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
+
+    saved = []
+    rep.writer.save = lambda name, obj, full_load_started_at=None: (
+        saved.append(full_load_started_at) or _ZERO_RESULT)
+
+    table_name = rep._handler_key("Catalog_X")
+    # Чужой merge в ту же таблицу, ещё не закоммиченный: его строки другим процессам не видны.
+    with rep.writes.track(table_name) as tracked:
+        rep.full_load("Catalog_X", batch_size=10)
+
+    assert saved and all(s <= tracked.started_at for s in saved), (
+        f"отметка страницы {saved} должна быть не позже старта незавершённого merge "
+        f"{tracked.started_at}")

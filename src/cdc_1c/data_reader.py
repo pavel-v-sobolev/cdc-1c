@@ -277,7 +277,20 @@ class DataReader1C(UserDict):
             params.append(f"$top={top}")
         if skip:
             params.append(f"$skip={skip}")
-        params.append("$orderby=" + ','.join(key_fields))
+        # $skip отсчитывает смещение в выборке, поэтому порядок обязан быть ОДНОЗНАЧНЫМ. У ключа
+        # страницы его может не быть: у табличной части ключ страницы — Ref_Key, а строк с одним
+        # Ref_Key много, и порядок внутри такой ничьей 1С не гарантирует. На границе страниц это
+        # даёт и дубли, и потерянные строки (проверено: 87 строк в 1С → 84 в БД). Дополняем
+        # сортировку остальными полями первичного ключа — они ничью и разрешают.
+        # keyset так дополнять нельзя: его фильтр строится ровно по key_fields, и страница,
+        # оборванная посреди ничьей, была бы продолжена не с той строки.
+        order_fields = list(key_fields)
+        if after_values is None:
+            metadata_obj = self.metadata.get(object_name)
+            for field in (metadata_obj.primary_key if metadata_obj is not None else {}):
+                if field not in order_fields:
+                    order_fields.append(field)
+        params.append("$orderby=" + ','.join(order_fields))
         # keyset-курсор и extra_filter объединяем по AND в один $filter.
         filters = []
         if after_values is not None:
@@ -432,6 +445,12 @@ class DataReader1C(UserDict):
 
             type_name = metadata_obj.get(field_name) or 'String'
 
+            if field_name.endswith('_Type'):
+                # В колонке _Type храним имя типа без префикса поставщика: у ссылок это уже сделано
+                # выше (StandardODATA.), у примитивов убираем Edm. — в БД полезно 'Double', а не
+                # 'Edm.Double'. Распознавание примитива идёт по сырому значению (см. primitives).
+                value = value.removeprefix(EDM_TYPE_PREFIX)
+
             if field_name in primitives:
                 # Не ссылка: в uuid-колонке ей места нет — значение уходит в соседнюю
                 # текстовую <поле>_Value как есть, здесь остаётся NULL.
@@ -449,6 +468,16 @@ class DataReader1C(UserDict):
                 converted = self._default_key_value(type_name)
 
             fields[field_name] = converted
+
+        # Поля ключа в целевой таблице NOT NULL, а 1С пустое измерение присылает пустым элементом
+        # (в json — null) либо не присылает вовсе: пустая строка в «ИдентификаторСтроки» регистра
+        # приходит именно так. Без дефолта такая запись роняет вставку всей пачки по NOT NULL.
+        # Поля регистратора пропускаем: в строках набора их нет по определению, и проставляются
+        # они уровнем выше, из entry (_entry_recorder_fields) — дефолт тут забил бы их нулевым guid.
+        for key_field, key_type in metadata_obj.primary_key.items():
+            if (fields.get(key_field) is None
+                    and key_field not in RECORDER_FIELDS and key_field != RECORDER_TYPE_FIELD):
+                fields[key_field] = self._default_key_value(key_type)
 
         # Соседняя колонка составного поля заполняется у КАЖДОЙ записи, даже когда значение —
         # ссылка и колонка остаётся пустой: иначе состав полей плавал бы от записи к записи.

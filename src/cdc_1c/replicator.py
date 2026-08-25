@@ -20,9 +20,9 @@ from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.db_writer import DBWriter1C, save_order_key
 from cdc_1c.db_logs import Replicator1CLog, LOAD_TYPE_CHANGES, LOAD_TYPE_FULL
 from cdc_1c.full_load_keys import FullLoadKeys
-from cdc_1c.handlers import (HandlerSignals, WriteTracker,
-                             SOURCE_CHANGES, SOURCE_FULL_LOAD)
+from cdc_1c.handlers import (HandlerSignals, SOURCE_CHANGES, SOURCE_FULL_LOAD)
 from cdc_1c.stop_signal import StopSignal, install_signal_handlers
+from cdc_1c.write_tracker import WriteTracker
 from cdc_1c.logging_config import _ensure_handler, get_logger, load_mode, LOAD_MODE_CHANGES, LOAD_MODE_FULL
 
 logger = get_logger(__name__)
@@ -518,9 +518,13 @@ class Replicator1C:
         # Полная выгрузка = базовая версия: emn=0 (ниже любого номера пакета изменений >=1).
         reader.exchange_message_no = 0
 
-        # Момент старта прогона по часам БД — граница для guard'ов save (см. DBWriter1C.db_now).
-        # Берётся один раз, до чтения первой страницы, и общий на все страницы прогона.
+        # Момент старта прогона по часам БД: по нему помечаются пропавшие строки в конце прогона
+        # (guard'ы save берут свою отметку на каждую страницу, см. ниже).
         started_at = self.writer.db_now()
+        # Таблицы, в которые пишет этот объект: он сам и его табличные части (в метаданных они
+        # лежат отдельными объектами с именем владельца в префиксе). По ним считается граница
+        # незавершённых merge для guard'ов страницы.
+        page_tables = self._full_load_tables(object_name)
 
         log_id = self.replicator_log.start(self._exchange_name, object_name, None, LOAD_TYPE_FULL)
         logger.info("Full load of %s started (batch_size=%s, key=%s, paging=%s, date_filter=%s)",
@@ -541,6 +545,23 @@ class Replicator1C:
             if keys is not None:
                 stack.enter_context(keys)
             while True:
+                # Отметка берётся на КАЖДУЮ страницу, а не одна на прогон. Guard'ы снимка проверяют
+                # «строку не переписали после того, как мы прочитали эти данные», и точка отсчёта у
+                # них — момент чтения страницы. С одной отметкой на прогон группа, разрезанная
+                # границей страниц (табличная часть одного владельца), блокировала сама себя:
+                # строки, записанные предыдущей страницей, выглядели как чужое свежее изменение,
+                # и остаток группы молча не вставлялся (87 строк в 1С → 84 в БД).
+                #
+                # Не «сейчас», а граница по реестру незавершённых merge — та же, к которой
+                # прижимается окно обработчика (WriteTracker.boundary). merged_on штампуется ВНУТРИ
+                # merge-транзакции, а коммитится позже: чужой merge, начавшийся до нашего чтения и
+                # закоммиченный после, оставил бы merged_on левее «сейчас», guard счёл бы строку
+                # старой, и снимок затёр бы свежее изменение. Брошенные строки реестра границу не
+                # держат — их отсекает отметка живости (HEARTBEAT_TTL), поэтому умерший процесс
+                # тормозит выгрузку максимум на TTL, а не навсегда. Свои же записи помехой не
+                # становятся: строка реестра живёт до коммита, а страницы пишутся последовательно —
+                # к этому моменту нашей строки в реестре уже нет.
+                page_started_at = self.writes.boundary(page_tables)
                 try:
                     page = reader.read_object(object_name, top=page_size, key_fields=key_fields,
                                               after_values=after_values, key_types=key_types,
@@ -565,7 +586,7 @@ class Replicator1C:
                     table_name = self._handler_key(obj_name)
                     with self.writes.track(table_name):
                         result = self.writer.save(obj_name, data_object,
-                                                  full_load_started_at=started_at)
+                                                  full_load_started_at=page_started_at)
                     self.replicator_log.write_result(log_id, result)
                     rows_modified += _rows_modified(result)
                     # Флаг на каждую страницу, а не один в конце прогона: он булев, тысяча страниц
@@ -753,6 +774,20 @@ class Replicator1C:
         page_size = min(batch_size, fits)
         self._full_load_page_size[object_name] = page_size
         return page_size
+
+    def _full_load_tables(self, object_name: str) -> list[str]:
+        """
+        Имена таблиц (в терминах реестра незавершённых merge), в которые пишет полная выгрузка
+        объекта: сам объект и его табличные части — 1С отдаёт их вместе с владельцем, и страница
+        сохраняет их той же записью.
+
+        Табличные части в метаданных лежат отдельными объектами, названными «владелец_ЧастьИмени»,
+        поэтому и ищутся по префиксу.
+        """
+        prefix = object_name + '_'
+        names = [name for name in self.metadata.keys()
+                 if name == object_name or name.startswith(prefix)]
+        return [self._handler_key(name) for name in names]
 
     def _supports_keyset(self, object_name: str, key_fields: list[str]) -> bool:
         """
