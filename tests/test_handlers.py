@@ -283,7 +283,7 @@ def test_signals_are_coalesced(db):
 
 
 def test_on_full_load_is_published_and_respected_by_the_replicator(db):
-    # Обработчик по флагу update_is_required источник не различает, поэтому решение «звать ли на
+    # Обработчик по метке update_requested_at источник не различает, поэтому решение «звать ли на
     # бэкфилле» принимает тот, кто флаг поднимает. Значит on_full_load обязан доехать до него через
     # ту же таблицу — иначе ON_FULL_LOAD=False просто не работал бы.
     quiet = Spy(name='quiet', on=["Catalog_X"], on_full_load=False)
@@ -520,7 +520,7 @@ def test_replicator_signals_only_on_real_changes(db, monkeypatch):
 
 def test_signals_from_several_replicators_reach_one_handler(db):
     # Несколько планов обмена — несколько Replicator1C, а обработчик один. Связывает их только БД:
-    # репликаторы поднимают update_is_required, обработчик его видит. Объекты обработчика им не
+    # репликаторы ставят update_requested_at, обработчик её видит. Объекты обработчика им не
     # нужны — потому он и может жить в другом процессе.
     spy = Spy(on=["Catalog_Nomenklatura", "Document_ZakazKlienta"])
     runner = _runner_for(db, spy)
@@ -532,11 +532,11 @@ def test_signals_from_several_replicators_reach_one_handler(db):
 
     rep1._signal_handlers("Catalog_Nomenklatura", _result(updated=1), SOURCE_CHANGES)
     rep2._signal_handlers("Document_ZakazKlienta", _result(inserted=1), SOURCE_CHANGES)
-    assert _state(runner, spy.name).update_is_required
+    assert _state(runner, spy.name).update_requested_at is not None
 
     runner.run_if_pending()
     assert len(spy.calls) == 1
-    assert not _state(runner, spy.name).update_is_required, 'флаг снят успешным прогоном'
+    assert _state(runner, spy.name).update_requested_at is None, 'метка снята успешным прогоном'
 
 
 def test_boundary_covers_writes_of_another_process(db):
@@ -656,7 +656,7 @@ def test_update_flag_survives_a_failed_run(db):
     rep._signal_handlers("Catalog_Nomenklatura", _result(updated=1), SOURCE_CHANGES)
     runner.run_if_pending()
 
-    assert _state(runner, spy.name).update_is_required, 'упавший прогон флаг не снимает'
+    assert _state(runner, spy.name).update_requested_at is not None, 'упавший прогон метку не снимает'
 
 
 def test_dead_replicator_does_not_freeze_the_boundary(db):
@@ -899,7 +899,7 @@ def test_changes_are_applied_between_rebuild_blocks(db):
     assert len(spy.calls) >= 1
     assert spy.calls[0].last_run_at is not None, 'это инкремент, а не ещё одна пересборка'
     assert spy.calls[0].full_rebuild is False
-    assert not _state(runner, spy.name).update_is_required, 'флаг снят успешным прогоном'
+    assert _state(runner, spy.name).update_requested_at is None, 'метка снята успешным прогоном'
 
 
 def test_rebuild_resumes_from_the_cursor_after_a_restart(db):
@@ -956,3 +956,37 @@ def test_handler_without_blocks_rebuilds_in_one_go(db):
     assert spy.calls[0].full_rebuild is True
     assert spy.calls[0].last_run_at is None
     assert _state(runner, spy.name).rebuild_cursor is None
+
+
+def test_signal_arriving_during_a_run_is_not_swallowed(db):
+    """
+    Сигнал, пришедший ПОСЕРЕДИНЕ прогона, обязан завести обработчика ещё раз.
+
+    С булевым флагом это не работало: поднять true над true нельзя, следа не остаётся, и успешный
+    прогон снимал флаг вместе с непрочитанным сигналом — изменение терялось до следующего.
+    Метка времени сдвигается вправо от границы окна, и снять её прогон уже не вправе.
+    """
+    class SignallingSpy(Spy):
+        """Обработчик, во время работы которого репликатор сообщает о новом изменении."""
+
+        def handle(self, context):
+            super().handle(context)
+            if len(self.calls) == 1:          # только на первом прогоне, иначе цикл был бы вечным
+                _signal(db, "Catalog_X")
+
+    spy = SignallingSpy()
+    runner = _runner_for(db, spy)
+    runner.run_if_pending()                   # первый прогон: стартовый + сигнал внутри него
+    spy.calls.clear()
+
+    _signal(db, "Catalog_X")
+    runner.run_if_pending()
+    assert len(spy.calls) == 1, 'обработчик должен быть позван по сигналу'
+    assert _state(runner, spy.name).update_requested_at is not None, \
+        'сигнал, пришедший во время прогона, снят вместе с обработанными'
+
+    # И он действительно заводит следующий прогон, а не просто висит меткой.
+    runner.run_if_pending()
+    assert len(spy.calls) == 2
+    assert _state(runner, spy.name).update_requested_at is None, \
+        'после прогона, который его прочитал, метка должна сняться'

@@ -91,8 +91,8 @@ from datetime import datetime, timedelta
 from types import ModuleType
 from typing import Callable, Iterable
 
-from sqlalchemy import (ARRAY, Boolean, Column, ColumnElement, DateTime, Engine, Float, MetaData,
-                        String, Table, func, insert, inspect, or_, select, text, update)
+from sqlalchemy import (ARRAY, Boolean, case, Column, ColumnElement, DateTime, Engine, Float,
+                        func, insert, inspect, MetaData, or_, select, String, Table, text, update)
 
 from cdc_1c.common_functions import DB_NOW_WITHOUT_TIMEZONE
 from cdc_1c.db_logs import _check_create_schema
@@ -109,6 +109,10 @@ logger = get_logger(__name__)
 
 HANDLERS_TABLE = "handlers_1c"
 
+# Метка сигнала об изменении подписанной таблицы (см. _handlers_table). Вынесена в
+# константу: на неё смотрят и перенос со старого булева флага, и сам цикл.
+UPDATE_REQUESTED_FIELD = "update_requested_at"
+
 # Откуда пришло изменение: пакет изменений или страница полной выгрузки.
 SOURCE_CHANGES = 'changes'
 SOURCE_FULL_LOAD = 'full_load'
@@ -120,7 +124,7 @@ SOURCE_STARTUP = 'startup'
 # Заказана пересборка витрины (full_rebuild_is_required). Отдельный повод к запуску: флаг ставят
 # руками в таблице, и никаких изменений за ним не приходит — ждать сигнала можно вечно.
 SOURCE_REBUILD = 'full_rebuild'
-# Репликатор поднял update_is_required: подписанная таблица изменилась. Так выглядит сигнал,
+# Репликатор поставил update_requested_at: подписанная таблица изменилась. Так выглядит сигнал,
 # пришедший через БД, — от репликатора в другом процессе или контейнере.
 SOURCE_DB_SIGNAL = 'db_signal'
 
@@ -419,12 +423,18 @@ def _handlers_table(metadata: MetaData, schema_name: str | None) -> Table:
         # процессе или вообще в другом контейнере.
         Column("update_on", ARRAY(String), nullable=True),
         # Звать ли на страницах полной выгрузки. Объявляет обработчик, читает репликатор: сам
-        # обработчик по флагу update_is_required источник изменения не различает, поэтому решение
+        # обработчик по метке update_requested_at источник изменения не различает, поэтому решение
         # принимается на стороне того, кто флаг поднимает.
         Column("on_full_load", Boolean, nullable=False, server_default=text('true')),
-        # Репликатор увидел изменение подписанной таблицы. Единственный способ, которым он зовёт
-        # обработчика: поднять флаг, а дальше тот сам увидит его своим циклом.
-        Column("update_is_required", Boolean, nullable=False, server_default=text('false')),
+        # Репликатор увидел изменение подписанной таблицы: пишет сюда момент сигнала по часам БД
+        # (NULL — незакрытых сигналов нет). Единственный способ, которым он зовёт обработчика:
+        # поставить метку, а дальше тот сам увидит её своим циклом.
+        #
+        # Метка, а не булев флаг, — из-за сигнала, пришедшего ПОСЕРЕДИНЕ прогона: поднять true над
+        # true нельзя, следа не остаётся, и прогон снимал флаг вместе с непрочитанным сигналом.
+        # Метка же сдвигается вправо от границы окна, и снять её прогон уже не вправе (см.
+        # _save_success): обработчик будет позван ещё раз.
+        Column(UPDATE_REQUESTED_FIELD, DateTime, nullable=True),
         # Заказ полной пересборки витрины — руками или автоматически (см. request_full_rebuild) —
         # и метрики последней пересборки. Названы по образцу metadata_objects_1c, где так же
         # устроена полная выгрузка объекта.
@@ -457,6 +467,32 @@ def _add_missing_columns(engine: Engine, table: Table) -> None:
             conn.execute(text(f'ALTER TABLE {compiler.preparer.format_table(table)} '
                               f'ADD COLUMN {compiler.get_column_specification(column)}'))
     logger.info("Added columns to %s: %s", table.name, ', '.join(c.name for c in missing))
+    _carry_over_update_flag(engine, table, existing, {c.name for c in missing})
+
+
+def _carry_over_update_flag(engine: Engine, table: Table, existing: set, added: set) -> None:
+    """
+    Переносит незакрытые сигналы из старого булева update_is_required в новую метку
+    update_requested_at — один раз, в момент, когда колонка только что добавлена.
+
+    Без этого обработчик, стоявший в очереди на момент обновления библиотеки, дождался бы только
+    следующего изменения подписанной таблицы: его витрина всё это время висела бы неактуальной, и
+    молча. Само значение метки — «сейчас»: когда именно пришёл потерянный сигнал, уже не узнать,
+    а прогон от этого только перечитает чуть большее окно.
+
+    Старую колонку не удаляем: она ничему не мешает (NOT NULL с дефолтом), а автоматически ронять
+    колонку в чужой БД — не то, что библиотека вправе делать без спроса.
+    """
+    legacy = 'update_is_required'
+    if UPDATE_REQUESTED_FIELD not in added or legacy not in existing:
+        return
+    with engine.begin() as conn:
+        result = conn.execute(update(table)
+                              .where(text(f'{legacy} = true'))
+                              .values(update_requested_at=DB_NOW_WITHOUT_TIMEZONE))
+    if result.rowcount:
+        logger.info("Carried over %s pending signal(s) from %s to %s",
+                    result.rowcount, legacy, UPDATE_REQUESTED_FIELD)
 
 
 class HandlerSignals:
@@ -465,7 +501,7 @@ class HandlerSignals:
 
     Обработчик при старте объявляет себя в handlers_1c и перечисляет в update_on таблицы, на
     которые подписан. Репликатор перечитывает эту таблицу и, увидев изменение подписанной таблицы,
-    просто поднимает update_is_required. Дальше обработчик сам заметит флаг своим циклом.
+    просто ставит метку update_requested_at. Дальше обработчик сам заметит её своим циклом.
 
     Отсюда и берётся возможность разнести их как угодно: репликатору не нужны ни объекты
     обработчиков, ни их импорт, ни общий с ними процесс — только общая БД. Обработчик может жить
@@ -493,7 +529,7 @@ class HandlerSignals:
         Имена обработчиков, которых это изменение касается: подписаны на таблицу (update_on) и
         согласны на такой источник (on_full_load).
 
-        Источник учитывается здесь, а не у обработчика: тот видит только флаг update_is_required и
+        Источник учитывается здесь, а не у обработчика: тот видит только метку update_requested_at и
         по нему не может отличить бэкфилл от живого изменения. Поэтому обработчик объявляет своё
         on_full_load в таблице, а решение принимает тот, кто флаг поднимает.
         """
@@ -520,14 +556,21 @@ class HandlerSignals:
         return subscriptions
 
     def signal(self, object_name: str, source: str) -> None:
-        """Поднимает update_is_required подписчикам таблицы. Подписчиков нет — ничего не делаем."""
+        """
+        Ставит подписчикам таблицы метку сигнала. Подписчиков нет — ничего не делаем.
+
+        Метка ВСЕГДА перезаписывается текущим временем БД, а не ставится «если пусто»: обработчик
+        снимает её, только если она не правее границы его окна, а значит хранить надо последний
+        сигнал. С самым ранним сигнал, пришедший в середине прогона, не сдвинул бы значение — и
+        был бы снят вместе с обработанными.
+        """
         names = self.subscribers(object_name, source)
         if not names:
             return
         with self.engine.begin() as conn:
             conn.execute(update(self.table)
                          .where(self.table.c.name.in_(names))
-                         .values(update_is_required=True))
+                         .values(update_requested_at=DB_NOW_WITHOUT_TIMEZONE))
         logger.info("Changed %s (%s) → update requested for %s",
                     object_name, source, ', '.join(sorted(names)))
 
@@ -560,7 +603,7 @@ class HandlerLoop:
     два обработчика, пишущие в одну целевую таблицу, теперь могут делать это одновременно. Если
     витрина строится поверх другой витрины, полагаться на «сначала базовая» нельзя.
 
-    Сигнал — булев флаг update_is_required в handlers_1c, а не очередь событий. Пока обработчик
+    Сигнал — метка update_requested_at в handlers_1c, а не очередь событий. Пока обработчик
     считает, прилетевшие страницы поднимают тот же флаг ещё раз, а не выстраиваются в очередь из
     тысячи вызовов. Поэтому репликатор может сигналить на каждую страницу полной выгрузки: витрина
     начинает наполняться после первой же и догоняет выгрузку с задержкой в один свой прогон.
@@ -733,12 +776,12 @@ class HandlerLoop:
         t = self.table
         with self.engine.connect() as conn:
             row = conn.execute(select(t.c.enabled, t.c.last_run_at, t.c.full_rebuild_is_required,
-                                      t.c.update_is_required, t.c.rebuild_cursor)
+                                      t.c.update_requested_at, t.c.rebuild_cursor)
                                .where(t.c.name == self.name)).first()
         if row is None:
             return False, None, False, False, None
         return (bool(row.enabled), row.last_run_at, bool(row.full_rebuild_is_required),
-                bool(row.update_is_required), row.rebuild_cursor)
+                row.update_requested_at is not None, row.rebuild_cursor)
 
     def _run(self, last_run_at: datetime, expected_rebuild: bool = False,
              update_requested: bool = False) -> None:
@@ -955,20 +998,26 @@ class HandlerLoop:
                      else t.c.last_run_at == expected_last_run_at)
         values = {'last_run_at': boundary, 'last_error': None}
         if update_requested:
-            # Флаг снимаем только вместе с успешной отметкой: упавший прогон должен остаться
+            # Метку снимаем только вместе с успешной отметкой: упавший прогон должен остаться
             # «ждущим обновления», иначе изменение, о котором сообщил репликатор, потерялось бы.
-            # Сигналы, пришедшие за время прогона, не теряются — они поднимут флаг заново, и
-            # условие ниже (update_is_required == expected) их не даст затереть.
-            values['update_is_required'] = False
+            #
+            # И снимаем не всякую, а только ту, что не правее границы окна: всё, что правее, этот
+            # прогон не читал. Сюда попадают и сигналы, пришедшие ПОСЕРЕДИНЕ прогона, и сигналы
+            # о данных, которых в окне не было — граница прижата к незавершённым merge, а метку
+            # ставит время сигнала. Оставшаяся метка заведёт обработчика ещё раз.
+            values['update_requested_at'] = case(
+                (t.c.update_requested_at <= boundary, None),
+                else_=t.c.update_requested_at)
         if full_rebuild:
             values.update(full_rebuild_is_required=False, last_full_rebuild_dt=func.now(),
                           last_full_rebuild_minutes=round(elapsed / 60, 3))
         with self.engine.begin() as conn:
             result = conn.execute(
                 update(t)
+                # Оптимистичного условия по метке здесь нет: её судьбу решает сравнение с границей
+                # выше, и сигнал, пришедший за время прогона, оно сохраняет само.
                 .where(t.c.name == self.name, unchanged,
-                       t.c.full_rebuild_is_required == expected_rebuild,
-                       t.c.update_is_required == update_requested)
+                       t.c.full_rebuild_is_required == expected_rebuild)
                 .values(**values))
         return result.rowcount > 0
 
