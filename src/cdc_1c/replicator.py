@@ -1059,7 +1059,7 @@ class Replicator1C:
         занять его не могут. Общий у них только engine, поэтому дефицит возникает не в потоках, а
         в соединениях: одновременно их держат пакет изменений, страницы выгрузки, отметка живости
         и каждый обработчик, отсюда
-        pool_size >= full_load_workers + 2 + число обработчиков (см. README).
+        pool_size >= full_load_workers + 2 + число обработчиков (см. README_HANDLERS.md).
         """
         stop = StopSignal()
         self._stop_signal = stop

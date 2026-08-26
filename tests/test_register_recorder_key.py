@@ -47,7 +47,7 @@ def _row(**overrides) -> dict:
 
 def test_inactive_record_is_flagged_as_not_counted():
     # Active=False — запись не участвует в итогах 1С, значит и у нас должна быть погашена
-    # тем же флагом, что и удалённые: is_deleted_or_empty универсален (см. README).
+    # тем же флагом, что и удалённые: is_deleted_or_empty универсален (см. README_DB.md).
     fields = dict(_FIELDS, Active="Boolean")
     reader = _reader(fields)
     reader._get_register_records(REG, {"d:Recorder_Key": REC, "d:RecordSet": {"d:element": [

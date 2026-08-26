@@ -52,7 +52,7 @@ VERSION_FIELDS = ('DataVersion', 'Version')
 # Спец-поле, заполняемое при загрузке. Универсальный признак «строку не учитывать»:
 # пометка удаления объекта (DeletionMark), неактивная запись регистра (Active=False)
 # и фиктивные записи (удаленный набор регистра, опустевшая табличная часть).
-# Полное описание логики — в README, раздел про is_deleted_or_empty.
+# Полное описание логики — в README_DB.md, раздел про is_deleted_or_empty.
 IS_DELETED_OR_EMPTY_FIELD = 'is_deleted_or_empty'
 # Спец-поле: номер пакета обмена (message_no), проставляется во все записи при чтении изменений.
 EXCHANGE_MESSAGE_NO_FIELD = 'exchange_message_no'
