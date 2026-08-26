@@ -65,6 +65,9 @@ def _pages(rep, object_name, monkeypatch, pages, recheck_answer=None):
         return len(records)
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
+    # Границы периода эти тесты не проверяют: без них выгрузка идёт одной выборкой, как и до
+    # нарезки на периоды (см. Replicator1C._period_partitions).
+    monkeypatch.setattr(DataReader1C, "read_date_bound", lambda *a, **k: None)
     return calls
 
 

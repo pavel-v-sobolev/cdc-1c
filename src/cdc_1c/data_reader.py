@@ -319,6 +319,38 @@ class DataReader1C(UserDict):
                     self.rows_read(), format_bytes(self.last_response_bytes))
         return len(object_entries)
 
+    def read_date_bound(self, object_name: str, date_field: str, *, newest: bool,
+                        extra_filter: str | None = None) -> datetime | None:
+        """
+        Самая ранняя (newest=False) или самая поздняя (newest=True) дата объекта — одной строкой:
+        `$top=1` с сортировкой по этому полю. Нужна, чтобы нарезать полную выгрузку на партиции по
+        периоду и не гонять `$skip` по всей таблице (см. Replicator1C.full_load).
+
+        Запрос дешёвый именно потому, что поле даты у документов и регистров входит в индекс:
+        1С отдаёт первую строку упорядоченной выборки, а не сортирует всё.
+
+        None — объект пуст (или пуст заданный диапазон): выгружать нечего.
+        """
+        order = date_field + (' desc' if newest else '')
+        params = ["$top=1", "$orderby=" + quote(order, safe="")]
+        if extra_filter:
+            params.append("$filter=" + quote(extra_filter, safe="':"))
+        query = '?' + '&'.join(params)
+        response = requests.get(f"{self.odata_url}/{object_name}{query}", auth=self.odata_auth,
+                                timeout=resolve_timeout(self.request_timeout))
+        raise_for_status(response, f'read {object_name}{query}')
+
+        entries = (xmltodict.parse(response.text, force_list=('entry',)).get('feed') or {}).get('entry') or []
+        if not entries:
+            return None
+        properties = (entries[0].get('content') or {}).get('m:properties') or {}
+        value = properties.get('d:' + date_field)
+        if not isinstance(value, str):
+            logger.warning('No %s in the first row of %s — period partitioning is off',
+                           date_field, object_name)
+            return None
+        return self._convert_value(value, 'DateTime', context=f'{object_name}.{date_field}')
+
     def rows_read(self) -> int:
         """Сколько строк дали прочитанные entry — с учётом табличных частей и наборов записей
         (одна entry регистра/документа разворачивается в сотни и тысячи строк)."""

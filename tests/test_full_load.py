@@ -16,7 +16,7 @@ from dbmerge import mergeResult
 from cdc_1c import DataObject1C
 from cdc_1c.data_reader import DataReader1C
 from cdc_1c.metadata_reader import MetadataObject1C, MetadataReader1C
-from cdc_1c.replicator import Replicator1C
+from cdc_1c.replicator import FULL_LOAD_PARTITION_MAX_PAGES, Replicator1C
 from conftest import TEST_QUEUE_GUID
 
 # Нулевой результат merge — writer.save в тестах замокан, но full_load агрегирует его результат.
@@ -259,6 +259,9 @@ def test_full_load_composite_key_with_reference(db, monkeypatch):
         return 0
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
+    # Границы периода тест не проверяет: без них выгрузка идёт одной выборкой,
+    # как и до партиционирования (см. Replicator1C._period_partitions).
+    monkeypatch.setattr(DataReader1C, "read_date_bound", lambda *a, **k: None)
     rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
 
     rep.full_load("InformationRegister_Indep", batch_size=2)
@@ -428,6 +431,9 @@ def test_full_load_passes_date_filter(db, monkeypatch):
         return 0
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
+    # Границы периода тест не проверяет: без них выгрузка идёт одной выборкой,
+    # как и до партиционирования (см. Replicator1C._period_partitions).
+    monkeypatch.setattr(DataReader1C, "read_date_bound", lambda *a, **k: None)
     rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
 
     rep.full_load("Catalog_X", batch_size=2, date_field="Date",
@@ -492,3 +498,96 @@ def test_page_timestamp_is_clamped_to_unfinished_merges(db, monkeypatch):
     assert saved and all(s <= tracked.started_at for s in saved), (
         f"отметка страницы {saved} должна быть не позже старта незавершённого merge "
         f"{tracked.started_at}")
+
+
+def _partitioned(db, monkeypatch, rows_per_page, *, date_field="Date"):
+    """
+    Репликатор с объектом, у которого есть дата, и подменённым чтением. Возвращает (rep, calls),
+    где calls — список $filter каждой прочитанной страницы: по ним и видно нарезку.
+    """
+    rep = _replicator(db)
+    meta = MetadataObject1C("Document_Y", {"Ref_Key": "Guid", date_field: "DateTime"},
+                            {"Ref_Key": "Guid"}, object_key=None)
+    rep.metadata["Document_Y"] = meta
+    calls = []
+    counter = {"v": 0}
+
+    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
+                         key_types=None, extra_filter=None, skip=None):
+        calls.append(extra_filter)
+        n = rows_per_page(extra_filter, skip or 0)
+        keys = []
+        for _ in range(n):
+            counter["v"] += 1
+            keys.append(uuid.UUID(int=counter["v"]))
+        self.clear()
+        self[object_name] = DataObject1C(meta, [{"Ref_Key": k} for k in keys])
+        return n
+
+    monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
+    monkeypatch.setattr(DataReader1C, "read_date_bound",
+                        lambda self, name, field, *, newest, extra_filter=None:
+                        datetime(2026, 3, 20) if newest else datetime(2026, 1, 15))
+    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
+    return rep, calls
+
+
+def test_deep_object_is_partitioned_by_month_newest_first(db, monkeypatch):
+    """
+    Объект, который не дочитался за FULL_LOAD_PARTITION_MAX_PAGES страниц, перечитывается по
+    месяцам — от свежих к старым.
+
+    Смысл в $skip: без нарезки 1С на каждую страницу строит выборку заново, сортирует её целиком и
+    отбрасывает первые N строк, поэтому цена растёт квадратично. Фильтр по периоду переводит запрос
+    на индекс (Дата у документа входит в него), и сортируется маленький кусок. Порядок от свежих к
+    старым выбран потому, что свежие данные нужнее: при обрыве прогона они уже в БД.
+    """
+    # Без фильтра страницы всегда полные (объект «бездонный»), с фильтром по месяцу — одна строка.
+    rep, calls = _partitioned(db, monkeypatch, lambda flt, skip: 1 if flt else 10)
+    rep.full_load("Document_Y", batch_size=10)
+
+    first_pass = [c for c in calls if c is None]
+    assert len(first_pass) == FULL_LOAD_PARTITION_MAX_PAGES, \
+        'сначала объект читается как есть и обрывается на лимите страниц'
+
+    # Данные с 2026-01-15 по 2026-03-20 → три месяца, в обратном порядке.
+    months = [c for c in calls if c]
+    assert len(months) == 3
+    assert "Date ge datetime'2026-03-01T00:00:00'" in months[0]
+    assert "Date ge datetime'2026-02-01T00:00:00'" in months[1]
+    assert "Date lt datetime'2026-03-01T00:00:00'" in months[1]
+    assert "Date ge datetime'2026-01-01T00:00:00'" in months[2]
+
+    # У самой свежей партиции правая граница открыта: документ, созданный уже во время прогона,
+    # иначе остался бы за краем выгрузки.
+    assert " lt " not in months[0]
+
+
+def test_small_object_is_not_partitioned(db, monkeypatch):
+    """
+    Мелкому объекту периоды только вредят: он укладывается в пару страниц, а нарезка стоила бы
+    запроса на каждый месяц истории, даже пустой. Проверено на живой базе: 74 запроса против 2.
+    """
+    rep, calls = _partitioned(db, monkeypatch, lambda flt, skip: 1)
+    rep.full_load("Document_Y", batch_size=10)
+
+    assert calls == [None], 'объект дочитан с первого захода — нарезки быть не должно'
+
+
+def test_deep_partition_is_split_into_days(db, monkeypatch):
+    """Месяц, который сам по себе даёт глубокий $skip, дробится на дни — иначе нарезка не спасает."""
+    month = ("Date ge datetime'2026-02-01T00:00:00' and "
+             "Date lt datetime'2026-03-01T00:00:00'")
+
+    def rows(flt, skip):
+        # Бездонны объект целиком и февраль; прочие месяцы и любой день — по одной странице.
+        return 10 if flt is None or flt == month else 1
+
+    rep, calls = _partitioned(db, monkeypatch, rows)
+    rep.full_load("Document_Y", batch_size=10)
+
+    assert len([c for c in calls if c == month]) == FULL_LOAD_PARTITION_MAX_PAGES, \
+        'глубокая партиция должна оборваться на лимите страниц, а не читаться до конца'
+    days = [c for c in calls if c and c != month and c.startswith("Date ge datetime'2026-02-")]
+    assert len(days) == 28, 'февраль должен быть прочитан по дням'
+    assert "2026-02-28" in days[0], 'дни тоже идут от свежих к старым'

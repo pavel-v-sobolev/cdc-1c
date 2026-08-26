@@ -58,6 +58,21 @@ FULL_LOAD_MIN_BATCH = 1
 FULL_LOAD_TARGET_BYTES = 32 * 1024 * 1024
 FULL_LOAD_PROBE_BATCH = 20
 
+# Полная выгрузка режется на партиции по периоду (месяц), а внутри партиции страницы берутся
+# через $skip. Смысл в том, что $skip дорог: 1С на каждый запрос строит выборку заново, сортирует
+# и отбрасывает первые N строк, поэтому цена растёт квадратично по числу страниц. Фильтр по дате
+# переводит запрос на индекс (Дата у документа, Период у регистра входят в него), и сортируется
+# уже маленький кусок.
+#
+# Партиция глубже этого числа страниц дробится на дни: значит месяц всё равно даёт глубокий $skip.
+# Порог небольшой, потому что перечитывание уже прочитанных страниц — цена дробления, и платить
+# за неё много раз не хочется.
+FULL_LOAD_PARTITION_MAX_PAGES = 10
+
+# Поля, по которым выгрузка режется на периоды, если пользователь не задал своё: у документа это
+# Date, у регистра — Period. Порядок важен: у регистра сведений бывают оба.
+PARTITION_DATE_FIELDS = ('Date', 'Period')
+
 # Перепроверка кандидатов на пометку (mark_missing при выгрузке за период): сколько ключей уходит
 # в один $filter. Ключи объединяются через OR, и слишком длинный URL 1С не примет.
 RECHECK_KEYS_PER_REQUEST = 20
@@ -255,6 +270,64 @@ def _load_mode_tag(mode: str):
                 return method(self, *args, **kwargs)
         return wrapper
     return decorator
+
+
+def _and_filters(*parts: str | None) -> str | None:
+    """Склейка OData-фрагментов $filter по AND; None и пустые пропускаются."""
+    clauses = [part for part in parts if part]
+    if not clauses:
+        return None
+    return " and ".join(clauses)
+
+
+def _month_start(moment: datetime) -> datetime:
+    return moment.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def _next_month(moment: datetime) -> datetime:
+    return (moment.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+
+class _Partition:
+    """
+    Отрезок периода [start, end) полной выгрузки: за него отвечает один $filter, внутри страницы
+    берутся обычным способом.
+
+    end=None у самой свежей партиции — правая граница открыта намеренно: документы, созданные уже
+    во время прогона, попадают в неё, а не остаются за краем выгрузки. Идём мы от свежих к старым,
+    поэтому она же читается первой: свежие данные обычно нужнее, и при обрыве прогона они уже в БД.
+    """
+
+    def __init__(self, date_field: str, start: datetime, end: datetime | None, *, final: bool):
+        self.date_field = date_field
+        self.start = start
+        self.end = end
+        # final — партицию дробить больше некуда (день); только для неё лимит страниц не ставится.
+        self.final = final
+
+    @property
+    def filter(self) -> str:
+        clauses = [f"{self.date_field} ge {Replicator1C._odata_datetime(self.start)}"]
+        if self.end is not None:
+            clauses.append(f"{self.date_field} lt {Replicator1C._odata_datetime(self.end)}")
+        return " and ".join(clauses)
+
+    @property
+    def title(self) -> str:
+        return f"{self.start:%Y-%m}" if self.end is None or self.final is False else f"{self.start:%Y-%m-%d}"
+
+    def split(self) -> list["_Partition"]:
+        """Дробит месяц на дни — от свежих к старым, как и сами партиции."""
+        end = self.end or _next_month(self.start)
+        days = []
+        day = self.start
+        while day < end:
+            days.append(_Partition(self.date_field, day, day + timedelta(days=1), final=True))
+            day += timedelta(days=1)
+        # Правая граница последнего дня остаётся открытой, если открыта у самой партиции.
+        if self.end is None and days:
+            days[-1] = _Partition(self.date_field, days[-1].start, None, final=True)
+        return list(reversed(days))
 
 
 class Replicator1C:
@@ -526,84 +599,69 @@ class Replicator1C:
         # незавершённых merge для guard'ов страницы.
         page_tables = self._full_load_tables(object_name)
 
+        # Поле, по которому объект можно порезать на периоды, если он окажется глубоким. Нарезка
+        # имеет смысл только там, где страницы берутся через $skip: keyset-курсор в глубину не
+        # уходит и в нарезке не нуждается.
+        partition_field = None if use_keyset else self._partition_date_field(object_name, date_field)
+
         log_id = self.replicator_log.start(self._exchange_name, object_name, None, LOAD_TYPE_FULL)
-        logger.info("Full load of %s started (batch_size=%s, key=%s, paging=%s, date_filter=%s)",
-                    object_name, batch_size, key_fields,
-                    'keyset' if use_keyset else 'skip', date_filter)
-        after_values = None
-        skip = 0
+        logger.info("Full load of %s started (batch_size=%s, key=%s, paging=%s, date_filter=%s, "
+                    "partition_field=%s)", object_name, batch_size, key_fields,
+                    'keyset' if use_keyset else 'skip', date_filter, partition_field)
         total = 0
         rows_modified = 0
         # Ключи прогона: собираются постранично, в конце по ним помечаются пропавшие строки.
         # ExitStack — чтобы одноразовая таблица гарантированно удалилась и при ошибке прогона.
         keys = self._full_load_keys(object_name) if mark_missing else None
         stack = ExitStack()
-        # Начинаем с размера, подобранного по этому объекту раньше, иначе — с пробной страницы.
-        page_size = min(batch_size,
-                        self._full_load_page_size.get(object_name, FULL_LOAD_PROBE_BATCH))
         with stack:
             if keys is not None:
                 stack.enter_context(keys)
-            while True:
-                # Отметка берётся на КАЖДУЮ страницу, а не одна на прогон. Guard'ы снимка проверяют
-                # «строку не переписали после того, как мы прочитали эти данные», и точка отсчёта у
-                # них — момент чтения страницы. С одной отметкой на прогон группа, разрезанная
-                # границей страниц (табличная часть одного владельца), блокировала сама себя:
-                # строки, записанные предыдущей страницей, выглядели как чужое свежее изменение,
-                # и остаток группы молча не вставлялся (87 строк в 1С → 84 в БД).
-                #
-                # Не «сейчас», а граница по реестру незавершённых merge — та же, к которой
-                # прижимается окно обработчика (WriteTracker.boundary). merged_on штампуется ВНУТРИ
-                # merge-транзакции, а коммитится позже: чужой merge, начавшийся до нашего чтения и
-                # закоммиченный после, оставил бы merged_on левее «сейчас», guard счёл бы строку
-                # старой, и снимок затёр бы свежее изменение. Брошенные строки реестра границу не
-                # держат — их отсекает отметка живости (HEARTBEAT_TTL), поэтому умерший процесс
-                # тормозит выгрузку максимум на TTL, а не навсегда. Свои же записи помехой не
-                # становятся: строка реестра живёт до коммита, а страницы пишутся последовательно —
-                # к этому моменту нашей строки в реестре уже нет.
-                page_started_at = self.writes.boundary(page_tables)
-                try:
-                    page = reader.read_object(object_name, top=page_size, key_fields=key_fields,
-                                              after_values=after_values, key_types=key_types,
-                                              extra_filter=date_filter,
-                                              skip=None if use_keyset else skip)
-                except requests.HTTPError as exc:
-                    # Страница не по зубам серверу 1С (упирается в память/временные файлы) —
-                    # уменьшаем её и повторяем с того же места. Курсор/смещение не сдвигались.
-                    if _is_permanent_error(exc) or page_size <= FULL_LOAD_MIN_BATCH:
-                        raise
-                    page_size = max(FULL_LOAD_MIN_BATCH, page_size // FULL_LOAD_BATCH_DIVISOR)
-                    self._full_load_page_size[object_name] = page_size
-                    logger.warning("Full load of %s: page failed, retrying with batch_size=%s",
-                                   object_name, page_size)
-                    continue
-                if keys is not None:
-                    # Ключи страницы — до сохранения: если save упадёт, прогон не закончится и
-                    # пометки не будет вовсе, а лишние ключи в одноразовой таблице никому не мешают.
-                    keys.add(self._page_keys(object_name, reader))
-                for obj_name, data_object in reader.items():
-                    # Много страниц/объектов пишутся в одну строку лога — счётчики суммируются в БД.
-                    table_name = self._handler_key(obj_name)
-                    with self.writes.track(table_name):
-                        result = self.writer.save(obj_name, data_object,
-                                                  full_load_started_at=page_started_at)
-                    self.replicator_log.write_result(log_id, result)
-                    rows_modified += _rows_modified(result)
-                    # Флаг на каждую страницу, а не один в конце прогона: он булев, тысяча страниц
-                    # поднимет его один раз, зато витрина начинает наполняться после первой же
-                    # страницы, а не через часы, когда выгрузка закончится.
-                    self._signal_handlers(table_name, result, SOURCE_FULL_LOAD)
-                total += page
-                if page < page_size:
-                    break
-                if use_keyset:
-                    # Курсор следующей страницы — значения ключевых полей последней записи.
-                    data = reader[object_name].data
-                    after_values = [data[f][-1] for f in key_fields]
-                else:
-                    skip += page
-                page_size = self._next_page_size(object_name, page_size, page,
-                                                 reader.last_response_bytes, batch_size)
+            page_args = dict(reader=reader, key_fields=key_fields, key_types=key_types,
+                             use_keyset=use_keyset, batch_size=batch_size,
+                             page_tables=page_tables, keys=keys, log_id=log_id)
+
+            # Сначала читаем объект как есть — без нарезки и без лишних запросов. Мелкому объекту
+            # (а таких большинство) периоды только вредят: он укладывается в пару страниц, а за
+            # нарезку пришлось бы заплатить запросом на каждый месяц истории, даже пустой.
+            # Лимит страниц ставим, только если резать вообще есть по чему.
+            records, modified, exhausted = self._load_pages(
+                object_name, extra_filter=date_filter, **page_args,
+                max_pages=FULL_LOAD_PARTITION_MAX_PAGES if partition_field else None)
+            total += records
+            rows_modified += modified
+
+            if not exhausted:
+                logger.info("Full load of %s: deep object (> %s pages), switching to monthly "
+                            "partitions by %s", object_name, FULL_LOAD_PARTITION_MAX_PAGES,
+                            partition_field)
+                # Объект глубокий: $skip уже уходит далеко, и дальше цена растёт квадратично —
+                # 1С на каждый запрос строит выборку заново, сортирует и отбрасывает первые N
+                # строк. Перечитываем его по месяцам: фильтр по периоду переводит запрос на индекс
+                # (Дата у документа, Период у регистра входят в него), и сортируется маленький
+                # кусок. Прочитанные страницы перезапишутся теми же значениями — выгрузка
+                # идемпотентна, и это дешевле, чем гадать о размере объекта заранее ($count 1С
+                # не отдаёт).
+                for partition in self._period_partitions(object_name, reader, partition_field,
+                                                         date_filter):
+                    records, modified, exhausted = self._load_pages(
+                        object_name, extra_filter=_and_filters(partition.filter, date_filter),
+                        max_pages=FULL_LOAD_PARTITION_MAX_PAGES, **page_args)
+                    total += records
+                    rows_modified += modified
+                    if exhausted:
+                        continue
+                    # Глубоким оказался и месяц — дробим его на дни. Заново, а не с середины:
+                    # страницы упорядочены по ключу, а не по дате, и какие строки уже прочитаны,
+                    # в терминах периода неизвестно.
+                    logger.info("Full load of %s: %s is deep (> %s pages), splitting it into days",
+                                object_name, partition.title, FULL_LOAD_PARTITION_MAX_PAGES)
+                    for day in partition.split():
+                        records, modified, _ = self._load_pages(
+                            object_name, extra_filter=_and_filters(day.filter, date_filter),
+                            max_pages=None, **page_args)
+                        total += records
+                        rows_modified += modified
             if keys is not None:
                 # Пометка — только здесь, после последней страницы: прогон, упавший на середине,
                 # объявил бы «пропавшим» весь непрочитанный хвост объекта.
@@ -615,6 +673,142 @@ class Replicator1C:
                     object_name, total, rows_modified)
         return rows_modified
 
+
+    def _load_pages(self, object_name: str, *, reader: DataReader1C, key_fields: list[str],
+                    key_types: list[str], use_keyset: bool, extra_filter: str | None,
+                    batch_size: int, page_tables: list[str], keys, log_id,
+                    max_pages: int | None) -> tuple[int, int, bool]:
+        """
+        Постраничное чтение одной выборки (объект целиком либо его партиция по периоду) с записью
+        каждой страницы. Возвращает (сколько записей прочитано, сколько строк изменено, дочитано ли
+        до конца).
+
+        max_pages ограничивает число страниц: превышение означает «выборка слишком глубокая», и
+        вызывающий режет её на меньшие периоды (см. full_load). None — читать до конца.
+        """
+        after_values = None
+        skip = 0
+        total = 0
+        rows_modified = 0
+        pages = 0
+        # Начинаем с размера, подобранного по этому объекту раньше, иначе — с пробной страницы.
+        page_size = min(batch_size,
+                        self._full_load_page_size.get(object_name, FULL_LOAD_PROBE_BATCH))
+        while True:
+            # Отметка берётся на КАЖДУЮ страницу, а не одна на прогон. Guard'ы снимка проверяют
+            # «строку не переписали после того, как мы прочитали эти данные», и точка отсчёта у
+            # них — момент чтения страницы. С одной отметкой на прогон группа, разрезанная
+            # границей страниц (табличная часть одного владельца), блокировала сама себя:
+            # строки, записанные предыдущей страницей, выглядели как чужое свежее изменение,
+            # и остаток группы молча не вставлялся (87 строк в 1С → 84 в БД).
+            #
+            # Не «сейчас», а граница по реестру незавершённых merge — та же, к которой
+            # прижимается окно обработчика (WriteTracker.boundary). merged_on штампуется ВНУТРИ
+            # merge-транзакции, а коммитится позже: чужой merge, начавшийся до нашего чтения и
+            # закоммиченный после, оставил бы merged_on левее «сейчас», guard счёл бы строку
+            # старой, и снимок затёр бы свежее изменение. Брошенные строки реестра границу не
+            # держат — их отсекает отметка живости (HEARTBEAT_TTL), поэтому умерший процесс
+            # тормозит выгрузку максимум на TTL, а не навсегда. Свои же записи помехой не
+            # становятся: строка реестра живёт до коммита, а страницы пишутся последовательно —
+            # к этому моменту нашей строки в реестре уже нет.
+            page_started_at = self.writes.boundary(page_tables)
+            try:
+                page = reader.read_object(object_name, top=page_size, key_fields=key_fields,
+                                          after_values=after_values, key_types=key_types,
+                                          extra_filter=extra_filter,
+                                          skip=None if use_keyset else skip)
+            except requests.HTTPError as exc:
+                # Страница не по зубам серверу 1С (упирается в память/временные файлы) —
+                # уменьшаем её и повторяем с того же места. Курсор/смещение не сдвигались.
+                if _is_permanent_error(exc) or page_size <= FULL_LOAD_MIN_BATCH:
+                    raise
+                page_size = max(FULL_LOAD_MIN_BATCH, page_size // FULL_LOAD_BATCH_DIVISOR)
+                self._full_load_page_size[object_name] = page_size
+                logger.warning("Full load of %s: page failed, retrying with batch_size=%s",
+                               object_name, page_size)
+                continue
+            if keys is not None:
+                # Ключи страницы — до сохранения: если save упадёт, прогон не закончится и
+                # пометки не будет вовсе, а лишние ключи в одноразовой таблице никому не мешают.
+                keys.add(self._page_keys(object_name, reader))
+            for obj_name, data_object in reader.items():
+                # Много страниц/объектов пишутся в одну строку лога — счётчики суммируются в БД.
+                table_name = self._handler_key(obj_name)
+                with self.writes.track(table_name):
+                    result = self.writer.save(obj_name, data_object,
+                                              full_load_started_at=page_started_at)
+                self.replicator_log.write_result(log_id, result)
+                rows_modified += _rows_modified(result)
+                # Флаг на каждую страницу, а не один в конце прогона: он булев, тысяча страниц
+                # поднимет его один раз, зато витрина начинает наполняться после первой же
+                # страницы, а не через часы, когда выгрузка закончится.
+                self._signal_handlers(table_name, result, SOURCE_FULL_LOAD)
+            total += page
+            pages += 1
+            if page < page_size:
+                break
+            if max_pages is not None and pages >= max_pages:
+                # Дочитать можно и так, но дальше $skip уходит в глубину — пусть вызывающий
+                # порежет выборку на меньшие периоды.
+                return total, rows_modified, False
+            if use_keyset:
+                # Курсор следующей страницы — значения ключевых полей последней записи.
+                data = reader[object_name].data
+                after_values = [data[f][-1] for f in key_fields]
+            else:
+                skip += page
+            page_size = self._next_page_size(object_name, page_size, page,
+                                             reader.last_response_bytes, batch_size)
+        return total, rows_modified, True
+
+    def _partition_date_field(self, object_name: str, date_field: str | None) -> str | None:
+        """
+        Поле, по которому режем выгрузку на периоды: заданное пользователем либо угаданное по
+        метаданным — Date у документа, Period у регистра. У справочника даты нет вовсе, и это
+        нормально: он и не растёт так, чтобы $skip стал проблемой.
+
+        Имя проверяем по метаданным, а не по классу объекта: набор полей 1С отдаёт в $metadata,
+        и опираться на него надёжнее, чем на разбор имени.
+        """
+        properties = self.metadata.get(object_name) or {}
+        if date_field:
+            return date_field
+        for candidate in PARTITION_DATE_FIELDS:
+            if properties.get(candidate) == 'DateTime':
+                return candidate
+        return None
+
+    def _period_partitions(self, object_name: str, reader: DataReader1C, date_field: str | None,
+                           date_filter: str | None) -> list["_Partition"]:
+        """
+        Режет выгрузку на месяцы — от свежих к старым. Пустой список означает «партиционирования
+        нет», и объект читается одной выборкой, как раньше.
+
+        Границы берём у самой 1С: две строки, отсортированные по полю даты в обе стороны. Запрос
+        дешёвый (поле даты входит в индекс), а знать их надо, чтобы не перебирать пустые годы.
+        Внутри заданного пользователем диапазона режем так же — фильтр периода просто добавляется
+        к пользовательскому.
+
+        Правая граница самой свежей партиции открыта: документ, созданный уже во время прогона,
+        иначе остался бы за краем.
+        """
+        if date_field is None:
+            return []
+        oldest = reader.read_date_bound(object_name, date_field, newest=False,
+                                        extra_filter=date_filter)
+        if oldest is None:
+            return []          # объект (или заданный период) пуст — читать нечего
+        newest = reader.read_date_bound(object_name, date_field, newest=True,
+                                        extra_filter=date_filter) or oldest
+
+        partitions = []
+        start = _month_start(oldest)
+        last_start = _month_start(newest)
+        while start <= last_start:
+            end = None if start == last_start else _next_month(start)
+            partitions.append(_Partition(date_field, start, end, final=False))
+            start = _next_month(start)
+        return list(reversed(partitions))
 
     def _primary_key_columns(self, object_name: str) -> dict:
         """Первичный ключ объекта в терминах целевой таблицы: {колонка: тип SQLAlchemy}. По нему
