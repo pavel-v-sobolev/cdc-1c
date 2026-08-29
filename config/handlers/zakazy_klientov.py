@@ -97,16 +97,6 @@ class ZakazyKlientov(Handler1C):
         # CREATE OR REPLACE VIEW на каждую страницу брал бы блокировки на пустом месте.
         self.execute(context, DDL)
 
-    def merge(self, context):
-        """Один и тот же merge для инкремента и для блока пересборки — различаются они только
-        условиями, которые передаются в exec()."""
-        return dbmerge(context.engine, table_name="ZakazyKlientov", schema=context.schema,
-                       # Промежуточную таблицу merge кладём туда же, куда её кладёт репликатор
-                       # (см. runner.py): не задана — схема данных.
-                       temp_schema=context.temp_schema,
-                       source_table_name="ZakazyKlientov_view", source_schema=context.schema,
-                       delete_mode='delete')
-
     def rebuild(self, context):
         """
         Пересборка ПО МЕСЯЦАМ. Между блоками цикл применяет накопившиеся изменения, поэтому витрина
@@ -114,67 +104,61 @@ class ZakazyKlientov(Handler1C):
 
         Блок читает данные АКТУАЛЬНЫЕ на момент своего выполнения — никакого снимка на старте
         пересборки. Иначе блок затёр бы изменения, применённые между блоками.
+
+        Удаления нет и здесь: ключ витрины совпадает с ключом строки регистра, поэтому строка,
+        у которой поправили дату документа, просто обновится на месте — копии в старом месяце не
+        остаётся. Витрине, где ключ другой, месяц пришлось бы заменять целиком: см. соседний
+        zakazy_klientov_grouped.py.
         """
         for label, begin, end in self.query(context, REBUILD_BLOCKS_SQL):
             if context.rebuild_from and label <= context.rebuild_from:
                 continue                      # этот месяц уже посчитан до перезапуска процесса
 
-            with self.merge(context) as merge:
-                target_period = merge.table.c["Period"]
+            with dbmerge(context.engine, table_name="ZakazyKlientov", schema=context.schema,
+                         temp_schema=context.temp_schema,
+                         source_table_name="ZakazyKlientov_view",
+                         source_schema=context.schema) as merge:
                 period = merge.source_table.c["Period"]
-                # Блок берёт из источника ВЕСЬ месяц, поэтому и удалять можно весь месяц: что не
-                # приехало в staging, того в источнике больше нет. Инкременту так нельзя — он
-                # видит лишь часть строк месяца и снёс бы остальные.
-                #
-                # Заодно это чинит переезд строки между месяцами (поправили дату документа): из
-                # старого месяца её удалит его блок, в новом создаст его собственный. Удаляй мы
-                # только по регистраторам из staging, в старом месяце осталась бы копия.
-                merge.exec(
-                    source_condition=and_(period >= begin, period < end),
-                    delete_condition=and_(target_period >= begin, target_period < end))
+                merge.exec(source_condition=and_(period >= begin, period < end))
 
             context.logger.info("Data Mart updated for %s", label)
             yield label
 
     def handle(self, context):
-        with self.merge(context) as merge:
+        # delete_mode не задан (по умолчанию 'no'): удалять из витрины нечего. Строки из целевых
+        # таблиц физически не исчезают — выпавшую из набора движений репликатор помечает
+        # is_deleted_or_empty и гасит ресурсы, а вьюшка её не фильтрует. Значит такая строка
+        # приедет сюда как обычное изменение и обновит строку витрины нулём и флагом.
+        with dbmerge(context.engine, table_name="ZakazyKlientov", schema=context.schema,
+                     # Промежуточную таблицу merge кладём туда же, куда её кладёт репликатор
+                     # (см. runner.py): не задана — схема данных.
+                     temp_schema=context.temp_schema,
+                     source_table_name="ZakazyKlientov_view", source_schema=context.schema) as merge:
 
-            # Единица пересчёта — не строка, а ГРУППА (Recorder), потому что удаляем мы тоже
-            # группой. Берём ключи групп, у которых стал свежее хоть один источник.
+            # Ключ витрины совпадает с ключом строки регистра, и удаления нет, поэтому единица
+            # пересчёта — СТРОКА: берём те, у которых стал свежее хоть один источник. (Там, где
+            # ключ витрины другой — например, агрегат по GROUP BY, — так нельзя: см. соседний
+            # zakazy_klientov_grouped.py, где пересчитывается группа целиком.)
             #
             # Вьюшка у веток одна и та же: логика соединений не дублируется, различаются они
             # только колонкой в WHERE. ALL — потому что дедупликация не нужна: результат уходит
             # в IN (...), где дубликаты не мешают.
             changed = merge.source_table.alias("chg")
             since = self.since(context)
+            row_key = (changed.c["Recorder"], changed.c["Recorder_Type"], changed.c["LineNumber"])
 
-            changed_by_register = (
-                select(changed.c["Recorder"], changed.c["Recorder_Type"])
-                .where(changed.c["merged_on"] > since))
+            changed_by_register = select(*row_key).where(changed.c["merged_on"] > since)
+            changed_by_nomenklatura = select(*row_key).where(
+                changed.c["Nomenklatura_merged_on"] > since)
 
-            changed_by_nomenklatura = (
-                select(changed.c["Recorder"], changed.c["Recorder_Type"])
-                .where(changed.c["Nomenklatura_merged_on"] > since))
-
-            changed_recorders = union_all(changed_by_register, changed_by_nomenklatura)
+            changed_rows = union_all(changed_by_register, changed_by_nomenklatura)
 
             merge.exec(
                 source_condition=tuple_(merge.source_table.c["Recorder"],
-                                        merge.source_table.c["Recorder_Type"])
-                                 .in_(changed_recorders),
-                delete_condition=tuple_(merge.table.c["Recorder"], merge.table.c["Recorder_Type"])
-                                 .in_(select(merge.temp_table.c["Recorder"],
-                                             merge.temp_table.c["Recorder_Type"]).distinct()))
-            # source_condition: тащим из вьюшки ЦЕЛИКОМ все строки изменившихся Recorder'ов. Нельзя
-            # брать только строки, свежие сами по себе: если приехала одна номенклатура, «свежей»
-            # станет лишь часть строк документа, а delete_condition снесёт все строки Recorder'а —
-            # остальные не вернутся.
-            # delete_condition: удаляем из целевой таблицы строки, для которых во временной таблице
-            # есть ключ (Recorder, Recorder_Type), но нет строки с таким LineNumber — значит, в
-            # источнике строку табличной части удалили. Если табличную часть удалили целиком,
-            # прилетит строка с is_deleted_or_empty=True и почистит старые строки.
-            #
-            # Почему changed_recorders собран через UNION ALL, а не одним WHERE с OR (то есть не
+                                        merge.source_table.c["Recorder_Type"],
+                                        merge.source_table.c["LineNumber"]).in_(changed_rows))
+
+            # Почему changed_rows собран через UNION ALL, а не одним WHERE с OR (то есть не
             # через self.changed_since). Написать `merged_on > since OR Nomenklatura_merged_on >
             # since` — читается лучше, но на объёме это узкое место, и дело НЕ в отсутствии
             # индексов. Ветки такого OR живут на разных таблицах соединения, поэтому ни по одной

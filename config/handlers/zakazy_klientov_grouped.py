@@ -199,16 +199,6 @@ class ZakazyKlientovGrouped(Handler1C):
     def setup(self, context):
         self.execute(context, DDL)
 
-    def merge(self, context):
-        """Один и тот же merge для инкремента и для блока пересборки — различаются они только
-        условиями, которые уходят в exec()."""
-        return dbmerge(context.engine, table_name="ZakazyKlientovGrouped", schema=context.schema,
-                       # Промежуточную таблицу merge кладём туда же, куда её кладёт репликатор
-                       # (см. runner.py): не задана — схема данных.
-                       temp_schema=context.temp_schema,
-                       source_table_name="ZakazyKlientovGrouped_view", source_schema=context.schema,
-                       delete_mode='delete')
-
     def rebuild(self, context):
         """
         Пересборка ПО МЕСЯЦАМ. Между блоками цикл применяет накопившиеся изменения, поэтому витрина
@@ -224,7 +214,12 @@ class ZakazyKlientovGrouped(Handler1C):
             if context.rebuild_from and label <= context.rebuild_from:
                 continue                  # этот месяц уже посчитан до перезапуска процесса
 
-            with self.merge(context) as merge:
+            with dbmerge(context.engine, table_name="ZakazyKlientovGrouped", schema=context.schema,
+                         # Промежуточную таблицу merge кладём туда же, куда её кладёт репликатор
+                         # (см. runner.py): не задана — схема данных.
+                         temp_schema=context.temp_schema,
+                         source_table_name="ZakazyKlientovGrouped_view",
+                         source_schema=context.schema, delete_mode='delete') as merge:
                 merge.exec(source_condition=merge.source_table.c["Period"] == period,
                            delete_condition=merge.table.c["Period"] == period)
 
@@ -236,7 +231,12 @@ class ZakazyKlientovGrouped(Handler1C):
             GROUPS_TO_HANDLE_SQL.format(schema=self.schema_prefix(context))
         ).bindparams(since=self.since(context))
 
-        with self.merge(context) as merge:
+        with dbmerge(context.engine, table_name="ZakazyKlientovGrouped", schema=context.schema,
+                     # Промежуточную таблицу merge кладём туда же, куда её кладёт репликатор
+                     # (см. runner.py): не задана — схема данных.
+                     temp_schema=context.temp_schema,
+                     source_table_name="ZakazyKlientovGrouped_view", source_schema=context.schema,
+                     delete_mode='delete') as merge:
             # Ключ группы составной, поэтому сравнение row-value: (Number, Year) IN (SELECT
             # Number, Year ...). В остальном ничего не меняется по сравнению с одиночным ключом.
             source_key = tuple_(merge.source_table.c["Number"], merge.source_table.c["Year"])

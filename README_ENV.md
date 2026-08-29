@@ -63,7 +63,7 @@ python -m cdc_1c     # то же самое
 `CDC1C_FULL_LOAD_WORKERS` влияет и на пул соединений: entrypoint заводит `create_engine` с
 `pool_size = CDC1C_FULL_LOAD_WORKERS + 2` — соединение одновременно держат цикл изменений, поток
 отметки живости незавершённых merge и страницы полной выгрузки (подробнее —
-[README_HANDLERS.md](README_HANDLERS.md), раздел «Сколько нужно соединений к БД»).
+[README_DB.md](README_DB.md), раздел «Сколько нужно соединений к БД»).
 
 ### Не `CDC1C_*`, но важна
 
