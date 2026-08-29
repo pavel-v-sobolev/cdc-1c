@@ -212,7 +212,7 @@ class WriteTracker:
         return min(now, earliest) if earliest is not None else now
 
     def heartbeat(self) -> None:
-        """Продлевает жизнь своим строкам. Зовётся своим же потоком (см. _heartbeat_loop), пока в
+        """Продлевает жизнь своим строкам. Вызывается своим же потоком (см. _heartbeat_loop), пока в
         реестре есть незавершённые merge этого процесса."""
         with self.engine.begin() as conn:
             conn.execute(update(self.table)

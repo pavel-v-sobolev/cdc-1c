@@ -230,7 +230,7 @@ def test_first_run_starts_from_scratch_and_advances_window(db):
     first_boundary = spy.calls[0].boundary
     assert _last_run_at(runner, spy.name) == first_boundary
 
-    # Без сигнала повторно не зовём: обработчик всё равно выбирает данные сам, и пустое окно ему
+    # Без сигнала повторно не вызываем: обработчик всё равно выбирает данные сам, и пустое окно ему
     # ничего не даст.
     runner.run_if_pending()
     assert len(spy.calls) == 1
@@ -283,7 +283,7 @@ def test_signals_are_coalesced(db):
 
 
 def test_on_full_load_is_published_and_respected_by_the_replicator(db):
-    # Обработчик по метке update_requested_at источник не различает, поэтому решение «звать ли на
+    # Обработчик по метке update_requested_at источник не различает, поэтому решение «вызывать ли на
     # бэкфилле» принимает тот, кто флаг поднимает. Значит on_full_load обязан доехать до него через
     # ту же таблицу — иначе ON_FULL_LOAD=False просто не работал бы.
     quiet = Spy(name='quiet', on=["Catalog_X"], on_full_load=False)
@@ -359,7 +359,7 @@ def test_handler_waits_when_window_would_be_inverted(db):
         assert len(spy.calls) == 1
         _signal(db, "Catalog_X", SOURCE_CHANGES)
         runner.run_if_pending()
-        assert len(spy.calls) == 1, 'окно не сдвинулось — звать нечем'
+        assert len(spy.calls) == 1, 'окно не сдвинулось — вызывать не с чем'
 
     runner.run_if_pending()
     assert len(spy.calls) == 2, 'merge завершился — накопленная отметка отработала'
@@ -445,7 +445,7 @@ def test_full_rebuild_request_alone_starts_the_handler(db):
     spy.calls.clear()
 
     runner.run_if_pending()
-    assert spy.calls == [], 'без изменений и без заказа обработчик не зовут'
+    assert spy.calls == [], 'без изменений и без заказа обработчик не вызывают'
 
     with runner.engine.begin() as conn:
         conn.execute(runner.table.update()
@@ -489,7 +489,7 @@ def test_full_rebuild_requested_during_a_run_is_not_lost(db):
 
 
 def test_replicator_signals_only_on_real_changes(db, monkeypatch):
-    # Гейт «звать только если merge реально что-то сделал» живёт в оркестраторе: 1С регистрирует
+    # Гейт «вызывать только если merge реально что-то сделал» живёт в оркестраторе: 1С регистрирует
     # изменение объекта на любую перезапись, и пустых прогонов в пакете больше, чем содержательных.
 
 
@@ -810,7 +810,7 @@ def test_the_heartbeat_thread_goes_away_when_nothing_is_in_flight(db, monkeypatc
 def test_constructors_install_signal_handlers(db, monkeypatch):
     # Типовая точка входа отправляет все run_forever в пул потоков, а из рабочего потока перехват
     # поставить нельзя. Тогда его не ставит никто: SIGTERM убивает процесс, SIGINT вешает его
-    # намертво. Поэтому перехват ставится в конструкторе — он-то зовётся из главного потока.
+    # намертво. Поэтому перехват ставится в конструкторе — он-то вызывается из главного потока.
     import signal as signal_module
 
     from cdc_1c import stop_signal
@@ -894,7 +894,7 @@ def test_changes_are_applied_between_rebuild_blocks(db):
     # ненулевой счётчик на строке '2025' означает: инкремент прошёл именно МЕЖДУ блоками,
     # а не после всей пересборки. Ради этого блоки и заведены.
     by_label = dict(signalled)
-    assert by_label['2024'] == 0, 'до сигнала обработчик по окну не звали'
+    assert by_label['2024'] == 0, 'до сигнала обработчик по окну не вызывали'
     assert by_label['2025'] >= 1, 'изменение ждало конца пересборки, а не применилось между блоками'
     assert len(spy.calls) >= 1
     assert spy.calls[0].last_run_at > EPOCH, 'это инкремент, а не ещё одна пересборка'
@@ -981,7 +981,7 @@ def test_signal_arriving_during_a_run_is_not_swallowed(db):
 
     _signal(db, "Catalog_X")
     runner.run_if_pending()
-    assert len(spy.calls) == 1, 'обработчик должен быть позван по сигналу'
+    assert len(spy.calls) == 1, 'обработчик должен быть вызван по сигналу'
     assert _state(runner, spy.name).update_requested_at is not None, \
         'сигнал, пришедший во время прогона, снят вместе с обработанными'
 
