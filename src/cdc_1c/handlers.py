@@ -189,9 +189,10 @@ class HandlerContext:
     rebuild_from: str | None
     # Что привело к вызову. Только для логов: выбирать данные обязательно по окну.
     #
-    # Точности тут немного, и это осознанно. Репликатор сообщает об изменении флагом в handlers_1c,
-    # а флаг не несёт ни имени изменившейся таблицы, ни источника — иначе пришлось бы городить в
-    # таблице очередь событий вместо одного булева поля. Поэтому objects — это весь ON обработчика,
+    # Точности тут немного, и это осознанно. Репликатор сообщает об изменении меткой времени в
+    # handlers_1c, а метка не несёт ни имени изменившейся таблицы, ни источника — иначе пришлось бы
+    # городить в таблице очередь событий вместо одной колонки. Поэтому objects — это весь ON
+    # обработчика,
     # а sources — db_signal (изменение), startup (первый проход процесса) или full_rebuild (заказ
     # пересборки). Отличить бэкфилл полной выгрузки от живого изменения по sources нельзя; если
     # обработчику не нужен бэкфилл, он выключается целиком через ON_FULL_LOAD.
@@ -530,7 +531,7 @@ class HandlerSignals:
         self.table.create(engine, checkfirst=True)
         _add_missing_columns(engine, self.table)
         self._lock = threading.Lock()
-        self._subscriptions: dict[str, list[str]] = {}
+        self._subscriptions: dict[str, list[tuple[str, bool]]] = {}
         self._read_at = 0.0
 
     def subscribers(self, object_name: str, source: str = SOURCE_CHANGES) -> list[str]:
@@ -583,7 +584,8 @@ class HandlerSignals:
         logger.info("Changed %s (%s) → update requested for %s",
                     object_name, source, ', '.join(sorted(names)))
 
-    def request_full_rebuild(self, object_name: str, reason: str) -> None:
+    def request_full_rebuild(self, object_name: str, reason: str,
+                             source: str = SOURCE_CHANGES) -> None:
         """
         Просит подписчиков таблицы собрать витрину заново: ставит full_rebuild_is_required.
 
@@ -591,8 +593,15 @@ class HandlerSignals:
         dbmerge). Инкремент её появления не видит в принципе: окно строится по merged_on, а
         merged_on двигается только у строк, у которых изменились ЗНАЧЕНИЯ; добавление колонки не
         меняет ни одного значения, и все уже лежащие строки остаются левее окна навсегда.
+
+        Источник учитывается так же, как в signal(), и по той же причине. Колонка появляется и на
+        странице ПОЛНОЙ ВЫГРУЗКИ — dbmerge заводит их по фактическим данным страницы, а поля со
+        значением null 1С не присылает вовсе, поэтому реквизит, пустой на первой странице и
+        заполненный на второй, добавляет колонку прямо посреди прогона. Звать на этом того, кто от
+        бэкфилла отписался (ON_FULL_LOAD=False), нельзя: для отправщика во внешнюю систему
+        пересборка — это повторная отправка всего с начала времён, ровно то, чего он и избегал.
         """
-        names = self.subscribers(object_name)
+        names = self.subscribers(object_name, source)
         if not names:
             return
         with self.engine.begin() as conn:
@@ -840,8 +849,7 @@ class HandlerLoop:
             # last_run_at = граница, ВЗЯТАЯ ДО вызова: всё, что смёржилось за время работы
             # обработчика, окажется правее неё и попадёт в следующее окно, а не потеряется.
             elapsed = time.monotonic() - started
-            if self._save_success(boundary, last_run_at, expected_rebuild,
-                                  False, elapsed, update_requested):
+            if self._save_success(boundary, last_run_at, expected_rebuild, update_requested):
                 logger.info("Handler %s finished in %.1fs (objects=%s)",
                             self.name, elapsed, sorted(objects))
             else:
@@ -989,8 +997,7 @@ class HandlerLoop:
             self._dirty_sources |= sources
 
     def _save_success(self, boundary: datetime, expected_last_run_at: datetime | None,
-                      expected_rebuild: bool, full_rebuild: bool, elapsed: float,
-                      update_requested: bool = False) -> bool:
+                      expected_rebuild: bool, update_requested: bool = False) -> bool:
         """
         Двигает отметку обработчика — но только если его состояние не поменяли снаружи, пока он
         работал (`expected_*` — значения, с которыми он стартовал). False, если не сдвинул.
@@ -999,13 +1006,12 @@ class HandlerLoop:
         безусловная запись сняла бы этот заказ, не оставив следа. Условие собрано на IS NULL /
         равенстве, а не на IS DISTINCT FROM — тот есть не во всех СУБД.
 
-        Если прогон был пересборкой (full_rebuild), вместе с отметкой снимается требование и
-        записываются её метрики — как mark_full_loaded делает для полной выгрузки объекта. Время в
-        МИНУТАХ и дробное: пересборка витрины меряется десятками минут, секунды тут только мешают.
+        expected_rebuild — что стояло в БД на старте прогона: по нему и проверяем, не заказали ли
+        пересборку в середине.
 
-        Два разных признака рядом не по недосмотру: expected_rebuild — что стояло в БД на старте
-        прогона (по нему проверяем, не заказали ли пересборку в середине), а full_rebuild — чем
-        прогон оказался на самом деле. Первый в жизни прогон — пересборка, хотя её не заказывали.
+        Пересборкой этот метод не занимается вовсе: её ведёт _run_rebuild — флаг заказа снимает
+        _save_rebuild_started, метрики пишет _save_rebuild_finished. Сюда прогон приходит только
+        инкрементом, в том числе тем, что идёт МЕЖДУ блоками пересборки.
         """
         t = self.table
         unchanged = (t.c.last_run_at.is_(None) if expected_last_run_at is None
@@ -1022,9 +1028,6 @@ class HandlerLoop:
             values['update_requested_at'] = case(
                 (t.c.update_requested_at <= boundary, None),
                 else_=t.c.update_requested_at)
-        if full_rebuild:
-            values.update(full_rebuild_is_required=False, last_full_rebuild_dt=func.now(),
-                          last_full_rebuild_minutes=round(elapsed / 60, 3))
         with self.engine.begin() as conn:
             result = conn.execute(
                 update(t)

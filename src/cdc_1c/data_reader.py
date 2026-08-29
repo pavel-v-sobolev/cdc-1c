@@ -244,7 +244,7 @@ class DataReader1C(UserDict):
     def read_object(self, object_name: str, top: int | None = None,
                     key_fields: list[str] | None = None, after_values: list | None = None,
                     key_types: list[str] | None = None, extra_filter: str | None = None,
-                    skip: int | None = None) -> int:
+                    skip: int | None = None, use_keyset: bool = False) -> int:
         """
         Читает объект 1С в reader (предыдущее содержимое очищается). Страница — сортировка по ключу
         ($orderby key_fields) и лимит $top; следующая страница берётся одним из двух способов:
@@ -255,7 +255,10 @@ class DataReader1C(UserDict):
         - $skip: смещение от начала выборки. 1С перечитывает пропущенные строки, зато работает для
           любого ключа.
 
-        skip и after_values взаимоисключающи; способ выбирает вызывающий (см. Replicator1C.full_load).
+        skip и after_values взаимоисключающи; способ выбирает вызывающий (см. Replicator1C.full_load)
+        и объявляет его флагом use_keyset — от него зависит состав $orderby (см. ниже). Флаг явный,
+        а не выведенный из after_values: на ПЕРВОЙ странице keyset-выборки курсора ещё нет, и по
+        одному after_values эти два случая неразличимы.
 
         key_fields/key_types (порядок = порядок сортировки; типы — для литералов, см. _odata_literal):
         - справочник/документ: ['Ref_Key'] / ['Guid'];
@@ -283,9 +286,11 @@ class DataReader1C(UserDict):
         # даёт и дубли, и потерянные строки (проверено: 87 строк в 1С → 84 в БД). Дополняем
         # сортировку остальными полями первичного ключа — они ничью и разрешают.
         # keyset так дополнять нельзя: его фильтр строится ровно по key_fields, и страница,
-        # оборванная посреди ничьей, была бы продолжена не с той строки.
+        # оборванная посреди ничьей, была бы продолжена не с той строки. Поэтому смотрим на
+        # use_keyset, а не на «есть ли уже курсор»: у первой страницы курсора нет, а порядок у
+        # неё обязан быть тот же, что у следующих.
         order_fields = list(key_fields)
-        if after_values is None:
+        if not use_keyset:
             metadata_obj = self.metadata.get(object_name)
             for field in (metadata_obj.primary_key if metadata_obj is not None else {}):
                 if field not in order_fields:
@@ -329,7 +334,8 @@ class DataReader1C(UserDict):
         Запрос дешёвый именно потому, что поле даты у документов и регистров входит в индекс:
         1С отдаёт первую строку упорядоченной выборки, а не сортирует всё.
 
-        None — объект пуст (или пуст заданный диапазон): выгружать нечего.
+        None — объект пуст (или пуст заданный диапазон), а также если в первой строке даты не
+        оказалось (тогда пишем warning): нарезать не по чему.
         """
         order = date_field + (' desc' if newest else '')
         params = ["$top=1", "$orderby=" + quote(order, safe="")]

@@ -191,16 +191,24 @@ class WriteTracker:
                 self._active -= 1
 
     def boundary(self, object_names: Iterable[str]) -> datetime:
-        """Верхняя граница окна: минимум из «сейчас» и стартов живых незавершённых merge по этим
-        таблицам, чьи бы они ни были."""
+        """
+        Верхняя граница окна: минимум из «сейчас» и стартов живых незавершённых merge по этим
+        таблицам, чьи бы они ни были.
+
+        Одним запросом, а не двумя: границу спрашивают на КАЖДУЮ страницу полной выгрузки, а
+        страница бывает и в одну entry (см. FULL_LOAD_MIN_BATCH) — лишний round-trip там заметен.
+        Заодно «сейчас» для отсечки по живости и «сейчас» для самой границы гарантированно одно и
+        то же значение.
+        """
         t = self.table
+        # started_at лежит в колонке без пояса, поэтому и читается уже offset-naive.
+        earliest = (select(func.min(t.c.started_at))
+                    .where(t.c.object_name.in_(list(object_names)),
+                           t.c.heartbeat_at > DB_NOW_WITHOUT_TIMEZONE
+                           - timedelta(seconds=HEARTBEAT_TTL))
+                    .scalar_subquery())
         with self.engine.connect() as conn:
-            now = conn.scalar(select(DB_NOW_WITHOUT_TIMEZONE))
-            # started_at лежит в колонке без пояса, поэтому и читается уже offset-naive.
-            earliest = conn.scalar(
-                select(func.min(t.c.started_at))
-                .where(t.c.object_name.in_(list(object_names)),
-                       t.c.heartbeat_at > now - timedelta(seconds=HEARTBEAT_TTL)))
+            now, earliest = conn.execute(select(DB_NOW_WITHOUT_TIMEZONE, earliest)).one()
         return min(now, earliest) if earliest is not None else now
 
     def heartbeat(self) -> None:

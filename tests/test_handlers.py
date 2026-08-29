@@ -990,3 +990,44 @@ def test_signal_arriving_during_a_run_is_not_swallowed(db):
     assert len(spy.calls) == 2
     assert _state(runner, spy.name).update_requested_at is None, \
         'после прогона, который его прочитал, метка должна сняться'
+
+
+def test_full_rebuild_from_a_full_load_page_skips_opted_out_handlers(db):
+    """
+    Заказ пересборки уважает on_full_load так же, как обычный сигнал.
+
+    Колонку dbmerge заводит по фактическим данным страницы, а поля со значением null 1С не
+    присылает вовсе — поэтому реквизит, пустой на первой странице и заполненный на второй,
+    добавляет колонку прямо посреди полной выгрузки. Для отправщика во внешнюю систему пересборка
+    — это повторная отправка всего с начала времён, ровно то, чего ON_FULL_LOAD=False и избегает.
+    """
+    quiet = Spy(name='quiet', on=["Catalog_X"], on_full_load=False)
+    loud = Spy(name='loud', on=["Catalog_X"])
+    runner = _runner_for(db, quiet)
+    _runner_for(db, loud)
+
+    signals = HandlerSignals(db.engine, db.schema)
+    signals.request_full_rebuild("Catalog_X", "new column", SOURCE_FULL_LOAD)
+
+    assert not _state(runner, 'quiet').full_rebuild_is_required, \
+        'бэкфилл не должен заказывать пересборку тому, кто от бэкфилла отписался'
+    assert _state(runner, 'loud').full_rebuild_is_required
+
+    # Живое изменение — другое дело: там колонка касается всех подписчиков.
+    signals.request_full_rebuild("Catalog_X", "new column", SOURCE_CHANGES)
+    assert _state(runner, 'quiet').full_rebuild_is_required
+
+
+def test_replicator_passes_the_source_to_the_rebuild_request(db):
+    """Тот же гейт на боевом пути: источник доезжает от _signal_handlers до handlers_1c."""
+    quiet = Spy(name='quiet', on=["Catalog_X"], on_full_load=False)
+    runner = _runner_for(db, quiet)
+    rep = _replicator(db)
+
+    rep._signal_handlers("Catalog_X", _result(inserted=1, added_fields={'Новый': 'String'}),
+                         SOURCE_FULL_LOAD)
+    assert not _state(runner, 'quiet').full_rebuild_is_required
+
+    rep._signal_handlers("Catalog_X", _result(inserted=1, added_fields={'Новый': 'String'}),
+                         SOURCE_CHANGES)
+    assert _state(runner, 'quiet').full_rebuild_is_required

@@ -5,9 +5,9 @@
 `DBWriter1C`, `MetadataReader1C` и прочие вызываются библиотекой сами, и трогать их не нужно.
 
 Обзор и запуск — в [README.md](README.md), переменные окружения — в [README_ENV.md](README_ENV.md),
-что появляется в БД — в [README_DB.md](README_DB.md), механика обработчиков — в
-[README_HANDLERS.md](README_HANDLERS.md), внутреннее устройство — в
-[DESIGN.md](DESIGN.md). Готовый шаблон сборки — [config/runner.py](config/runner.py).
+что появляется в БД — в [README_DB.md](README_DB.md), внутреннее устройство (в том числе
+механика обработчиков) — в [DESIGN.md](DESIGN.md). Готовый шаблон сборки —
+[config/runner.py](config/runner.py).
 
 Всё импортируется из корня пакета:
 
@@ -99,8 +99,9 @@ class ZakazyKlientov(Handler1C):
 контекста; `schema_prefix(context)` — префикс схемы для строкового SQL.
 
 Данные обработчику **не передаются**: он получает окно по часам БД и выбирает изменившееся сам.
-Как это работает и что нужно знать, чтобы витрина считалась правильно, — в
-[README_HANDLERS.md](README_HANDLERS.md).
+Как это работает и что нужно знать, чтобы витрина считалась правильно, — в docstring модуля
+`cdc_1c.handlers`, а механика (сигнал, граница окна, пересборка блоками) — в
+[DESIGN.md](DESIGN.md#обработчики-сигнал-окно-и-пересборка).
 
 ### `HandlerContext` — что обработчик получает
 

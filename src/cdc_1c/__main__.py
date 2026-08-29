@@ -54,7 +54,8 @@ def main() -> None:
         raise SystemExit(f"Unknown CDC1C_MODE={mode!r} (expected 'loop' or 'once')")
 
     # Пул: одновременно соединение держат цикл изменений, поток отметки живости незавершённых
-    # merge и страницы полной выгрузки, отсюда full_load_workers + 2 (см. README_HANDLERS.md).
+    # merge и страницы полной выгрузки, отсюда full_load_workers + 2 (см. README_DB.md,
+    # «Сколько нужно соединений к БД»).
     # Обработчиков здесь нет — были бы, добавилось бы по соединению на каждого.
     engine = create_engine(_required("CDC1C_DB_URL"), pool_size=full_load_workers + 2)
 

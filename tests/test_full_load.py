@@ -51,7 +51,7 @@ def test_full_load_paging(db, monkeypatch):
     counter = {"v": 0}
 
     def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None):
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
         calls.append({"top": top, "key_fields": key_fields, "after_values": after_values,
                       "key_types": key_types, "skip": skip})
         n = next(pages)
@@ -109,7 +109,7 @@ def test_full_load_register_paging(db, monkeypatch):
     counter = {"v": 0}
 
     def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None):
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
         calls.append({"key_fields": key_fields, "after_values": after_values,
                       "key_types": key_types, "skip": skip})
         n = next(pages)
@@ -147,7 +147,7 @@ def test_full_load_key_recorder_key(db):
 def _failing_above(limit, calls):
     """Стаб read_object: страницы больше limit сервер не отдаёт, остальные — пустые."""
     def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None):
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
         calls.append({"top": top, "skip": skip})
         if top > limit:
             raise requests.HTTPError("500", response=_response(500))
@@ -206,7 +206,7 @@ def test_full_load_reraises_permanent_error(db, monkeypatch):
     rep = _replicator(db)
 
     def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None):
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
         raise requests.HTTPError("403", response=_response(403))
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
@@ -220,7 +220,7 @@ def test_full_load_empty_object(db, monkeypatch):
     rep = _replicator(db)
 
     def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None):
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
         self.clear()
         return 0     # объект пуст: первая же страница неполная → один запрос и останов
 
@@ -247,7 +247,7 @@ def test_full_load_composite_key_with_reference(db, monkeypatch):
     calls = []
 
     def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None):
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
         calls.append({"key_fields": key_fields, "key_types": key_types,
                       "after_values": after_values, "skip": skip})
         self.clear()
@@ -259,8 +259,8 @@ def test_full_load_composite_key_with_reference(db, monkeypatch):
         return 0
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
-    # Границы периода тест не проверяет: без них выгрузка идёт одной выборкой,
-    # как и до партиционирования (см. Replicator1C._period_partitions).
+    # Границы периода тест не проверяет: объект мелкий, до нарезки дело не доходит
+    # (см. Replicator1C._period_partitions).
     monkeypatch.setattr(DataReader1C, "read_date_bound", lambda *a, **k: None)
     rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
 
@@ -282,7 +282,7 @@ def test_full_load_composite_key_keyset(db, monkeypatch):
     calls = []
 
     def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None):
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
         calls.append({"after_values": after_values, "skip": skip})
         self.clear()
         if len(calls) == 1:
@@ -425,14 +425,14 @@ def test_full_load_passes_date_filter(db, monkeypatch):
     captured = {}
 
     def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None):
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
         captured["extra_filter"] = extra_filter
         self.clear()
         return 0
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
-    # Границы периода тест не проверяет: без них выгрузка идёт одной выборкой,
-    # как и до партиционирования (см. Replicator1C._period_partitions).
+    # Границы периода тест не проверяет: объект мелкий, до нарезки дело не доходит
+    # (см. Replicator1C._period_partitions).
     monkeypatch.setattr(DataReader1C, "read_date_bound", lambda *a, **k: None)
     rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
 
@@ -479,7 +479,7 @@ def test_page_timestamp_is_clamped_to_unfinished_merges(db, monkeypatch):
     meta = rep.metadata["Catalog_X"]
 
     def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None):
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
         self.clear()
         self[object_name] = DataObject1C(meta, [{"Ref_Key": uuid.UUID(int=1)}])
         return 1
@@ -513,7 +513,7 @@ def _partitioned(db, monkeypatch, rows_per_page, *, date_field="Date"):
     counter = {"v": 0}
 
     def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None):
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
         calls.append(extra_filter)
         n = rows_per_page(extra_filter, skip or 0)
         keys = []
@@ -591,3 +591,172 @@ def test_deep_partition_is_split_into_days(db, monkeypatch):
     days = [c for c in calls if c and c != month and c.startswith("Date ge datetime'2026-02-")]
     assert len(days) == 28, 'февраль должен быть прочитан по дням'
     assert "2026-02-28" in days[0], 'дни тоже идут от свежих к старым'
+
+
+def test_deep_object_without_date_bounds_is_read_through(db, monkeypatch):
+    """
+    Объект глубокий, но границ периода 1С не отдала (в первой строке не оказалось даты — см.
+    read_date_bound). Нарезать не по чему, и раньше прогон на этом просто заканчивался: в логе
+    «finished», в БД — ровно FULL_LOAD_PARTITION_MAX_PAGES страниц, а с mark_missing весь
+    непрочитанный хвост объявлялся пропавшим. Теперь объект дочитывается сплошным $skip.
+    """
+    # Бездонны первые 12 страниц, тринадцатая неполная → останов.
+    rep, calls = _partitioned(db, monkeypatch, lambda flt, skip: 10 if skip < 120 else 3)
+    monkeypatch.setattr(DataReader1C, "read_date_bound", lambda *a, **k: None)
+
+    rep.full_load("Document_Y", batch_size=10)
+
+    assert all(c is None for c in calls), 'нарезки быть не должно — границ периода нет'
+    # 10 страниц первого прохода (упёрлись в лимит) + 13 страниц дочитывания с нуля.
+    assert len(calls) == FULL_LOAD_PARTITION_MAX_PAGES + 13, \
+        'объект обязан быть дочитан до конца, а не брошен на лимите страниц'
+
+
+def test_page_size_does_not_climb_back_after_a_refusal(db, monkeypatch):
+    """
+    Отказ 1С ставит потолок, и подбор по весу его не перешагивает.
+
+    Вес ответа причину отказа не объясняет: 1С валит сборку страницы во временных файлах, отдав
+    перед этим лёгкий ответ. Без потолка первая же удавшаяся страница вернула бы размер к
+    batch_size — и следующий запрос снова лёг бы: 500 → уменьшили → успех → вернулись → 500.
+    """
+    rep = _replicator(db)
+    meta = rep.metadata["Catalog_X"]
+    calls = []
+
+    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+        calls.append(top)
+        if top > 5:
+            raise requests.HTTPError("500", response=_response(500))
+        self.clear()
+        # Ответ лёгкий: сам по себе он попросил бы у _next_page_size сразу batch_size.
+        self.last_response_bytes = 1024
+        if len(calls) < 6:
+            self[object_name] = DataObject1C(
+                meta, [{"Ref_Key": uuid.UUID(int=i)} for i in range(top)])
+            return top
+        return 0
+
+    monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
+    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
+
+    rep.full_load("Catalog_X", batch_size=1000)
+
+    assert calls[0] == 20 and calls[1] == 5, 'проба, затем деление на FULL_LOAD_BATCH_DIVISOR'
+    assert max(calls[1:]) == 5, f'размер страницы не должен подниматься выше потолка: {calls}'
+    assert rep._full_load_page_limit["Catalog_X"] == 5
+
+
+def test_keyset_page_without_own_entries_fails_loudly(db, monkeypatch):
+    """
+    Страница вернула entry, но ни одна не легла в наш объект (все были неподдерживаемого класса и
+    read_data_entries их пропустила). Курсор строить не из чего — раньше здесь был KeyError, теперь
+    внятная ошибка. Молча оборваться нельзя: прогон отчитался бы успехом на половине объекта.
+    """
+    rep = _replicator(db)
+    meta = MetadataObject1C("InformationRegister_Scalar", {"Period": "DateTime", "Code": "Int64"},
+                            {"Period": "DateTime", "Code": "Int64"}, object_key=None)
+    rep.metadata["InformationRegister_Scalar"] = meta
+
+    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+        self.clear()
+        return top          # полная страница, но объекта в reader нет
+
+    monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
+    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
+
+    with pytest.raises(RuntimeError, match="keyset cursor"):
+        rep.full_load("InformationRegister_Scalar", batch_size=2)
+
+
+def test_orderby_is_the_same_on_the_first_keyset_page_and_the_next(db, monkeypatch):
+    """
+    Порядок страниц выбирается по способу пагинации, а не по «есть ли уже курсор»: у первой
+    keyset-страницы курсора нет, но $orderby у неё обязан быть тот же, что у следующих, — иначе
+    курсор продолжил бы не тот порядок (дубли и пропуски на границах страниц).
+    """
+    md = MetadataReader1C("http://x")
+    md["InformationRegister_Scalar"] = MetadataObject1C(
+        "InformationRegister_Scalar", {"Period": "DateTime", "Code": "Int64", "Note": "String"},
+        {"Period": "DateTime", "Code": "Int64"}, object_key=None)
+    reader = DataReader1C("http://x", md)
+    captured = []
+
+    class _Resp:
+        ok = True
+        text = '<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
+        content = text.encode()
+
+    monkeypatch.setattr("cdc_1c.data_reader.requests.get",
+                        lambda url, **kw: (captured.append(url), _Resp())[1])
+
+    # keyset: первая страница (курсора ещё нет) — сортировка ровно по ключу курсора.
+    reader.read_object("InformationRegister_Scalar", top=10, key_fields=["Period"],
+                       key_types=["DateTime"], use_keyset=True)
+    assert "$orderby=Period&" in captured[-1] or captured[-1].endswith("$orderby=Period")
+
+    # $skip: та же первая страница — сортировка дополняется остальными полями ключа,
+    # иначе порядок внутри ничьей 1С не гарантирует (см. read_object).
+    reader.read_object("InformationRegister_Scalar", top=10, key_fields=["Period"],
+                       key_types=["DateTime"], skip=0)
+    assert "$orderby=Period,Code" in captured[-1]
+
+
+def test_partition_title_names_a_day_for_a_day(db):
+    """Заголовок партиции в логе: месяц у месяца, день у дня — в том числе у последнего дня
+    открытой партиции, где правая граница отсутствует."""
+    from cdc_1c.replicator import _Partition
+
+    month = _Partition("Date", datetime(2026, 2, 1), datetime(2026, 3, 1), final=False)
+    open_month = _Partition("Date", datetime(2026, 3, 1), None, final=False)
+    day = _Partition("Date", datetime(2026, 2, 3), datetime(2026, 2, 4), final=True)
+    open_day = _Partition("Date", datetime(2026, 3, 31), None, final=True)
+
+    assert month.title == "2026-02"
+    assert open_month.title == "2026-03"
+    assert day.title == "2026-02-03"
+    assert open_day.title == "2026-03-31"
+
+
+def _mark_missing_spy(rep, monkeypatch):
+    """Перехватывает шаг пометки и возвращает словарь с его аргументами: сама пометка здесь не
+    интересна, интересен признак recheck — с ним прогон перепроверяет кандидатов в 1С."""
+    captured = {}
+
+    def spy(self, object_name, keys, started_at, reader, recheck, log_id=None):
+        captured["recheck"] = recheck
+        return 0
+
+    monkeypatch.setattr(Replicator1C, "_mark_missing_rows", spy)
+    return captured
+
+
+def test_partitioned_run_rechecks_candidates(db, monkeypatch):
+    """
+    Нарезка читает объект окнами по дате — ровно так же, как пользовательский период, и порождает
+    ту же проблему: строка не исчезла, а уехала. Партиции идут от свежих к старым, поэтому
+    документ, у которого во время прогона поменяли дату с февраля на апрель, не попал ни в
+    апрельское чтение (тогда его там не было), ни в февральское (уже нет). Без перепроверки его
+    пометили бы удалённым.
+    """
+    rep, calls = _partitioned(db, monkeypatch, lambda flt, skip: 1 if flt else 10)
+    captured = _mark_missing_spy(rep, monkeypatch)
+
+    rep.full_load("Document_Y", batch_size=10, mark_missing=True)
+
+    assert [c for c in calls if c], 'объект должен был уйти в нарезку по месяцам'
+    assert captured["recheck"] is True, 'окно создала нарезка — кандидатов надо перепроверить'
+
+
+def test_run_without_any_window_does_not_recheck(db, monkeypatch):
+    """Обратная сторона: объект прочитан сплошь, окна не было ни от пользователя, ни от нарезки —
+    перепроверять нечего, и лишних запросов в 1С прогон не делает."""
+    rep, calls = _partitioned(db, monkeypatch, lambda flt, skip: 1)
+    captured = _mark_missing_spy(rep, monkeypatch)
+
+    rep.full_load("Document_Y", batch_size=10, mark_missing=True)
+
+    assert calls == [None], 'объект дочитан с первого захода'
+    assert captured["recheck"] is False

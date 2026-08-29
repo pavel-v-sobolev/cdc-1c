@@ -22,7 +22,7 @@ scoped-удаления (у него нет регистратора, и наб�
 
 import uuid
 
-from sqlalchemy import (Column, Index, MetaData, Table, and_, exists, func, insert, not_,
+from sqlalchemy import (Column, Index, MetaData, Table, and_, exists, func, insert, not_, or_,
                         select, update)
 from sqlalchemy.engine import Engine
 
@@ -112,6 +112,15 @@ class FullLoadKeys:
         """«Строки нет среди увиденных» — анти-join по ключу."""
         return not_(exists().where(and_(*(self.table.c[c] == target.c[c] for c in self.key_columns))))
 
+    @staticmethod
+    def _older_than_run(target: Table, started_at):
+        """«Строку не переписывали с момента старта прогона» — тот же guard, что у самой выгрузки
+        (DBWriter1C._not_touched_since), включая ветку NULL: строка из времён, когда колонки
+        merged_on ещё не было, заведомо старше любого прогона. Без этой ветки такую строку не
+        пометила бы никакая выгрузка — NULL не меньше и не больше отметки."""
+        merged_on = target.c['merged_on']
+        return or_(merged_on.is_(None), merged_on < started_at)
+
     def missing_rows(self, target: Table, started_at, mark_field: str) -> list[dict]:
         """
         Ключи строк-кандидатов на пометку: не встретились в прогоне, ещё не помечены и не переписаны
@@ -119,7 +128,7 @@ class FullLoadKeys:
         изменения переписали уже во время прогона, снимок трогать не вправе).
         """
         query = (select(*(target.c[c] for c in self.key_columns))
-                 .where(and_(target.c['merged_on'] < started_at,
+                 .where(and_(self._older_than_run(target, started_at),
                              not_(target.c[mark_field].is_(True)),
                              self._not_seen(target))))
         with self.engine.connect() as conn:
@@ -136,7 +145,7 @@ class FullLoadKeys:
         """
         values = {mark_field: True, 'merged_on': func.now(), **(reset_values or {})}
         statement = (update(target)
-                     .where(and_(target.c['merged_on'] < started_at,
+                     .where(and_(self._older_than_run(target, started_at),
                                  not_(target.c[mark_field].is_(True)),
                                  self._not_seen(target)))
                      .values(**values))
