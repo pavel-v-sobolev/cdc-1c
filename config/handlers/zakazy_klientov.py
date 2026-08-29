@@ -14,7 +14,7 @@ merged_on регистра, строка, дождавшаяся своей но
 from sqlalchemy import and_, select, tuple_, union_all
 from dbmerge import dbmerge
 
-from cdc_1c import Handler1C
+from cdc_1c import Handler1C, HandlerContext
 
 DDL = """
 CREATE OR REPLACE VIEW {schema}."ZakazyKlientov_view"
@@ -92,12 +92,12 @@ class ZakazyKlientov(Handler1C):
     # (незавершённый merge любой из них прижимает границу к своему старту).
     ON = ["AccumulationRegister_ZakazyKlientov", "Catalog_Nomenklatura"]
 
-    def setup(self, context):
+    def setup(self, context: HandlerContext) -> None:
         # Один раз за процесс, а не на каждый вызов: полная выгрузка сигналит постранично, и
         # CREATE OR REPLACE VIEW на каждую страницу брал бы блокировки на пустом месте.
         self.execute(context, DDL)
 
-    def rebuild(self, context):
+    def rebuild(self, context: HandlerContext):
         """
         Пересборка ПО МЕСЯЦАМ. Между блоками цикл применяет накопившиеся изменения, поэтому витрина
         не стоит холодной все те десятки минут, что идёт пересборка (см. Handler1C.rebuild).
@@ -124,7 +124,7 @@ class ZakazyKlientov(Handler1C):
             context.logger.info("Data Mart updated for %s", label)
             yield label
 
-    def handle(self, context):
+    def handle(self, context: HandlerContext) -> None:
         # delete_mode не задан (по умолчанию 'no'): удалять из витрины нечего. Строки из целевых
         # таблиц физически не исчезают — выпавшую из набора движений репликатор помечает
         # is_deleted_or_empty и гасит ресурсы, а вьюшка её не фильтрует. Значит такая строка
@@ -144,12 +144,14 @@ class ZakazyKlientov(Handler1C):
             # только колонкой в WHERE. ALL — потому что дедупликация не нужна: результат уходит
             # в IN (...), где дубликаты не мешают.
             changed = merge.source_table.alias("chg")
-            since = self.since(context)
             row_key = (changed.c["Recorder"], changed.c["Recorder_Type"], changed.c["LineNumber"])
 
-            changed_by_register = select(*row_key).where(changed.c["merged_on"] > since)
+            # Нижняя граница окна берётся из контекста как есть: там всегда дата, и на первом
+            # прогоне (или пересборке) это начало времён, а не None — проверять нечего.
+            changed_by_register = select(*row_key).where(
+                changed.c["merged_on"] > context.last_run_at)
             changed_by_nomenklatura = select(*row_key).where(
-                changed.c["Nomenklatura_merged_on"] > since)
+                changed.c["Nomenklatura_merged_on"] > context.last_run_at)
 
             changed_rows = union_all(changed_by_register, changed_by_nomenklatura)
 
@@ -159,8 +161,9 @@ class ZakazyKlientov(Handler1C):
                                         merge.source_table.c["LineNumber"]).in_(changed_rows))
 
             # Почему changed_rows собран через UNION ALL, а не одним WHERE с OR (то есть не
-            # через self.changed_since). Написать `merged_on > since OR Nomenklatura_merged_on >
-            # since` — читается лучше, но на объёме это узкое место, и дело НЕ в отсутствии
+            # через self.changed_since). Написать `merged_on > last_run_at OR
+            # Nomenklatura_merged_on > last_run_at` — читается лучше, но на объёме это узкое
+            # место, и дело НЕ в отсутствии
             # индексов. Ветки такого OR живут на разных таблицах соединения, поэтому ни по одной
             # из них нельзя отфильтровать до джойна: условие проверяется только на готовой паре и
             # вырождается в Join Filter поверх ПОЛНОГО соединения. BitmapOr из индексных сканов
@@ -171,8 +174,9 @@ class ZakazyKlientov(Handler1C):
             # В варианте с UNION ALL в каждой ветке остаётся предикат ровно по ОДНОЙ базовой
             # таблице. Такой предикат планировщик опускает внутрь вьюшки, в скан этой таблицы, и
             # ветка заходит через её индекс merged_on (их заводит сам репликатор, см.
-            # DBWriter1C._ensure_merged_on_index). LEFT JOIN не мешает: `n.merged_on > since` для
-            # несопоставленных строк даёт NULL, предикат null-rejecting, и внешнее соединение в
+            # DBWriter1C._ensure_merged_on_index). LEFT JOIN не мешает: `n.merged_on >
+            # last_run_at` для несопоставленных строк даёт NULL, предикат null-rejecting, и
+            # внешнее соединение в
             # этой ветке схлопывается во внутреннее.
             #
             # Замер на синтетике (регистр 2 млн строк, окно ~0.5%): OR — 620 мс с полным сканом
@@ -187,5 +191,5 @@ class ZakazyKlientov(Handler1C):
             #    заводит только merged_on, поэтому этот индекс создаётся в setup().
 
         context.logger.info(
-            f'Data Mart changes applied since {self.since(context)}; '
+            f'Data Mart changes applied since {context.last_run_at}; '
             f'Next run will apply since {context.boundary}')

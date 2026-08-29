@@ -72,9 +72,13 @@ Replicator1C(
 class ZakazyKlientov(Handler1C):
     ON = ["AccumulationRegister_ZakazyKlientov"]   # имена ТАБЛИЦ, не объектов 1С
 
-    def handle(self, context):
-        self.execute(context, "insert into ... where merged_on > :since", since=self.since(context))
+    def handle(self, context: HandlerContext) -> None:
+        self.execute(context, 'insert into ... where merged_on > :last_run_at',
+                     last_run_at=context.last_run_at)
 ```
+
+Аннотация `context: HandlerContext` не обязательна, но с ней IDE подсказывает поля контекста и их
+типы — писать её стоит везде.
 
 | объявление | смысл |
 |---|---|
@@ -89,7 +93,7 @@ class ZakazyKlientov(Handler1C):
 | `handle(context)` | обычный прогон за окно `(last_run_at, boundary]`. Обязателен |
 | `rebuild(context)` | необязательный генератор полной пересборки: `yield <метка>` означает «блок закончен», между блоками библиотека применяет накопившиеся изменения. Не объявлен — пересборка идёт одним проходом |
 
-Помощники, чтобы не писать одно и то же: `since(context)` — нижняя граница окна;
+Помощники, чтобы не писать одно и то же:
 `changed_since(context, *columns)` — условие «изменилось за окно» для SQLAlchemy;
 `execute(context, sql, **params)` и `query(context, sql, **params)` — SQL с параметрами на движке
 контекста; `schema_prefix(context)` — префикс схемы для строкового SQL.
@@ -103,7 +107,7 @@ class ZakazyKlientov(Handler1C):
 | поле | значение |
 |---|---|
 | `engine`, `schema`, `temp_schema` | подключение и схемы (те же, что у `HandlerLoop`) |
-| `last_run_at`, `boundary` | границы окна: `(last_run_at, boundary]` — за него обработчик и отвечает |
+| `last_run_at`, `boundary` | границы окна: `(last_run_at, boundary]` — за него обработчик и отвечает. Обе всегда `datetime`: первый прогон и пересборка получают в `last_run_at` начало времён (`EPOCH`), а не `None` |
 | `full_rebuild`, `rebuild_from` | идёт ли пересборка и метка последнего завершённого блока |
 | `objects`, `sources` | какие таблицы изменились и откуда пришёл сигнал (`changes` / `full_load` / …) |
 | `logger` | логгер обработчика |

@@ -226,7 +226,7 @@ def test_first_run_starts_from_scratch_and_advances_window(db):
 
     runner.run_if_pending()
     assert len(spy.calls) == 1
-    assert spy.calls[0].last_run_at is None, 'первый прогон идёт с начала времён'
+    assert spy.calls[0].last_run_at == EPOCH, 'первый прогон идёт с начала времён'
     first_boundary = spy.calls[0].boundary
     assert _last_run_at(runner, spy.name) == first_boundary
 
@@ -425,7 +425,7 @@ def test_full_rebuild_request_opens_the_window_and_is_cleared_after_success(db):
 
     _signal(db, "Catalog_X", SOURCE_CHANGES)
     runner.run_if_pending()
-    assert spy.calls[0].last_run_at is None, 'пересборка = окно с начала времён'
+    assert spy.calls[0].last_run_at == EPOCH, 'пересборка = окно с начала времён'
     assert spy.calls[0].full_rebuild is True
 
     state = _state(runner, spy.name)
@@ -484,7 +484,7 @@ def test_full_rebuild_requested_during_a_run_is_not_lost(db):
     runner.handler = original
     spy.calls.clear()
     runner.run_if_pending()
-    assert spy.calls[0].last_run_at is None, 'и следующий прогон идёт с начала времён'
+    assert spy.calls[0].last_run_at == EPOCH, 'и следующий прогон идёт с начала времён'
     assert spy.calls[0].full_rebuild is True
 
 
@@ -513,7 +513,7 @@ def test_replicator_signals_only_on_real_changes(db, monkeypatch):
     rep._signal_handlers("Catalog_X", _result(inserted=1, added_fields={'Новый': 'String'}),
                          SOURCE_CHANGES)
     runner.run_if_pending()
-    assert spy.calls[0].last_run_at is None
+    assert spy.calls[0].last_run_at == EPOCH
 
 
 # --- несколько планов обмена: общий HandlerLoop --------------------------------------------
@@ -897,7 +897,7 @@ def test_changes_are_applied_between_rebuild_blocks(db):
     assert by_label['2024'] == 0, 'до сигнала обработчик по окну не звали'
     assert by_label['2025'] >= 1, 'изменение ждало конца пересборки, а не применилось между блоками'
     assert len(spy.calls) >= 1
-    assert spy.calls[0].last_run_at is not None, 'это инкремент, а не ещё одна пересборка'
+    assert spy.calls[0].last_run_at > EPOCH, 'это инкремент, а не ещё одна пересборка'
     assert spy.calls[0].full_rebuild is False
     assert _state(runner, spy.name).update_requested_at is None, 'метка снята успешным прогоном'
 
@@ -954,7 +954,7 @@ def test_handler_without_blocks_rebuilds_in_one_go(db):
 
     assert len(spy.calls) == 1
     assert spy.calls[0].full_rebuild is True
-    assert spy.calls[0].last_run_at is None
+    assert spy.calls[0].last_run_at == EPOCH
     assert _state(runner, spy.name).rebuild_cursor is None
 
 

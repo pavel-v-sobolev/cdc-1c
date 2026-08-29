@@ -40,7 +40,7 @@ from sqlalchemy import text, tuple_
 
 from dbmerge import dbmerge
 
-from cdc_1c import Handler1C
+from cdc_1c import Handler1C, HandlerContext
 
 DDL = """
 CREATE OR REPLACE VIEW {schema}."ZakazyKlientovGrouped_rows_view"
@@ -133,7 +133,7 @@ CREATE INDEX IF NOT EXISTS "ix_ZakazyKlientovGrouped_Period" ON
 	{schema}."ZakazyKlientovGrouped" USING btree ("Period");
 """
 
-# Группы, которые надо пересчитать за окно (:since — конец прошлого прогона):
+# Группы, которые надо пересчитать за окно (:last_run_at — конец прошлого прогона):
 # PREVIOUS — что изменившиеся объекты давали раньше, CURRENT — что дают сейчас.
 #
 # Две тонкости, из-за которых половины записаны по-разному:
@@ -145,14 +145,14 @@ GROUPS_TO_HANDLE_SQL = """
 WITH changed_recorders AS (
     SELECT DISTINCT "Recorder" AS id
       FROM {schema}."AccumulationRegister_ZakazyKlientov"
-     WHERE "merged_on" > :since
+     WHERE "merged_on" > :last_run_at
     UNION
     SELECT "Ref_Key" FROM {schema}."Document_ZakazKlienta"
-     WHERE "merged_on" > :since
+     WHERE "merged_on" > :last_run_at
 ),
 changed_nomenklatura AS (
     SELECT "Ref_Key" AS id FROM {schema}."Catalog_Nomenklatura"
-     WHERE "merged_on" > :since
+     WHERE "merged_on" > :last_run_at
 )
 
 -- PREVIOUS: группы, которые изменившиеся объекты давали раньше
@@ -164,13 +164,13 @@ UNION ALL
 
 -- CURRENT: группы, которые они дают сейчас
 SELECT "Number", "Year" FROM {schema}."ZakazyKlientovGrouped_rows_view"
- WHERE "merged_on" > :since
+ WHERE "merged_on" > :last_run_at
 UNION ALL
 SELECT "Number", "Year" FROM {schema}."ZakazyKlientovGrouped_rows_view"
- WHERE "ZakazKlienta_merged_on" > :since
+ WHERE "ZakazKlienta_merged_on" > :last_run_at
 UNION ALL
 SELECT "Number", "Year" FROM {schema}."ZakazyKlientovGrouped_rows_view"
- WHERE "Nomenklatura_merged_on" > :since
+ WHERE "Nomenklatura_merged_on" > :last_run_at
 """
 
 
@@ -196,10 +196,10 @@ class ZakazyKlientovGrouped(Handler1C):
     # граница окна.
     ON = ["AccumulationRegister_ZakazyKlientov", "Document_ZakazKlienta", "Catalog_Nomenklatura"]
 
-    def setup(self, context):
+    def setup(self, context: HandlerContext) -> None:
         self.execute(context, DDL)
 
-    def rebuild(self, context):
+    def rebuild(self, context: HandlerContext):
         """
         Пересборка ПО МЕСЯЦАМ. Между блоками цикл применяет накопившиеся изменения, поэтому витрина
         не стоит холодной все те десятки минут, что идёт пересборка (см. Handler1C.rebuild).
@@ -226,10 +226,10 @@ class ZakazyKlientovGrouped(Handler1C):
             context.logger.info("Data Mart updated for %s", label)
             yield label
 
-    def handle(self, context):
+    def handle(self, context: HandlerContext) -> None:
         groups_to_handle = text(
             GROUPS_TO_HANDLE_SQL.format(schema=self.schema_prefix(context))
-        ).bindparams(since=self.since(context))
+        ).bindparams(last_run_at=context.last_run_at)
 
         with dbmerge(context.engine, table_name="ZakazyKlientovGrouped", schema=context.schema,
                      # Промежуточную таблицу merge кладём туда же, куда её кладёт репликатор
@@ -250,5 +250,5 @@ class ZakazyKlientovGrouped(Handler1C):
                        delete_condition=target_key.in_(groups_to_handle))
 
         context.logger.info(
-            f'Data Mart changes applied since {self.since(context)}; '
+            f'Data Mart changes applied since {context.last_run_at}; '
             f'Next run will apply since {context.boundary}')

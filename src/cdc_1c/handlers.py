@@ -10,12 +10,17 @@
 Обработчик — класс, унаследованный от Handler1C:
 
     # handlers/zakazy_klientov.py
+    from cdc_1c import Handler1C, HandlerContext
+
     class ZakazyKlientov(Handler1C):
         ON = ["AccumulationRegister_ZakazyKlientov", "Catalog_Nomenklatura"]
         ON_FULL_LOAD = True     # звать ли на страницах полной выгрузки (по умолчанию да)
         MIN_INTERVAL = 0        # не чаще раза в N секунд (0 — без ограничения)
 
-        def handle(self, context): ...
+        def handle(self, context: HandlerContext) -> None: ...
+
+Аннотацию `context: HandlerContext` писать стоит везде: библиотека её не требует, но с ней IDE
+подсказывает поля контекста и их типы, а опечатка в имени поля видна сразу, а не в проде.
 
 Наследование не обязательно: as_handler примет и модуль целиком, и функцию — нужны только те же
 `ON` и `handle`. Базовый класс просто избавляет от копипасты (см. Handler1C).
@@ -53,12 +58,14 @@ HandlerSignals). Поэтому обработчики можно запуска
 
     WHERE merged_on > :last_run_at
 
-`last_run_at` — отметка предыдущего УСПЕШНОГО запуска, `NULL` — обработчик ещё ни разу не
-отрабатывал. Собрать витрину заново можно, заказав пересборку:
+`last_run_at` — отметка предыдущего УСПЕШНОГО запуска, и это ВСЕГДА datetime, а не None:
+обработчик, который ещё ни разу не отрабатывал, получает начало времён (EPOCH). Поэтому WHERE у
+него один и тот же во всех случаях — без ветки «а если первый раз». Собрать витрину заново можно,
+заказав пересборку:
 
     UPDATE <схема>.handlers_1c SET full_rebuild_is_required = true WHERE name = '<имя обработчика>';
 
-Тогда окно откроется с начала времён (`context.last_run_at` = None), а в `context.full_rebuild`
+Тогда окно откроется с начала времён (`context.last_run_at` = EPOCH), а в `context.full_rebuild`
 придёт True. После успеха требование снимается и в `last_full_rebuild_dt` записывается время.
 
 Пересборку большой витрины стоит нарезать на блоки — объявив генератор `rebuild` (см. Handler1C):
@@ -89,7 +96,7 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import ModuleType
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Iterator
 
 from sqlalchemy import (ARRAY, Boolean, case, Column, ColumnElement, DateTime, Engine, Float,
                         func, insert, inspect, MetaData, or_, select, String, Table, text, update)
@@ -142,8 +149,11 @@ RETRY_DELAY = 60.0
 SUBSCRIPTIONS_TTL = 30.0
 
 
-# Нижняя граница окна, когда last_run_at ещё нет (первый запуск или запрошен полный пересчёт).
-# Заведомо раньше любого merged_on и при этом валидная дата для всех поддерживаемых СУБД.
+# Начало времён: то, что приезжает в context.last_run_at, когда отметки прошлого прогона ещё нет
+# (первый запуск или запрошена пересборка). Заведомо раньше любого merged_on и при этом валидная
+# дата для всех поддерживаемых СУБД. В колонке handlers_1c.last_run_at на её месте NULL — там он
+# значит «ни разу не отрабатывал», и по нему цикл выбирает пересборку; в контекст этот NULL не
+# доходит, чтобы обработчику не приходилось разбирать None у себя в WHERE.
 EPOCH = datetime(1900, 1, 1)
 
 
@@ -162,8 +172,11 @@ class HandlerContext:
     # Схема промежуточных таблиц dbmerge, если обработчик пишет витрину через него: передайте её
     # в dbmerge(..., temp_schema=context.temp_schema). None — та же схема, что у данных.
     temp_schema: str | None
-    # Границы окна по часам БД: (last_run_at, boundary]. last_run_at=None — с начала времён.
-    last_run_at: datetime | None
+    # Границы окна по часам БД: (last_run_at, boundary]. Обе — всегда datetime: первый прогон и
+    # пересборка получают в last_run_at начало времён (EPOCH), а не None, поэтому обработчик пишет
+    # `merged_on > context.last_run_at` одинаково во всех прогонах. Что это сборка с нуля, видно из
+    # соседнего full_rebuild — гадать по None не нужно.
+    last_run_at: datetime
     boundary: datetime
     # Витрину просят собрать заново: обработчик ещё ни разу не отрабатывал либо кто-то заказал
     # пересборку (handlers_1c.full_rebuild_is_required). Окно при этом открыто с начала времён —
@@ -197,10 +210,10 @@ class Handler1C:
             # имена ТАБЛИЦ в целевой БД (транслит), а не имена объектов 1С
             ON = ["AccumulationRegister_ZakazyKlientov", "Catalog_Nomenklatura"]
 
-            def setup(self, context):
+            def setup(self, context: HandlerContext) -> None:
                 self.execute(context, DDL)
 
-            def handle(self, context):
+            def handle(self, context: HandlerContext) -> None:
                 ...
 
     В HandlerLoop передаётся ЭКЗЕМПЛЯР, а не класс: так обработчик можно параметризовать
@@ -248,13 +261,13 @@ class Handler1C:
         """Полезная работа за окно (context.last_run_at, context.boundary]."""
         raise NotImplementedError(f"{self.name}.handle(context) is not implemented")
 
-    def rebuild(self, context: HandlerContext):
+    def rebuild(self, context: HandlerContext) -> Iterator[str]:
         """
         Полная пересборка витрины ПО БЛОКАМ. Генератор: `yield <метка>` означает «блок закончен и
         закоммичен». В этих точках цикл вклинивается и применяет накопившиеся изменения, поэтому
         витрина не стоит холодной все те десятки минут, что идёт пересборка.
 
-            def rebuild(self, context):
+            def rebuild(self, context: HandlerContext) -> Iterator[str]:
                 for year in range(2020, 2027):
                     if context.rebuild_from and str(year) <= context.rebuild_from:
                         continue                      # этот блок уже сделан до перезапуска
@@ -280,13 +293,10 @@ class Handler1C:
 
     # --- то, что иначе копируется из обработчика в обработчик ----------------------------------
 
-    def since(self, context: HandlerContext) -> datetime:
-        """Нижняя граница окна; None (первый запуск либо запрошен пересчёт) → с начала времён."""
-        return context.last_run_at or EPOCH
-
     def changed_since(self, context: HandlerContext, *columns: ColumnElement) -> ColumnElement:
         """
-        Условие «хоть одна из отметок свежее прошлого прогона»: `column > since` через OR.
+        Условие «хоть одна из отметок свежее прошлого прогона»: `column > context.last_run_at`
+        через OR.
 
         Колонок несколько, потому что объекты 1С приезжают в обмене независимо: строка витрины
         собирается JOIN-ом нескольких источников, и свежим может стать любой из них.
@@ -308,8 +318,7 @@ class Handler1C:
         Обработчику, которому повтор дорог (отправка во внешнюю систему, где каждое сообщение
         стоит денег), верхнюю границу стоит добавить самому: `column <= context.boundary`.
         """
-        since = self.since(context)
-        return or_(*[column > since for column in columns])
+        return or_(*[column > context.last_run_at for column in columns])
 
     def execute(self, context: HandlerContext, sql: str, **params) -> None:
         """Выполняет SQL, подставляя в `{schema}` целевую схему (уже в кавычках)."""
@@ -849,7 +858,9 @@ class HandlerLoop:
             if delay > 0:
                 self._next_allowed_at = time.monotonic() + delay
 
-    def _context(self, window_start, boundary, objects, sources, full_rebuild, rebuild_from):
+    def _context(self, window_start: datetime, boundary: datetime, objects: Iterable[str],
+                 sources: Iterable[str], full_rebuild: bool,
+                 rebuild_from: str | None) -> HandlerContext:
         return HandlerContext(
             engine=self.engine, schema=self.schema, temp_schema=self.temp_schema,
             last_run_at=window_start, boundary=boundary,
@@ -905,7 +916,10 @@ class HandlerLoop:
                 if last_run_at is None:
                     last_run_at = boundary
 
-            context = self._context(None, boundary, objects or self.handler.on,
+            # Окно с начала времён — значением EPOCH, а не None: обработчик пишет
+            # `merged_on > context.last_run_at` одним и тем же кодом и в пересборке, и в
+            # инкременте, а что это пересборка, узнаёт из context.full_rebuild.
+            context = self._context(EPOCH, boundary, objects or self.handler.on,
                                     sources or {SOURCE_REBUILD},
                                     full_rebuild=True, rebuild_from=cursor)
             self._prepare(context)
