@@ -134,7 +134,8 @@ class ZakazyKlientov(Handler1C):
                      # Промежуточную таблицу merge кладём туда же, куда её кладёт репликатор
                      # (см. runner.py): не задана — схема данных.
                      temp_schema=context.temp_schema,
-                     source_table_name="ZakazyKlientov_view", source_schema=context.schema) as merge:
+                     source_table_name="ZakazyKlientov_view",
+                     source_schema=context.schema) as merge:
 
             # Ключ витрины совпадает с ключом строки регистра, и удаления нет, поэтому единица
             # пересчёта — СТРОКА: берём те, у которых стал свежее хоть один источник. (Там, где

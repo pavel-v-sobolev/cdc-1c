@@ -16,7 +16,8 @@ from dbmerge import mergeResult
 from cdc_1c import DataObject1C
 from cdc_1c.data_reader import DataReader1C
 from cdc_1c.metadata_reader import MetadataObject1C, MetadataReader1C
-from cdc_1c.replicator import FULL_LOAD_PARTITION_MAX_PAGES, Replicator1C
+from cdc_1c.replicator import (FULL_LOAD_EMPTY_WINDOWS_TO_STOP,
+                              FULL_LOAD_PARTITION_MAX_PAGES, Replicator1C)
 from conftest import TEST_QUEUE_GUID
 
 # Нулевой результат merge — writer.save в тестах замокан, но full_load агрегирует его результат.
@@ -321,7 +322,7 @@ def test_read_object_keyset_url(db, monkeypatch):
 
     key = uuid.UUID("11111111-1111-1111-1111-111111111111")
     reader.read_object("Catalog_X", top=500, key_fields=["Ref_Key"], after_values=[key],
-                       key_types=["Guid"])
+                       key_types=["Guid"], use_keyset=True)
     url = captured["url"]
     assert "$top=500" in url and "$orderby=Ref_Key" in url
     # фильтр закодирован (пробелы → %20), guid-литерал сохранён.
@@ -329,7 +330,7 @@ def test_read_object_keyset_url(db, monkeypatch):
 
     # Регистр: ключ Recorder, строковый литерал (без guid'...').
     reader.read_object("AccumulationRegister_R", top=100, key_fields=["Recorder"],
-                       after_values=[key], key_types=["String"])
+                       after_values=[key], key_types=["String"], use_keyset=True)
     url = captured["url"]
     assert "$orderby=Recorder" in url
     assert "$filter=Recorder%20gt%20'11111111-1111-1111-1111-111111111111'" in url
@@ -347,7 +348,7 @@ def test_read_object_keyset_url(db, monkeypatch):
     reader.read_object("InformationRegister_Indep", top=100,
                        key_fields=["Period", "Dim_Key"],
                        after_values=[datetime(2026, 1, 2), key],
-                       key_types=["DateTime", "Guid"])
+                       key_types=["DateTime", "Guid"], use_keyset=True)
     url = captured["url"]
     assert "$orderby=Period,Dim_Key" in url
     assert "Period%20gt%20datetime'2026-01-02T00:00:00'" in url
@@ -404,19 +405,51 @@ def test_dispatch_skips_in_progress(db):
 
 
 def test_build_date_filter(db):
-    from cdc_1c.replicator import Replicator1C
-    assert Replicator1C._build_date_filter(None, None, None) is None
+    rep = _replicator(db)
+    rep.metadata["Document_Y"] = MetadataObject1C(
+        "Document_Y", {"Ref_Key": "Guid", "Date": "DateTime"}, {"Ref_Key": "Guid"})
+
+    assert rep._build_date_filter("Document_Y", None, None, None) is None
     # нижняя граница — с начала дня (ge полночь)
-    assert Replicator1C._build_date_filter("Period", date(2026, 6, 1), None) \
+    assert rep._build_date_filter("Document_Y", "Period", date(2026, 6, 1), None) \
         == "Period ge datetime'2026-06-01T00:00:00'"
     # верхняя граница — чистая дата → весь день целиком (lt полночь следующего дня)
-    assert Replicator1C._build_date_filter("Date", date(2026, 6, 1), date(2026, 6, 30)) \
+    assert rep._build_date_filter("Document_Y", "Date", date(2026, 6, 1), date(2026, 6, 30)) \
         == "Date ge datetime'2026-06-01T00:00:00' and Date lt datetime'2026-07-01T00:00:00'"
     # верхняя граница — дата-время → как есть (le)
-    assert Replicator1C._build_date_filter("Date", None, datetime(2026, 6, 30, 15, 0, 0)) \
+    assert rep._build_date_filter("Document_Y", "Date", None, datetime(2026, 6, 30, 15, 0, 0)) \
         == "Date le datetime'2026-06-30T15:00:00'"
     with pytest.raises(ValueError, match="date_field"):
-        Replicator1C._build_date_filter(None, date(2026, 6, 1), None)
+        rep._build_date_filter("Document_Y", None, date(2026, 6, 1), None)
+
+
+def test_build_date_filter_wraps_record_set_register(db):
+    """
+    У регистра, подчинённого регистратору, entry — это НАБОР записей, и поля Period на верхнем
+    уровне нет: оно лежит внутри вложенной коллекции RecordSet. Плоское `Period ge ...` живая 1С
+    отвергает с 400 «Сегмент пути Period не найден!», поэтому фильтр обязан быть лямбдой по
+    коллекции.
+    """
+    rep = _replicator(db)
+    rep.metadata["AccumulationRegister_R"] = MetadataObject1C(
+        "AccumulationRegister_R", {"Recorder": "Guid", "Period": "DateTime"},
+        {"Recorder": "Guid", "Recorder_Type": "String"},
+        object_key=["Recorder", "Recorder_Type"])
+
+    assert rep._is_record_set_object("AccumulationRegister_R")
+    assert rep._build_date_filter("AccumulationRegister_R", "Period",
+                                  date(2026, 6, 1), date(2026, 6, 30)) == (
+        "RecordSet/any(r: r/Period ge datetime'2026-06-01T00:00:00' and "
+        "r/Period lt datetime'2026-07-01T00:00:00')")
+
+    # Табличная часть тоже имеет object_key (Ref_Key), но читается плоскими строками — её
+    # оборачивать нельзя.
+    rep.metadata["Document_Y_Tovary"] = MetadataObject1C(
+        "Document_Y_Tovary", {"Ref_Key": "Guid", "Date": "DateTime"},
+        {"Ref_Key": "Guid", "LineNumber": "Int64"}, object_key=["Ref_Key"], is_table_part=True)
+    assert not rep._is_record_set_object("Document_Y_Tovary")
+    assert rep._build_date_filter("Document_Y_Tovary", "Date", date(2026, 6, 1), None) \
+        == "Date ge datetime'2026-06-01T00:00:00'"
 
 
 def test_full_load_passes_date_filter(db, monkeypatch):
@@ -459,7 +492,8 @@ def test_read_object_combines_keyset_and_extra_filter(db, monkeypatch):
 
     key = uuid.UUID("11111111-1111-1111-1111-111111111111")
     reader.read_object("Document_X", top=100, key_fields=["Ref_Key"], after_values=[key],
-                       key_types=["Guid"], extra_filter="Date ge datetime'2026-06-01T00:00:00'")
+                       key_types=["Guid"], use_keyset=True,
+                       extra_filter="Date ge datetime'2026-06-01T00:00:00'")
     url = captured["url"]
     assert "Ref_Key%20gt%20guid'11111111-1111-1111-1111-111111111111'" in url
     assert "%20and%20" in url
@@ -532,17 +566,20 @@ def _partitioned(db, monkeypatch, rows_per_page, *, date_field="Date"):
     return rep, calls
 
 
-def test_deep_object_is_partitioned_by_month_newest_first(db, monkeypatch):
+def test_deep_object_is_read_by_day_windows_newest_first(db, monkeypatch):
     """
-    Объект, который не дочитался за FULL_LOAD_PARTITION_MAX_PAGES страниц, перечитывается по
-    месяцам — от свежих к старым.
+    Объект, который не дочитался за FULL_LOAD_PARTITION_MAX_PAGES страниц, перечитывается окнами
+    по периоду — от свежих к старым.
 
-    Смысл в $skip: без нарезки 1С на каждую страницу строит выборку заново, сортирует её целиком и
-    отбрасывает первые N строк, поэтому цена растёт квадратично. Фильтр по периоду переводит запрос
-    на индекс (Дата у документа входит в него), и сортируется маленький кусок. Порядок от свежих к
-    старым выбран потому, что свежие данные нужнее: при обрыве прогона они уже в БД.
+    Смысл в $skip: без окон 1С на каждую страницу строит выборку заново, сортирует её целиком и
+    отбрасывает первые N строк, поэтому цена растёт квадратично. Фильтр по периоду переводит
+    запрос на индекс (Дата у документа входит в него), и сортируется маленький кусок. Порядок от
+    свежих к старым выбран потому, что свежие данные нужнее: при обрыве прогона они уже в БД.
+
+    Окна отмеряются В ДНЯХ, а не календарными месяцами, и стыкуются встык по полному datetime —
+    время в границах не отбрасывается, иначе между окнами появилась бы дыра.
     """
-    # Без фильтра страницы всегда полные (объект «бездонный»), с фильтром по месяцу — одна строка.
+    # Без фильтра страницы всегда полные (объект «бездонный»), с фильтром — одна строка.
     rep, calls = _partitioned(db, monkeypatch, lambda flt, skip: 1 if flt else 10)
     rep.full_load("Document_Y", batch_size=10)
 
@@ -550,66 +587,164 @@ def test_deep_object_is_partitioned_by_month_newest_first(db, monkeypatch):
     assert len(first_pass) == FULL_LOAD_PARTITION_MAX_PAGES, \
         'сначала объект читается как есть и обрывается на лимите страниц'
 
-    # Данные с 2026-01-15 по 2026-03-20 → три месяца, в обратном порядке.
-    months = [c for c in calls if c]
-    assert len(months) == 3
-    assert "Date ge datetime'2026-03-01T00:00:00'" in months[0]
-    assert "Date ge datetime'2026-02-01T00:00:00'" in months[1]
-    assert "Date lt datetime'2026-03-01T00:00:00'" in months[1]
-    assert "Date ge datetime'2026-01-01T00:00:00'" in months[2]
+    windows = [c for c in calls if c]
+    # Границы известны (2026-01-15 .. 2026-03-20), поэтому обход начинается от самой поздней даты,
+    # а не от «сейчас»: пустой промежуток до сегодняшнего дня окнами не перебирается.
+    assert windows[0] == "Date ge datetime'2026-03-20T00:00:00'", \
+        'первое окно открыто вверх: дата в будущем и строки, созданные во время прогона'
 
-    # У самой свежей партиции правая граница открыта: документ, созданный уже во время прогона,
-    # иначе остался бы за краем выгрузки.
-    assert " lt " not in months[0]
+    # Дальше вниз шагами по FULL_LOAD_WINDOW_DAYS, встык.
+    assert windows[1] == ("Date ge datetime'2026-02-18T00:00:00' and "
+                          "Date lt datetime'2026-03-20T00:00:00'")
+    assert windows[2] == ("Date ge datetime'2026-01-19T00:00:00' and "
+                          "Date lt datetime'2026-02-18T00:00:00'")
+    # Окно, накрывшее самую раннюю дату, — последнее: ниже ничего нет.
+    assert windows[3] == ("Date ge datetime'2025-12-20T00:00:00' and "
+                          "Date lt datetime'2026-01-19T00:00:00'")
+    assert len(windows) == 4, 'ниже самой ранней даты окон быть не должно'
+
+    # Окна стыкуются встык: правая граница каждого равна левой предыдущего — дыр нет.
+    starts = [c.split("ge datetime'")[1][:19] for c in windows]
+    ends = [c.split("lt datetime'")[1][:19] for c in windows[1:]]
+    assert ends == starts[:-1]
 
 
-def test_small_object_is_not_partitioned(db, monkeypatch):
+def test_small_object_is_not_windowed(db, monkeypatch):
     """
-    Мелкому объекту периоды только вредят: он укладывается в пару страниц, а нарезка стоила бы
-    запроса на каждый месяц истории, даже пустой. Проверено на живой базе: 74 запроса против 2.
+    Мелкому объекту окна только вредят: он укладывается в пару страниц, а обход стоил бы запроса
+    на каждое окно истории, даже пустое. Проверено на живой базе: 74 запроса против 2.
     """
     rep, calls = _partitioned(db, monkeypatch, lambda flt, skip: 1)
     rep.full_load("Document_Y", batch_size=10)
 
-    assert calls == [None], 'объект дочитан с первого захода — нарезки быть не должно'
+    assert calls == [None], 'объект дочитан с первого захода — окон быть не должно'
 
 
-def test_deep_partition_is_split_into_days(db, monkeypatch):
-    """Месяц, который сам по себе даёт глубокий $skip, дробится на дни — иначе нарезка не спасает."""
-    month = ("Date ge datetime'2026-02-01T00:00:00' and "
-             "Date lt datetime'2026-03-01T00:00:00'")
+def test_deep_window_is_narrowed(db, monkeypatch):
+    """
+    Окно, которое само по себе даёт глубокий $skip, сужается и перечитывается с того же места —
+    иначе обход окнами не спасает. Только сужение: обратно окно не растёт, иначе мы снова упёрлись
+    бы в лимит и заплатили за перечитывание ещё раз.
+    """
+    deep = ("Date ge datetime'2026-02-18T00:00:00' and "
+            "Date lt datetime'2026-03-20T00:00:00'")
 
     def rows(flt, skip):
-        # Бездонны объект целиком и февраль; прочие месяцы и любой день — по одной странице.
-        return 10 if flt is None or flt == month else 1
+        # Бездонны объект целиком и первое окно вниз; всё остальное — по одной странице.
+        return 10 if flt is None or flt == deep else 1
 
     rep, calls = _partitioned(db, monkeypatch, rows)
     rep.full_load("Document_Y", batch_size=10)
 
-    assert len([c for c in calls if c == month]) == FULL_LOAD_PARTITION_MAX_PAGES, \
-        'глубокая партиция должна оборваться на лимите страниц, а не читаться до конца'
-    days = [c for c in calls if c and c != month and c.startswith("Date ge datetime'2026-02-")]
-    assert len(days) == 28, 'февраль должен быть прочитан по дням'
-    assert "2026-02-28" in days[0], 'дни тоже идут от свежих к старым'
+    assert len([c for c in calls if c == deep]) == FULL_LOAD_PARTITION_MAX_PAGES, \
+        'глубокое окно должно оборваться на лимите страниц, а не читаться до конца'
+
+    windows = [c for c in calls if c]
+    # 30 дней не поддались → 10 дней (30 // FULL_LOAD_WINDOW_DIVISOR), тот же правый край.
+    assert ("Date ge datetime'2026-03-10T00:00:00' and "
+            "Date lt datetime'2026-03-20T00:00:00'") in windows, \
+        'окно обязано сузиться и перечитаться от той же правой границы'
+    # и дальше идёт уже суженным шагом, не возвращаясь к 30 дням
+    assert ("Date ge datetime'2026-02-28T00:00:00' and "
+            "Date lt datetime'2026-03-10T00:00:00'") in windows
 
 
-def test_deep_object_without_date_bounds_is_read_through(db, monkeypatch):
+def test_window_keeps_time_of_day(db, monkeypatch):
+    """
+    Границы окон — полные datetime, без округления до суток. Дата в 1С хранится со временем, и
+    окно, обрезанное до полуночи, либо оставило бы дыру, либо заставило перечитывать сутки.
+    """
+    rep, calls = _partitioned(db, monkeypatch, lambda flt, skip: 1 if flt else 10)
+    monkeypatch.setattr(DataReader1C, "read_date_bound",
+                        lambda self, name, field, *, newest, extra_filter=None:
+                        datetime(2026, 3, 20, 14, 25, 37) if newest
+                        else datetime(2026, 3, 1, 9, 5, 1))
+    rep.full_load("Document_Y", batch_size=10)
+
+    windows = [c for c in calls if c]
+    assert windows[0] == "Date ge datetime'2026-03-20T14:25:37'", 'время верхней границы сохранено'
+    assert windows[1] == ("Date ge datetime'2026-02-18T14:25:37' and "
+                          "Date lt datetime'2026-03-20T14:25:37'"), \
+        'шаг вниз сохраняет время суток — стык окон точный'
+
+
+def test_deep_object_without_date_bounds_is_probed_and_read_through(db, monkeypatch):
     """
     Объект глубокий, но границ периода 1С не отдала (в первой строке не оказалось даты — см.
-    read_date_bound). Нарезать не по чему, и раньше прогон на этом просто заканчивался: в логе
-    «finished», в БД — ровно FULL_LOAD_PARTITION_MAX_PAGES страниц, а с mark_missing весь
-    непрочитанный хвост объявлялся пропавшим. Теперь объект дочитывается сплошным $skip.
+    read_date_bound). Раньше прогон на этом просто заканчивался: в логе «finished», в БД — ровно
+    FULL_LOAD_PARTITION_MAX_PAGES страниц, а с mark_missing весь непрочитанный хвост объявлялся
+    пропавшим.
+
+    Сюда попадают только объекты, НЕ дочитавшиеся за лимит страниц, то есть заведомо непустые:
+    значит отсутствие границы значит «границу взять не удалось», а не «данных нет». Конец истории
+    нащупывается пустыми окнами, а остаток добирается хвостовым окном без нижней границы.
     """
-    # Бездонны первые 12 страниц, тринадцатая неполная → останов.
-    rep, calls = _partitioned(db, monkeypatch, lambda flt, skip: 10 if skip < 120 else 3)
+    def rows(flt, skip):
+        if flt is None:
+            return 10                      # первый проход бездонный
+        if ' ge ' not in flt:
+            return 10 if skip < 120 else 3  # хвостовое окно: только верхняя граница
+        return 0                            # пробные окна пусты
+    rep, calls = _partitioned(db, monkeypatch, rows)
     monkeypatch.setattr(DataReader1C, "read_date_bound", lambda *a, **k: None)
 
     rep.full_load("Document_Y", batch_size=10)
 
-    assert all(c is None for c in calls), 'нарезки быть не должно — границ периода нет'
-    # 10 страниц первого прохода (упёрлись в лимит) + 13 страниц дочитывания с нуля.
-    assert len(calls) == FULL_LOAD_PARTITION_MAX_PAGES + 13, \
-        'объект обязан быть дочитан до конца, а не брошен на лимите страниц'
+    windows = [c for c in calls if c]
+    probes = [c for c in windows if ' ge ' in c]
+    # окно вверх + FULL_LOAD_EMPTY_WINDOWS_TO_STOP пустых окон вниз
+    assert len(probes) == 1 + FULL_LOAD_EMPTY_WINDOWS_TO_STOP
+    assert ' lt ' not in probes[0], 'первое окно открыто вверх'
+
+    tail = [c for c in windows if ' ge ' not in c]
+    assert len(tail) == 13, 'хвост дочитывается до конца сплошным $skip'
+    assert tail[0].startswith('Date lt '), 'у хвостового окна только верхняя граница'
+
+
+def test_record_set_register_is_read_by_lambda_windows(db, monkeypatch):
+    """
+    У регистра, подчинённого регистратору, дата лежит внутри вложенной коллекции RecordSet,
+    поэтому окна строятся лямбдой `RecordSet/any(r: r/Period ...)`. Границы у такого объекта не
+    спросить — `$orderby` по дате платформа молча игнорирует, — поэтому обход идёт пробными
+    окнами от «сейчас» вниз.
+    """
+    rep = _replicator(db)
+    rep.metadata["AccumulationRegister_R"] = MetadataObject1C(
+        "AccumulationRegister_R", {"Recorder": "Guid", "Period": "DateTime"},
+        {"Recorder": "Guid", "Recorder_Type": "String"},
+        object_key=["Recorder", "Recorder_Type"])
+    calls = []
+    counter = {"v": 0}
+
+    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+        calls.append(extra_filter)
+        n = 10 if extra_filter is None else 0
+        self.clear()
+        rows = []
+        for _ in range(n):
+            counter["v"] += 1
+            rows.append({"Recorder": uuid.UUID(int=counter["v"]), "Recorder_Type": "T"})
+        if rows:
+            self[object_name] = DataObject1C(rep.metadata["AccumulationRegister_R"], rows)
+        return n
+
+    monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
+    bounds = []
+    monkeypatch.setattr(DataReader1C, "read_date_bound",
+                        lambda *a, **k: bounds.append(1))     # звать её тут вообще нельзя
+    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
+
+    rep.full_load("AccumulationRegister_R", batch_size=10)
+
+    assert bounds == [], 'у регистра границы не спрашивают — $orderby по дате он игнорирует'
+    windows = [c for c in calls if c]
+    assert windows, 'глубокий регистр обязан читаться окнами'
+    assert all(c.startswith('RecordSet/any(r: ') and c.endswith(')') for c in windows), \
+        f'фильтр окна обязан быть лямбдой по вложенной коллекции: {windows[:2]}'
+    assert windows[0] == ("RecordSet/any(r: r/Period ge datetime'"
+                          + windows[0].split("ge datetime'")[1][:19] + "')"), \
+        'первое окно открыто вверх'
 
 
 def test_page_size_does_not_climb_back_after_a_refusal(db, monkeypatch):
@@ -704,20 +839,29 @@ def test_orderby_is_the_same_on_the_first_keyset_page_and_the_next(db, monkeypat
     assert "$orderby=Period,Code" in captured[-1]
 
 
-def test_partition_title_names_a_day_for_a_day(db):
-    """Заголовок партиции в логе: месяц у месяца, день у дня — в том числе у последнего дня
-    открытой партиции, где правая граница отсутствует."""
-    from cdc_1c.replicator import _Partition
+def test_window_title_and_filter(db):
+    """Заголовок окна в логе и его $filter, включая открытые границы и режим набора записей."""
+    from cdc_1c.replicator import _Window
 
-    month = _Partition("Date", datetime(2026, 2, 1), datetime(2026, 3, 1), final=False)
-    open_month = _Partition("Date", datetime(2026, 3, 1), None, final=False)
-    day = _Partition("Date", datetime(2026, 2, 3), datetime(2026, 2, 4), final=True)
-    open_day = _Partition("Date", datetime(2026, 3, 31), None, final=True)
+    closed = _Window("Date", datetime(2026, 2, 1, 10, 30), datetime(2026, 3, 1))
+    up = _Window("Date", datetime(2026, 3, 1), None)
+    tail = _Window("Date", None, datetime(2026, 1, 1))
 
-    assert month.title == "2026-02"
-    assert open_month.title == "2026-03"
-    assert day.title == "2026-02-03"
-    assert open_day.title == "2026-03-31"
+    assert closed.title == "[2026-02-01 10:30:00 .. 2026-03-01 00:00:00)"
+    assert up.title == "[2026-03-01 00:00:00 .. +inf)"
+    assert tail.title == "[-inf .. 2026-01-01 00:00:00)"
+
+    assert closed.filter == ("Date ge datetime'2026-02-01T10:30:00' and "
+                             "Date lt datetime'2026-03-01T00:00:00'")
+    assert up.filter == "Date ge datetime'2026-03-01T00:00:00'"
+    assert tail.filter == "Date lt datetime'2026-01-01T00:00:00'"
+    # Окно без обеих границ фильтровать нечем.
+    assert _Window("Date", None, None).filter is None
+
+    # Режим набора записей: обе границы уходят ВНУТРЬ одной лямбды.
+    reg = _Window("Period", datetime(2026, 2, 1), datetime(2026, 3, 1), record_set=True)
+    assert reg.filter == ("RecordSet/any(r: r/Period ge datetime'2026-02-01T00:00:00' and "
+                          "r/Period lt datetime'2026-03-01T00:00:00')")
 
 
 def _mark_missing_spy(rep, monkeypatch):
@@ -736,7 +880,7 @@ def _mark_missing_spy(rep, monkeypatch):
 def test_partitioned_run_rechecks_candidates(db, monkeypatch):
     """
     Нарезка читает объект окнами по дате — ровно так же, как пользовательский период, и порождает
-    ту же проблему: строка не исчезла, а уехала. Партиции идут от свежих к старым, поэтому
+    ту же проблему: строка не исчезла, а уехала. Окна идут от свежих к старым, поэтому
     документ, у которого во время прогона поменяли дату с февраля на апрель, не попал ни в
     апрельское чтение (тогда его там не было), ни в февральское (уже нет). Без перепроверки его
     пометили бы удалённым.
@@ -746,7 +890,7 @@ def test_partitioned_run_rechecks_candidates(db, monkeypatch):
 
     rep.full_load("Document_Y", batch_size=10, mark_missing=True)
 
-    assert [c for c in calls if c], 'объект должен был уйти в нарезку по месяцам'
+    assert [c for c in calls if c], 'объект должен был уйти в обход окнами'
     assert captured["recheck"] is True, 'окно создала нарезка — кандидатов надо перепроверить'
 
 

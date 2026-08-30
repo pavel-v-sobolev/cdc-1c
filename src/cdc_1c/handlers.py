@@ -996,26 +996,28 @@ class HandlerLoop:
             self._dirty_objects |= objects
             self._dirty_sources |= sources
 
-    def _save_success(self, boundary: datetime, expected_last_run_at: datetime | None,
+    def _save_success(self, boundary: datetime, expected_last_run_at: datetime,
                       expected_rebuild: bool, update_requested: bool = False) -> bool:
         """
         Двигает отметку обработчика — но только если его состояние не поменяли снаружи, пока он
         работал (`expected_*` — значения, с которыми он стартовал). False, если не сдвинул.
 
         Сравнение, а не безусловная запись: пересборку могли заказать уже в середине прогона, и
-        безусловная запись сняла бы этот заказ, не оставив следа. Условие собрано на IS NULL /
-        равенстве, а не на IS DISTINCT FROM — тот есть не во всех СУБД.
+        безусловная запись сняла бы этот заказ, не оставив следа. Условие собрано на равенстве, а
+        не на IS DISTINCT FROM — тот есть не во всех СУБД; ветка IS NULL не нужна, потому что
+        last_run_at=NULL сюда не приходит (см. ниже).
 
         expected_rebuild — что стояло в БД на старте прогона: по нему и проверяем, не заказали ли
         пересборку в середине.
 
         Пересборкой этот метод не занимается вовсе: её ведёт _run_rebuild — флаг заказа снимает
         _save_rebuild_started, метрики пишет _save_rebuild_finished. Сюда прогон приходит только
-        инкрементом, в том числе тем, что идёт МЕЖДУ блоками пересборки.
+        инкрементом, в том числе тем, что идёт МЕЖДУ блоками пересборки. Отсюда и datetime без
+        None в expected_last_run_at: обработчика с пустой отметкой цикл отправляет в пересборку,
+        а она к моменту первого инкремента отметку уже поставила (_save_rebuild_started).
         """
         t = self.table
-        unchanged = (t.c.last_run_at.is_(None) if expected_last_run_at is None
-                     else t.c.last_run_at == expected_last_run_at)
+        unchanged = t.c.last_run_at == expected_last_run_at
         values = {'last_run_at': boundary, 'last_error': None}
         if update_requested:
             # Метку снимаем только вместе с успешной отметкой: упавший прогон должен остаться

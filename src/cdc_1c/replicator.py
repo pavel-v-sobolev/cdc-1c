@@ -5,6 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from datetime import date, datetime, timedelta
+from urllib.parse import quote
 
 import requests
 from dbmerge import mergeResult
@@ -13,7 +14,7 @@ from sqlalchemy.exc import NoSuchTableError, OperationalError
 
 from cdc_1c.metadata_reader import MetadataReader1C
 from cdc_1c.common_functions import format_duration
-from cdc_1c.data_reader import (DataReader1C, IS_DELETED_OR_EMPTY_FIELD,
+from cdc_1c.data_reader import (DataReader1C, IS_DELETED_OR_EMPTY_FIELD, ODATA_PREFIX,
                                 RECORDER_FIELDS, _odata_literal)
 from cdc_1c.change_reader import ChangeReader1C
 from cdc_1c.name_mapper import NameMapper1C
@@ -58,24 +59,77 @@ FULL_LOAD_MIN_BATCH = 1
 FULL_LOAD_TARGET_BYTES = 32 * 1024 * 1024
 FULL_LOAD_PROBE_BATCH = 20
 
-# Полная выгрузка режется на партиции по периоду (месяц), а внутри партиции страницы берутся
-# через $skip. Смысл в том, что $skip дорог: 1С на каждый запрос строит выборку заново, сортирует
-# и отбрасывает первые N строк, поэтому цена растёт квадратично по числу страниц. Фильтр по дате
-# переводит запрос на индекс (Дата у документа, Период у регистра входят в него), и сортируется
-# уже маленький кусок.
+# Полная выгрузка режется на окна по периоду, а внутри окна страницы берутся через $skip. Смысл
+# в том, что $skip дорог: 1С на каждый запрос строит выборку заново, сортирует и отбрасывает
+# первые N строк, поэтому цена растёт квадратично по числу страниц. Фильтр по дате переводит
+# запрос на индекс (Дата у документа, Период у регистра входят в него), и сортируется уже
+# маленький кусок.
 #
-# Партиция глубже этого числа страниц дробится на дни: значит месяц всё равно даёт глубокий $skip.
-# Порог небольшой, потому что перечитывание уже прочитанных страниц — цена дробления, и платить
-# за неё много раз не хочется.
+# Окно глубже этого числа страниц сужается: значит и в нём $skip уходит слишком далеко. Порог
+# небольшой, потому что перечитывание уже прочитанных страниц — цена сужения, и платить за неё
+# много раз не хочется.
 FULL_LOAD_PARTITION_MAX_PAGES = 10
+
+# Окна отмеряются В ДНЯХ, а не календарными месяцами: месяц — единица неравномерная (28–31 день),
+# и от неё нет никакой пользы, потому что окно всё равно подбирается по глубине, а не по календарю.
+# Идём от свежих к старым, начальный размер — FULL_LOAD_WINDOW_DAYS; окно, упёршееся в лимит
+# страниц, делится на FULL_LOAD_WINDOW_DIVISOR и перечитывается, вплоть до FULL_LOAD_WINDOW_MIN_DAYS
+# (день — минимум, дальше дробить бессмысленно: внутри дня фильтр по дате уже ничего не отсекает).
+#
+# Только сужение, обратно окно не растёт. Причина та же, что у потолка размера страницы
+# (_full_load_page_limit): вернувшись к прежнему размеру, мы снова упрёмся в лимит и заплатим за
+# перечитывание ещё раз.
+FULL_LOAD_WINDOW_DAYS = 30
+FULL_LOAD_WINDOW_MIN_DAYS = 1
+FULL_LOAD_WINDOW_DIVISOR = 3
+
+# Сколько пустых окон подряд считать концом истории. Нужно только там, где границы периода у 1С
+# не спросить, — у регистра, подчинённого регистратору (см. _supports_date_bounds): у него дата
+# лежит внутри набора записей, и $orderby по ней платформа молча игнорирует. У документа границы
+# точные, и эта эвристика не применяется вовсе.
+FULL_LOAD_EMPTY_WINDOWS_TO_STOP = 3
 
 # Поля, по которым выгрузка режется на периоды, если пользователь не задал своё: у документа это
 # Date, у регистра — Period. Порядок важен: у регистра сведений бывают оба.
 PARTITION_DATE_FIELDS = ('Date', 'Period')
 
-# Перепроверка кандидатов на пометку (mark_missing при выгрузке за период): сколько ключей уходит
-# в один $filter. Ключи объединяются через OR, и слишком длинный URL 1С не примет.
-RECHECK_KEYS_PER_REQUEST = 20
+# Имя переменной в лямбде OData-фильтра по вложенной коллекции записей регистра:
+# RecordSet/any(r: r/Period ge ...). См. _Window.filter.
+RECORD_SET_FIELD = 'RecordSet'
+RECORD_SET_LAMBDA = 'r'
+
+# Перепроверка кандидатов на пометку (mark_missing при выгрузке за период): ключи объединяются в
+# один $filter через OR. Ограничивает эту строку не 1С, а веб-сервер перед ней, и меряет он БАЙТЫ,
+# а не количество ключей — поэтому и бюджет здесь в байтах. Раньше тут стояло фиксированное «20
+# ключей на запрос», и на составном ключе регистра (Recorder + LineNumber + Recorder_Type, где
+# тип регистратора — длинное кириллическое имя в процентном кодировании) двадцать ключей давали
+# далеко за 2048 байт.
+#
+# Значения по умолчанию у распространённых веб-серверов:
+#
+#   IIS      maxQueryString 2048 байт, maxUrl 4096 (requestFiltering/requestLimits)
+#   Apache   LimitRequestLine 8190 байт (вся строка запроса целиком)
+#   nginx    large_client_header_buffers 8k (строка запроса)
+#
+# Берём самый жёсткий — IIS: под Windows 1С обычно публикуется именно там. Пользователю это
+# задавать не нужно: лимит либо совпадает с умолчанием, либо больше него, а меньше не бывает.
+RECHECK_MAX_QUERY_BYTES = 2048
+# Запас в той же строке на всё, что не $filter: $orderby по полям ключа, само «$filter=» и «?».
+RECHECK_QUERY_RESERVE_BYTES = 512
+
+# Страховка на случай, если лимит всё-таки урезали ниже умолчания: получив от сервера «строка
+# запроса слишком длинная», бюджет делим и повторяем ту же пачку. Только вниз и до конца процесса —
+# как потолок размера страницы. Ниже RECHECK_MIN_QUERY_BYTES не опускаемся: там уже и один ключ не
+# всегда влезает, и дальнейшее деление только маскировало бы настоящую причину отказа.
+RECHECK_BUDGET_DIVISOR = 2
+RECHECK_MIN_QUERY_BYTES = 256
+
+# Коды, которыми веб-серверы отвечают на слишком длинную строку запроса. 414 — стандартный (nginx,
+# Apache), а IIS отдаёт 404.15 «Query String Too Long», то есть обычный 404: по одному коду его не
+# отличить от опечатки в имени объекта, поэтому 404 засчитываем только вместе с приметой в теле
+# (см. _is_query_too_long).
+URI_TOO_LONG_CODES = frozenset((414, 404))
+URI_TOO_LONG_MARKERS = ('404.15', 'query string', 'строка запроса', 'uri too long')
 
 
 def _is_permanent_error(exc: BaseException) -> bool:
@@ -83,6 +137,44 @@ def _is_permanent_error(exc: BaseException) -> bool:
     response = getattr(exc, 'response', None)
     status = getattr(response, 'status_code', None)
     return status in PERMANENT_HTTP_CODES
+
+
+def _is_query_too_long(exc: BaseException) -> bool:
+    """
+    Отказ «строка запроса слишком длинная». 414 — стандартный код, но IIS отдаёт 404.15 обычным
+    404, поэтому 404 засчитываем, только если в теле есть примета: иначе мы приняли бы за него
+    опечатку в имени объекта и молча резали бы запросы вдвое до самого дна.
+    """
+    response = getattr(exc, 'response', None)
+    status = getattr(response, 'status_code', None)
+    if status not in URI_TOO_LONG_CODES:
+        return False
+    if status != 404:
+        return True
+    body = (getattr(response, 'text', '') or '').lower()
+    return any(marker in body for marker in URI_TOO_LONG_MARKERS)
+
+
+def _recorder_type_for_url(field: str, value) -> str:
+    """
+    Значение поля ключа для прямого адреса (см. DataReader1C.read_by_key). Всё, кроме `<Имя>_Type`,
+    идёт как есть; типу возвращается пространство имён, которое разбор снял.
+
+    Снимаем мы только `StandardODATA.` (см. _get_record_fields), и в адресе его действительно надо
+    вернуть — без него 1С отвечает 400 «Недопустимое значение … для свойства составного типа». Но
+    так называются не все типы: регистратором может быть документ, НЕ опубликованный в этом
+    интерфейсе OData, и такой тип приходит уже со своим пространством имён —
+    `UnavailableEntities.UnavailableEntity_<guid>`. Ему `StandardODATA.` не нужен, и с ним 1С
+    отвечает тем же 400.
+
+    Отличаем по точке: имя объекта 1С — идентификатор, точек в нём нет, поэтому точка в значении
+    означает, что пространство имён при нём уже есть. Проверено на живой базе, где в одном регистре
+    встретились оба вида.
+    """
+    if not field.endswith('_Type'):
+        return value
+    value = str(value)
+    return value if '.' in value else f'{ODATA_PREFIX}{value}'
 
 
 # Проверка параметров конструктора: ошибка в них иначе всплывает далеко от места, где её
@@ -280,55 +372,62 @@ def _and_filters(*parts: str | None) -> str | None:
     return " and ".join(clauses)
 
 
-def _month_start(moment: datetime) -> datetime:
-    return moment.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-
-def _next_month(moment: datetime) -> datetime:
-    return (moment.replace(day=28) + timedelta(days=4)).replace(day=1)
-
-
-class _Partition:
+class _Window:
     """
-    Отрезок периода [start, end) полной выгрузки: за него отвечает один $filter, внутри страницы
-    берутся обычным способом.
+    Окно периода [start, end) полной выгрузки: за него отвечает один $filter, внутри окна страницы
+    берутся обычным способом. Границы — полные datetime, без округления до суток: и `Дата`
+    документа, и `Период` записи регистра хранят время, и обрезав его до полуночи мы получили бы
+    либо дыру, либо перечитывание.
 
-    end=None у самой свежей партиции — правая граница открыта намеренно: документы, созданные уже
-    во время прогона, попадают в неё, а не остаются за краем выгрузки. Идём мы от свежих к старым,
-    поэтому она же читается первой: свежие данные обычно нужнее, и при обрыве прогона они уже в БД.
+    Любая граница может быть None — это «до бесконечности» в соответствующую сторону:
+
+    - end=None у самого свежего окна: документ, созданный уже во время прогона, попадает в него, а
+      не остаётся за краем. Туда же попадает и дата в будущем — редкость, но своё окно у неё есть;
+    - start=None у хвостового окна: им добирается вся оставшаяся история одним сплошным $skip,
+      когда границу снизу спросить не у кого (см. FULL_LOAD_EMPTY_WINDOWS_TO_STOP).
+
+    Окна строятся строго встык (end одного = start следующего), поэтому пропустить между ними
+    ничего нельзя, чем бы ни было время в самих датах.
+
+    record_set=True — регистр, подчинённый регистратору. У него entry — это НАБОР записей
+    регистратора, и поля `Period` на верхнем уровне нет вовсе: она лежит внутри вложенной
+    коллекции RecordSet. Поэтому фильтр строится через лямбду `RecordSet/any(r: r/Period ...)`, а
+    не плоским сравнением — плоское 1С отвергает с 400 «Сегмент пути Period не найден!».
+    Набор при этом отбирается ЦЕЛИКОМ, если в окно попала хоть одна его запись, — что как раз и
+    нужно: страница обязана содержать набор целиком, иначе scoped-удаление снесёт его остаток.
     """
 
-    def __init__(self, date_field: str, start: datetime, end: datetime | None, *, final: bool):
+    def __init__(self, date_field: str, start: datetime | None, end: datetime | None, *,
+                 record_set: bool = False):
         self.date_field = date_field
         self.start = start
         self.end = end
-        # final — партицию дробить больше некуда (день); только для неё лимит страниц не ставится.
-        self.final = final
+        self.record_set = record_set
 
     @property
-    def filter(self) -> str:
-        clauses = [f"{self.date_field} ge {Replicator1C._odata_datetime(self.start)}"]
+    def filter(self) -> str | None:
+        """OData $filter окна; None у окна без обеих границ (весь объект — фильтровать нечего)."""
+        field = (f'{RECORD_SET_LAMBDA}/{self.date_field}' if self.record_set else self.date_field)
+        clauses = []
+        if self.start is not None:
+            clauses.append(f"{field} ge {Replicator1C._odata_datetime(self.start)}")
         if self.end is not None:
-            clauses.append(f"{self.date_field} lt {Replicator1C._odata_datetime(self.end)}")
-        return " and ".join(clauses)
+            clauses.append(f"{field} lt {Replicator1C._odata_datetime(self.end)}")
+        if not clauses:
+            return None
+        expression = " and ".join(clauses)
+        if not self.record_set:
+            return expression
+        return f"{RECORD_SET_FIELD}/any({RECORD_SET_LAMBDA}: {expression})"
 
     @property
     def title(self) -> str:
-        # final — это день (дробить дальше некуда), всё остальное — месяц.
-        return f"{self.start:%Y-%m-%d}" if self.final else f"{self.start:%Y-%m}"
-
-    def split(self) -> list["_Partition"]:
-        """Дробит месяц на дни — от свежих к старым, как и сами партиции."""
-        end = self.end or _next_month(self.start)
-        days = []
-        day = self.start
-        while day < end:
-            days.append(_Partition(self.date_field, day, day + timedelta(days=1), final=True))
-            day += timedelta(days=1)
-        # Правая граница последнего дня остаётся открытой, если открыта у самой партиции.
-        if self.end is None and days:
-            days[-1] = _Partition(self.date_field, days[-1].start, None, final=True)
-        return list(reversed(days))
+        """Окно для лога. Время показываем всегда: границы редко приходятся на полночь, и без него
+        два соседних окна выглядели бы одинаково."""
+        fmt = '%Y-%m-%d %H:%M:%S'
+        left = f"{self.start:{fmt}}" if self.start is not None else '-inf'
+        right = f"{self.end:{fmt}}" if self.end is not None else '+inf'
+        return f"[{left} .. {right})"
 
 
 class Replicator1C:
@@ -397,6 +496,11 @@ class Replicator1C:
         # потому, что подбор по весу ответа (_next_page_size) причину отказа не видит и вернул бы
         # размер обратно — см. _load_pages.
         self._full_load_page_limit: dict[str, int] = {}
+        # Бюджет длины $filter перепроверки, в байтах. Считается от умолчания самого жёсткого
+        # веб-сервера и только опускается — если тот всё-таки ответил «слишком длинно»
+        # (см. RECHECK_MAX_QUERY_BYTES и _still_in_1c). Общий на все объекты: ограничение стоит
+        # перед 1С, а не внутри неё, и от объекта не зависит.
+        self._recheck_query_budget = RECHECK_MAX_QUERY_BYTES - RECHECK_QUERY_RESERVE_BYTES
         self._in_progress_lock = threading.Lock()
         self.changes = ChangeReader1C(self._odata_url, self._exchange_name, self._queue_guid,
                                       self.metadata, odata_auth=self._odata_auth,
@@ -560,6 +664,11 @@ class Replicator1C:
         укладывается в FULL_LOAD_TARGET_BYTES. Если 1С всё же не осилила страницу (500), размер
         уменьшается и запрос повторяется с того же места (см. FULL_LOAD_BATCH_DIVISOR).
 
+        Глубокий объект (не дочитался за FULL_LOAD_PARTITION_MAX_PAGES страниц) перечитывается
+        ОКНАМИ ПО ПЕРИОДУ — от свежих к старым, окнами в днях, см. _load_by_windows. У документа
+        границы периода точные, у регистра, подчинённого регистратору, их не спросить, и конец
+        истории нащупывается пустыми окнами.
+
         Гонка с изменениями: в save уходит full_load_started_at — отметка, взятая на КАЖДУЮ
         страницу по часам БД, и не «сейчас», а граница по реестру незавершённых merge
         (WriteTracker.boundary, см. _load_pages). Снимок не трогает строки, переписанные уже после
@@ -571,8 +680,9 @@ class Replicator1C:
         Необязательный фильтр по периоду: date_field — имя поля даты/времени объекта (Date у
         документов, Period у регистров), date_from/date_to — границы (datetime/date/ISO-строка,
         включительно). Транслируется в OData $filter `date_field ge …` + `le`/`lt` для верхней
-        границы (чистая дата включает весь день целиком, см. _build_date_filter) и объединяется с
-        keyset-курсором по AND. Полезно для ручной догрузки за нужный период.
+        границы (чистая дата включает весь день целиком; у регистра, подчинённого регистратору,
+        всё это оборачивается в лямбду по вложенной коллекции — см. _build_date_filter) и
+        объединяется с keyset-курсором по AND. Полезно для ручной догрузки за нужный период.
 
         mark_missing=True — пометить строки, которых в 1С не оказалось (см. full_load_keys). Нужно
         затем, что физическое удаление объекта в обмен не приходит вовсе, и такая строка иначе
@@ -594,7 +704,7 @@ class Replicator1C:
         # независимый регистр → весь первичный ключ (составной ключ).
         key_fields, key_types = self._full_load_key(object_name)
         use_keyset = self._supports_keyset(object_name, key_fields)
-        date_filter = self._build_date_filter(date_field, date_from, date_to)
+        date_filter = self._build_date_filter(object_name, date_field, date_from, date_to)
 
         reader = DataReader1C(self._odata_url, self.metadata, odata_auth=self._odata_auth,
                               request_timeout=self._request_timeout)
@@ -604,14 +714,10 @@ class Replicator1C:
         # Момент старта прогона по часам БД: по нему помечаются пропавшие строки в конце прогона
         # (guard'ы save берут свою отметку на каждую страницу, см. ниже).
         started_at = self.writer.db_now()
-        # Таблицы, в которые пишет этот объект: он сам и его табличные части (в метаданных они
-        # лежат отдельными объектами с именем владельца в префиксе). По ним считается граница
-        # незавершённых merge для guard'ов страницы.
-        page_tables = self._full_load_tables(object_name)
 
         # Поле, по которому объект можно порезать на периоды, если он окажется глубоким. Нарезка
         # имеет смысл только там, где страницы берутся через $skip: keyset-курсор в глубину не
-        # уходит и в нарезке не нуждается.
+        # уходит и в окнах не нуждается.
         partition_field = None if use_keyset else self._partition_date_field(object_name, date_field)
 
         log_id = self.replicator_log.start(self._exchange_name, object_name, None, LOAD_TYPE_FULL)
@@ -630,14 +736,14 @@ class Replicator1C:
             page_args = dict(reader=reader, key_fields=key_fields, key_types=key_types,
                              use_keyset=use_keyset, batch_size=batch_size,
                              keys=keys, log_id=log_id)
-            # Читался ли объект окнами по дате. Важно для пометки пропавших строк: окно порождает
-            # «уехавшие» строки (см. _mark_missing_rows), и неважно, задал его пользователь или
-            # нарезка выбрала сама.
-            partitioned = False
+            # Читался ли объект окнами по дате. Важно для пометки пропавших строк: окно
+            # порождает «уехавшие» строки (см. _mark_missing_rows), и неважно, задал его
+            # пользователь или обход окнами выбрал сам.
+            windowed = False
 
-            # Сначала читаем объект как есть — без нарезки и без лишних запросов. Мелкому объекту
-            # (а таких большинство) периоды только вредят: он укладывается в пару страниц, а за
-            # нарезку пришлось бы заплатить запросом на каждый месяц истории, даже пустой.
+            # Сначала читаем объект как есть — без окон и без лишних запросов. Мелкому объекту
+            # (а таких большинство) окна только вредят: он укладывается в пару страниц, а за
+            # обход пришлось бы заплатить запросом на каждое окно истории, даже пустое.
             # Лимит страниц ставим, только если резать вообще есть по чему.
             records, modified, exhausted = self._load_pages(
                 object_name, extra_filter=date_filter, **page_args,
@@ -648,56 +754,27 @@ class Replicator1C:
             if not exhausted:
                 # Объект глубокий: $skip уже уходит далеко, и дальше цена растёт квадратично —
                 # 1С на каждый запрос строит выборку заново, сортирует и отбрасывает первые N
-                # строк. Перечитываем его по месяцам: фильтр по периоду переводит запрос на индекс
-                # (Дата у документа, Период у регистра входят в него), и сортируется маленький
-                # кусок. Прочитанные страницы перезапишутся теми же значениями — выгрузка
-                # идемпотентна, и это дешевле, чем гадать о размере объекта заранее ($count 1С
-                # не отдаёт).
-                partitions = self._period_partitions(object_name, reader, partition_field,
-                                                     date_filter)
-                partitioned = bool(partitions)
-                if not partitions:
-                    # Границ периода не получили — 1С не отдала дату в первой строке (см.
-                    # read_date_bound). Нарезать не по чему, но и бросить объект недочитанным
-                    # нельзя: прогон отчитался бы успехом, прочитав ровно max_pages страниц, а с
-                    # mark_missing объявил бы пропавшим весь непрочитанный хвост. Дочитываем как
-                    # есть, сплошным $skip — дорого, зато честно.
-                    logger.warning("Full load of %s: deep object (> %s pages), but its %s "
-                                   "boundaries are unknown — reading it through with plain $skip",
-                                   object_name, FULL_LOAD_PARTITION_MAX_PAGES, partition_field)
-                    records, modified, _ = self._load_pages(
-                        object_name, extra_filter=date_filter, max_pages=None, **page_args)
-                    total += records
-                    rows_modified += modified
-                else:
-                    logger.info("Full load of %s: deep object (> %s pages), switching to monthly "
-                                "partitions by %s", object_name, FULL_LOAD_PARTITION_MAX_PAGES,
-                                partition_field)
-                for partition in partitions:
-                    records, modified, exhausted = self._load_pages(
-                        object_name, extra_filter=_and_filters(partition.filter, date_filter),
-                        max_pages=FULL_LOAD_PARTITION_MAX_PAGES, **page_args)
-                    total += records
-                    rows_modified += modified
-                    if exhausted:
-                        continue
-                    # Глубоким оказался и месяц — дробим его на дни. Заново, а не с середины:
-                    # страницы упорядочены по ключу, а не по дате, и какие строки уже прочитаны,
-                    # в терминах периода неизвестно.
-                    logger.info("Full load of %s: %s is deep (> %s pages), splitting it into days",
-                                object_name, partition.title, FULL_LOAD_PARTITION_MAX_PAGES)
-                    for day in partition.split():
-                        records, modified, _ = self._load_pages(
-                            object_name, extra_filter=_and_filters(day.filter, date_filter),
-                            max_pages=None, **page_args)
-                        total += records
-                        rows_modified += modified
+                # строк. Перечитываем его окнами по периоду: фильтр по дате переводит запрос на
+                # индекс (Дата у документа, Период у регистра входят в него), и сортируется
+                # маленький кусок. Прочитанные страницы перезапишутся теми же значениями —
+                # выгрузка идемпотентна, и это дешевле, чем гадать о размере объекта заранее
+                # ($count 1С не отдаёт).
+                logger.info("Full load of %s: deep object (> %s pages), re-reading it by %s "
+                            "windows of %s days", object_name, FULL_LOAD_PARTITION_MAX_PAGES,
+                            partition_field, FULL_LOAD_WINDOW_DAYS)
+                windowed = True
+                records, modified = self._load_by_windows(
+                    object_name, reader=reader, date_field=partition_field,
+                    date_filter=date_filter, page_args=page_args)
+                total += records
+                rows_modified += modified
+
             if keys is not None:
                 # Пометка — только здесь, после последней страницы: прогон, упавший на середине,
                 # объявил бы «пропавшим» весь непрочитанный хвост объекта.
                 rows_modified += self._mark_missing_rows(
                     object_name, keys, started_at, reader,
-                    recheck=date_filter is not None or partitioned, log_id=log_id)
+                    recheck=date_filter is not None or windowed, log_id=log_id)
         self.replicator_log.write_result(log_id, finish=True)
         logger.info("Full load of %s finished (%s records, %s rows modified)",
                     object_name, total, rows_modified)
@@ -709,7 +786,7 @@ class Replicator1C:
                     batch_size: int, keys, log_id,
                     max_pages: int | None) -> tuple[int, int, bool]:
         """
-        Постраничное чтение одной выборки (объект целиком либо его партиция по периоду) с записью
+        Постраничное чтение одной выборки (объект целиком либо его окно по периоду) с записью
         каждой страницы. Возвращает (сколько записей прочитано, сколько строк изменено, дочитано ли
         до конца).
 
@@ -830,43 +907,154 @@ class Replicator1C:
                 return candidate
         return None
 
-    def _period_partitions(self, object_name: str, reader: DataReader1C, date_field: str | None,
-                           date_filter: str | None) -> list["_Partition"]:
+    def _load_by_windows(self, object_name: str, *, reader: DataReader1C, date_field: str,
+                         date_filter: str | None, page_args: dict) -> tuple[int, int]:
         """
-        Режет выгрузку на месяцы — от свежих к старым.
+        Перечитывает объект ОКНАМИ ПО ПЕРИОДУ, от свежих к старым. Возвращает (прочитано записей,
+        изменено строк).
 
-        ВНИМАНИЕ: пустой список здесь означает не «читаем без нарезки», а «читать нечего». Вызывают
-        этот метод только после того, как выборка ОБОРВАЛАСЬ на лимите страниц, и повторного
-        сплошного чтения у вызывающего нет — вернув [], мы оставляем объект прочитанным лишь до
-        лимита. Пустой ответ нормален ровно для пустого объекта (или пустого заданного периода);
-        если же read_date_bound не смогла разобрать дату (см. её warning), выгрузка молча выйдет
-        неполной.
+        Окна отмеряются в днях (FULL_LOAD_WINDOW_DAYS), а не календарными месяцами: календарь тут
+        ни при чём, размер окна выбирается по глубине $skip, а не по названию месяца. Границы —
+        полные datetime: и `Дата` документа, и `Период` записи регистра хранят время, и окно,
+        обрезанное до полуночи, либо оставило бы дыру, либо заставило перечитывать сутки.
 
-        Границы берём у самой 1С: две строки, отсортированные по полю даты в обе стороны. Запрос
-        дешёвый (поле даты входит в индекс), а знать их надо, чтобы не перебирать пустые годы.
-        Внутри заданного пользователем диапазона режем так же — фильтр периода просто добавляется
-        к пользовательскому.
+        Порядок обхода:
 
-        Правая граница самой свежей партиции открыта: документ, созданный уже во время прогона,
-        иначе остался бы за краем.
+        1. Открытое окно вверх `[anchor, +inf)`. Им забираются даты в будущем (редкость, но своя
+           у них быть должна) и всё, что создаётся уже во время прогона.
+        2. Вниз окнами `[cursor - window, cursor)`, встык: end одного окна = start следующего,
+           поэтому пропустить между ними нельзя ничего.
+        3. Хвост `(-inf, cursor)` одним сплошным $skip — только там, где границу снизу спросить не
+           у кого (см. ниже).
+
+        Окно, упёршееся в лимит страниц, СУЖАЕТСЯ (делится на FULL_LOAD_WINDOW_DIVISOR) и
+        перечитывается с того же места — заново, а не с середины: страницы упорядочены по ключу, а
+        не по дате, и какие строки уже прочитаны, в терминах периода неизвестно. Дойдя до
+        FULL_LOAD_WINDOW_MIN_DAYS, окно читается без лимита страниц: дробить дальше бессмысленно.
+        Обратно окно не растёт (см. FULL_LOAD_WINDOW_DAYS).
+
+        Где остановиться — зависит от того, отдаёт ли 1С границы периода (_supports_date_bounds):
+
+        - документ: границы точные. `anchor` берётся у самой поздней даты, поэтому пустой промежуток
+          между ней и «сейчас» не перебирается окнами впустую, а обход заканчивается ровно на окне,
+          накрывшем самую раннюю дату, — хвост не нужен;
+        - регистр в режиме набора записей: границ нет, `$orderby` по дате платформа молча
+          игнорирует. `anchor` — «сейчас», а конец истории нащупывается пустыми окнами:
+          FULL_LOAD_EMPTY_WINDOWS_TO_STOP подряд означают, что данных ниже, скорее всего, не
+          осталось. «Скорее всего» — поэтому остаток и добирается хвостовым окном, а не
+          отбрасывается: дыра в истории длиннее трёх окон иначе стоила бы потерянных строк.
         """
-        if date_field is None:
-            return []
-        oldest = reader.read_date_bound(object_name, date_field, newest=False,
-                                        extra_filter=date_filter)
+        total = 0
+        rows_modified = 0
+
+        def read(start, end, *, max_pages):
+            nonlocal total, rows_modified
+            window = self._window(object_name, date_field, start, end)
+            records, modified, exhausted = self._load_pages(
+                object_name, extra_filter=_and_filters(window.filter, date_filter),
+                max_pages=max_pages, **page_args)
+            total += records
+            rows_modified += modified
+            logger.debug("Full load of %s: window %s — %s records%s", object_name, window.title,
+                         records, '' if exhausted else ' (hit the page limit)')
+            return records, exhausted
+
+        # Сюда попадают только объекты, которые НЕ дочитались за лимит страниц, — то есть заведомо
+        # непустые. Поэтому отсутствие границы здесь значит не «данных нет», а «границу взять не
+        # удалось» (1С не отдала дату в первой строке, см. read_date_bound): переходим на тот же
+        # путь, что у регистра, — нащупываем конец пустыми окнами и добираем остаток хвостом.
+        # Раньше на этом месте прогон просто заканчивался, отчитавшись успехом на половине объекта.
+        oldest = newest = None
+        if self._supports_date_bounds(object_name):
+            oldest = reader.read_date_bound(object_name, date_field, newest=False,
+                                            extra_filter=date_filter)
+            if oldest is None:
+                logger.warning("Full load of %s: its %s boundaries are unknown — falling back to "
+                               "probing the history with empty windows", object_name, date_field)
+            else:
+                newest = reader.read_date_bound(object_name, date_field, newest=True,
+                                                extra_filter=date_filter)
+
+        # «Сейчас» по часам ЭТОЙ машины, и годится любое приближение: окно вверх открыто, а вниз
+        # мы идём встык, поэтому промах часов в любую сторону не создаёт дыры — только лишнее
+        # пустое окно. Часы 1С ради этого спрашивать незачем.
+        anchor = newest or datetime.now().replace(microsecond=0)
+
+        read(anchor, None, max_pages=None)
+
+        cursor = anchor
+        window_days = FULL_LOAD_WINDOW_DAYS
+        empty_in_a_row = 0
+        while oldest is None or cursor > oldest:
+            start = cursor - timedelta(days=window_days)
+            # Окно, накрывшее самую раннюю дату, — последнее: ниже ничего нет, и лимит страниц ему
+            # уже не нужен, дробить всё равно нечего.
+            last = oldest is not None and start <= oldest
+            no_limit = last or window_days <= FULL_LOAD_WINDOW_MIN_DAYS
+            records, exhausted = read(start, cursor,
+                                      max_pages=None if no_limit else FULL_LOAD_PARTITION_MAX_PAGES)
+            if not exhausted:
+                # Глубоко даже в этом окне — сужаем и перечитываем ТОТ ЖЕ отрезок.
+                window_days = max(FULL_LOAD_WINDOW_MIN_DAYS,
+                                  window_days // FULL_LOAD_WINDOW_DIVISOR)
+                logger.info("Full load of %s: window %s is deep (> %s pages), narrowing to %s days",
+                            object_name, self._window(object_name, date_field, start, cursor).title,
+                            FULL_LOAD_PARTITION_MAX_PAGES, window_days)
+                continue
+            cursor = start
+            if last:
+                return total, rows_modified
+            if oldest is None:
+                empty_in_a_row = empty_in_a_row + 1 if records == 0 else 0
+                if empty_in_a_row >= FULL_LOAD_EMPTY_WINDOWS_TO_STOP:
+                    break
+
         if oldest is None:
-            return []          # объект (или заданный период) пуст — читать нечего
-        newest = reader.read_date_bound(object_name, date_field, newest=True,
-                                        extra_filter=date_filter) or oldest
+            # Границ снизу не было: остаток истории добираем одним окном без нижней границы.
+            logger.info("Full load of %s: %s empty windows in a row, reading everything below "
+                        "%s in one go", object_name, empty_in_a_row, cursor)
+            read(None, cursor, max_pages=None)
+        return total, rows_modified
 
-        partitions = []
-        start = _month_start(oldest)
-        last_start = _month_start(newest)
-        while start <= last_start:
-            end = None if start == last_start else _next_month(start)
-            partitions.append(_Partition(date_field, start, end, final=False))
-            start = _next_month(start)
-        return list(reversed(partitions))
+    def _is_record_set_object(self, object_name: str) -> bool:
+        """
+        Отдаётся ли объект РЕЖИМОМ НАБОРА ЗАПИСЕЙ: одна entry = набор движений регистратора, а не
+        строка. Так 1С отдаёт регистры, подчинённые регистратору; у них на верхнем уровне entry
+        лежат только Recorder, Recorder_Type и вложенная коллекция RecordSet с самими записями.
+
+        Признак — заполненный object_key у объекта, который не является табличной частью. У
+        табличной части object_key тоже заполнен (Ref_Key, по нему идёт scoped-удаление), но
+        читается она плоскими строками, поэтому её сюда пускать нельзя.
+
+        От этого зависит, как строится фильтр по дате (см. _Window.filter) и можно ли вообще
+        спросить у 1С границы периода (см. _supports_date_bounds).
+        """
+        metadata_obj = self.metadata.get(object_name)
+        if metadata_obj is None:
+            return False
+        return bool(metadata_obj.object_key) and not metadata_obj.is_table_part
+
+    def _supports_date_bounds(self, object_name: str) -> bool:
+        """
+        Можно ли узнать у 1С самую раннюю и самую позднюю дату объекта одним запросом
+        (`$top=1&$orderby=<дата>`, см. DataReader1C.read_date_bound).
+
+        У документа — можно: `Date` лежит на верхнем уровне entry и входит в индекс.
+
+        У регистра в режиме набора записей — НЕЛЬЗЯ, и это не «не поддерживается», а хуже:
+        `$orderby=Period` платформа принимает с кодом 200 и МОЛЧА ИГНОРИРУЕТ. Проверено на живой
+        1С: `$orderby=Period`, `$orderby=Period desc` и запрос вовсе без сортировки отдают одну и
+        ту же первую entry. Поэтому «первая строка упорядоченной выборки» у такого объекта не
+        значит ничего, и границы приходится нащупывать пустыми окнами
+        (FULL_LOAD_EMPTY_WINDOWS_TO_STOP).
+        """
+        return not self._is_record_set_object(object_name)
+
+    def _window(self, object_name: str, date_field: str,
+                start: datetime | None, end: datetime | None) -> _Window:
+        """Окно [start, end) с фильтром, подходящим этому объекту (см. _Window)."""
+        return _Window(date_field, start, end,
+                       record_set=self._is_record_set_object(object_name))
 
     def _primary_key_columns(self, object_name: str) -> dict:
         """Первичный ключ объекта в терминах целевой таблицы: {колонка: тип SQLAlchemy}. По нему
@@ -946,29 +1134,108 @@ class Replicator1C:
                 values[column] = None
         return values
 
+    def _recheck_batch(self, terms: list[str], start: int) -> list[str]:
+        """
+        Сколько условий влезает в один $filter начиная с terms[start], по бюджету длины
+        (см. RECHECK_MAX_QUERY_BYTES). Меряем ЗАКОДИРОВАННУЮ длину — считает байты веб-сервер, а
+        до него строка доезжает уже процентно-закодированной, и кириллический тип регистратора в
+        ней раздувается втрое.
+
+        Одно условие возвращается всегда, даже если оно само больше бюджета: разбить его нельзя,
+        и уж лучше попробовать и получить внятный отказ, чем зациклиться.
+        """
+        batch = [terms[start]]
+        size = len(quote(terms[start], safe="':"))
+        separator = len(quote(' or ', safe="':"))
+        for term in terms[start + 1:]:
+            size += separator + len(quote(term, safe="':"))
+            if size > self._recheck_query_budget:
+                break
+            batch.append(term)
+        return batch
+
+    def _still_in_1c_by_recorder(self, object_name: str, candidates: list[dict],
+                                 reader: DataReader1C, metadata_obj) -> list[dict]:
+        """
+        Перепроверка кандидатов у регистра, подчинённого регистратору: по одному запросу НА НАБОР,
+        прямым адресом (DataReader1C.read_by_key).
+
+        Пачками через `$filter` тут нельзя вообще ничем: `Recorder` — поле неограниченной длины, и
+        `eq guid'…'` 1С отвергает с 500, а `eq '…'` строкой отвечает 200 и НОЛЬ строк, то есть
+        молча врёт (подробности и таблица — в read_by_key). Спрашивать по строке тоже нельзя:
+        `LineNumber` лежит внутри RecordSet, и фильтр по нему — 400 «Сегмент пути LineNumber не
+        найден!».
+
+        Спрашиваем поэтому про НАБОР: он и есть та единица, которая либо существует в 1С, либо нет.
+        Набор приходит целиком, _page_keys достаёт из него ключи строк — и строка, выпавшая из
+        набора, в «живые» не попадёт, то есть будет помечена, как и задумано.
+
+        Цена — запрос на каждый набор-кандидат. Это терпимо потому, что кандидаты здесь не весь
+        объект, а только строки, которых прогон не увидел; но на выгрузке, где «пропало» многое,
+        шаг заметен, и заплатить за него приходится: дешёвого способа спросить 1С о наборе по
+        ключу у платформы нет.
+        """
+        recorder_fields = [(field, self.name_mapper.map_field_name(field))
+                           for field in metadata_obj.object_key]
+        alive = []
+        seen = set()
+        for row in candidates:
+            key = {field: _recorder_type_for_url(field, row[column])
+                   for field, column in recorder_fields}
+            values = tuple(key.values())
+            if values in seen:
+                continue     # один регистратор приходит на каждую свою строку — спрашиваем раз
+            seen.add(values)
+            if reader.read_by_key(object_name, key):
+                alive.extend(self._page_keys(object_name, reader))
+        return alive
+
     def _still_in_1c(self, object_name: str, candidates: list[dict],
                      reader: DataReader1C) -> list[dict]:
         """
-        Кандидаты, которые в 1С всё-таки есть: запрашиваем их по ключу пачками
-        (RECHECK_KEYS_PER_REQUEST) и возвращаем те, что пришли в ответе.
+        Кандидаты, которые в 1С всё-таки есть: запрашиваем их по ключу пачками и возвращаем те,
+        что пришли в ответе.
+
+        Пачка набирается по длине строки запроса, а не по числу ключей: ограничивает её веб-сервер
+        перед 1С, и меряет он байты. У документа ключ — один guid, и в пачку их влезают десятки; у
+        регистра ключ составной, с длинным именем типа регистратора, и влезает несколько.
 
         Запрос идёт БЕЗ фильтра по периоду — в том и смысл: проверяем существование объекта, а не
         попадание в окно.
         """
         metadata_obj = self.metadata.get(object_name)
+        if self._is_record_set_object(object_name):
+            return self._still_in_1c_by_recorder(object_name, candidates, reader, metadata_obj)
         fields = [(field, self.name_mapper.map_field_name(field), type_name)
                   for field, type_name in metadata_obj.primary_key.items()]
+        terms = []
+        for row in candidates:
+            conj = ' and '.join(f"{field} eq {_odata_literal(row[column], type_name)}"
+                                for field, column, type_name in fields)
+            terms.append(f"({conj})" if ' and ' in conj else conj)
+
         alive = []
-        for start in range(0, len(candidates), RECHECK_KEYS_PER_REQUEST):
-            batch = candidates[start:start + RECHECK_KEYS_PER_REQUEST]
-            terms = []
-            for row in batch:
-                conj = ' and '.join(f"{field} eq {_odata_literal(row[column], type_name)}"
-                                    for field, column, type_name in fields)
-                terms.append(f"({conj})" if ' and ' in conj else conj)
-            reader.read_object(object_name, extra_filter=' or '.join(terms),
-                               key_fields=[fields[0][0]])
+        index = 0
+        while index < len(terms):
+            batch = self._recheck_batch(terms, index)
+            try:
+                reader.read_object(object_name, extra_filter=' or '.join(batch),
+                                   key_fields=[fields[0][0]])
+            except requests.HTTPError as exc:
+                # Страховка: лимит веб-сервера оказался ниже умолчания, от которого мы считали.
+                # Бюджет опускаем и повторяем ТУ ЖЕ пачку — она пересоберётся короче.
+                if (not _is_query_too_long(exc) or len(batch) == 1
+                        or self._recheck_query_budget <= RECHECK_MIN_QUERY_BYTES):
+                    raise
+                self._recheck_query_budget = max(RECHECK_MIN_QUERY_BYTES,
+                                                 self._recheck_query_budget
+                                                 // RECHECK_BUDGET_DIVISOR)
+                logger.warning("Recheck of %s: the web server refused the query string as too "
+                               "long, lowering the budget to %s bytes and retrying",
+                               object_name, self._recheck_query_budget)
+                continue
             alive.extend(self._page_keys(object_name, reader))
+            index += len(batch)
         return alive
 
     @staticmethod
@@ -980,13 +1247,15 @@ class Replicator1C:
             value = value.strftime('%Y-%m-%dT%H:%M:%S')
         return f"datetime'{value}'"
 
-    @staticmethod
-    def _build_date_filter(date_field: str | None,
+    def _build_date_filter(self, object_name: str, date_field: str | None,
                            date_from: date | datetime | str | None,
                            date_to: date | datetime | str | None) -> str | None:
         """
         OData $filter по периоду (границы включительно). Возвращает None, если границы не заданы;
         требует date_field, если задана хотя бы одна граница.
+
+        У регистра в режиме набора записей фильтр оборачивается в лямбду по вложенной коллекции —
+        ровно как у окон обхода (см. _Window): плоское `Period ge ...` такой объект отвергает.
 
         Верхняя граница date_to:
         - чистая дата (date без времени) → включаем весь день целиком, даже если поле хранит
@@ -999,16 +1268,21 @@ class Replicator1C:
             return None
         if not date_field:
             raise ValueError("full_load: date_from/date_to require date_field")
+        record_set = self._is_record_set_object(object_name)
+        field = f'{RECORD_SET_LAMBDA}/{date_field}' if record_set else date_field
         clauses = []
         if date_from is not None:
-            clauses.append(f"{date_field} ge {Replicator1C._odata_datetime(date_from)}")
+            clauses.append(f"{field} ge {Replicator1C._odata_datetime(date_from)}")
         if date_to is not None:
             if isinstance(date_to, date) and not isinstance(date_to, datetime):
                 next_day = date_to + timedelta(days=1)
-                clauses.append(f"{date_field} lt {Replicator1C._odata_datetime(next_day)}")
+                clauses.append(f"{field} lt {Replicator1C._odata_datetime(next_day)}")
             else:
-                clauses.append(f"{date_field} le {Replicator1C._odata_datetime(date_to)}")
-        return " and ".join(clauses)
+                clauses.append(f"{field} le {Replicator1C._odata_datetime(date_to)}")
+        expression = " and ".join(clauses)
+        if not record_set:
+            return expression
+        return f"{RECORD_SET_FIELD}/any({RECORD_SET_LAMBDA}: {expression})"
 
     def _next_page_size(self, object_name: str, page_size: int, entries: int,
                         response_bytes: int, batch_size: int) -> int:
