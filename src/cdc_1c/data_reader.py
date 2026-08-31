@@ -88,6 +88,14 @@ EXT_DIMENSION_SLOTS = (1, 2, 3)
 EXT_DIMENSION_VALUE = 'd:ExtDimension{side}{slot}'
 EXT_DIMENSION_VALUE_TYPE = 'd:ExtDimension{side}{slot}_Type'
 EXT_DIMENSION_KIND = 'd:ExtDimensionType{side}{slot}_Key'
+# Все поля вида субконто разом — по ним ищется план видов характеристик
+# (см. _ensure_ext_dimension_kinds).
+EXT_DIMENSION_KIND_FIELDS = tuple(EXT_DIMENSION_KIND.format(side=side, slot=slot)
+                                  for side in EXT_DIMENSIONS_FIELDS
+                                  for slot in EXT_DIMENSION_SLOTS)
+# Класс объектов 1С, в котором лежат виды субконто, и поле предопределённого имени его элемента.
+CHART_OF_CHARACTERISTIC_TYPES = 'ChartOfCharacteristicTypes'
+PREDEFINED_NAME_FIELD = 'PredefinedDataName'
 # Ключи внутри JSON-значения субконто.
 EXT_DIMENSION_VALUE_KEY = 'value'
 EXT_DIMENSION_TYPE_KEY = 'type'
@@ -299,6 +307,9 @@ class DataReader1C(UserDict):
         # обратно не растёт — как потолок размера страницы у полной выгрузки
         # (см. _ext_dimensions_chunk).
         self._ext_dimensions_segment_limit = EXT_DIMENSIONS_MAX_SEGMENT_CHARS
+        # {регистр: {вид субконто (Ref_Key): предопределённое имя}} — читаемые ключи JSON субконто.
+        # Строится один раз на процесс, см. _ensure_ext_dimension_kinds.
+        self._ext_dimension_kinds: dict[str, dict[str, str]] = {}
 
     def read_object(self, object_name: str, top: int | None = None,
                     key_fields: list[str] | None = None, after_values: list | None = None,
@@ -413,6 +424,7 @@ class DataReader1C(UserDict):
         if condition:
             terms.append(condition)
         elements = self._request_ext_dimensions(object_name, ' and '.join(terms) or None, top)
+        self._ensure_ext_dimension_kinds(object_name, elements)
 
         self.clear()
         self._add_records(object_name, [self._ext_dimensions_record(object_name, element)
@@ -467,10 +479,11 @@ class DataReader1C(UserDict):
                                'retrying with a %s-character budget',
                                object_name, self._ext_dimensions_segment_limit)
                 continue
+            self._ensure_ext_dimension_kinds(object_name, elements)
             for element in elements:
                 key = self._ext_dimensions_key(element)
                 if key is not None:
-                    index[key] = self._ext_dimensions(element)
+                    index[key] = self._ext_dimensions(object_name, element)
             remaining = remaining[len(chunk):]
             requests_made += 1
 
@@ -573,19 +586,105 @@ class DataReader1C(UserDict):
             if type_name in NUMERIC_TYPES and record.get(field) is None:
                 record[field] = 0
 
-        record.update(self._ext_dimensions(element))
+        record.update(self._ext_dimensions(object_name, element))
         return record
 
-    @staticmethod
-    def _ext_dimensions(element: dict) -> dict[str, dict]:
+    def _ensure_ext_dimension_kinds(self, object_name: str, elements: list) -> None:
+        """
+        Готовит карту {вид субконто (Ref_Key): предопределённое имя} для регистра — по ней ключи
+        JSON становятся читаемыми (см. _ext_dimensions). Считается один раз на процесс.
+
+        План видов характеристик, хранящий виды субконто, приходится ИСКАТЬ: в поле
+        `ExtDimensionTypeDr1_Key` лежит голый Guid, тип у него в `$metadata` — `Edm.Guid`, а
+        навигационной ссылки на владельца 1С в этом ответе не отдаёт (проверено: у записи
+        виртуальной таблицы её нет ни у одного поля вида субконто). Поэтому берём первый
+        встретившийся вид и спрашиваем прямым адресом каждый ПВХ конфигурации: чей 200 — тот и
+        нужен. В демо-базе бухгалтерии планов семь, то есть максимум семь дешёвых запросов, и
+        только пока карта не построена.
+
+        Если в пачке видов субконто не было вовсе, карту НЕ фиксируем: искать не по чему, а
+        следующая пачка может их принести.
+        """
+        if object_name in self._ext_dimension_kinds:
+            return
+        sample = next((value for element in elements
+                       for value in map(element.get, EXT_DIMENSION_KIND_FIELDS)
+                       if isinstance(value, str)), None)
+        if sample is None:
+            return
+
+        chart_name = self._find_ext_dimension_chart(sample)
+        if chart_name is None:
+            # Ключами останутся Guid — это рабочий вариант (вид субконто join-ится к ПВХ), просто
+            # менее читаемый. Молчать нельзя: разница видна в данных, и объяснить её должно тут.
+            logger.warning('Ext dimension kinds of %s are not resolvable: no chart of '
+                           'characteristic types holds %s — JSON keys stay GUIDs',
+                           object_name, sample)
+            self._ext_dimension_kinds[object_name] = {}
+            return
+
+        names = self._read_ext_dimension_kinds(chart_name)
+        logger.info('Ext dimension kinds of %s: %s names from %s',
+                    object_name, len(names), chart_name)
+        self._ext_dimension_kinds[object_name] = names
+
+    def _find_ext_dimension_chart(self, kind_key: str) -> str | None:
+        """Какой план видов характеристик содержит этот вид субконто. None — ни один."""
+        for chart_name in self.metadata:
+            if not chart_name.startswith(CHART_OF_CHARACTERISTIC_TYPES):
+                continue
+            path = quote(f"{chart_name}(guid'{kind_key}')", safe="/()='")
+            response = requests.get(f'{self.odata_url}/{path}?$select=Ref_Key',
+                                    auth=self.odata_auth,
+                                    timeout=resolve_timeout(self.request_timeout))
+            # Отсутствие элемента 1С сообщает честным 404 — это ответ, а не ошибка.
+            if response.status_code == 404:
+                continue
+            raise_for_status(response, f'read {path}')
+            return chart_name
+        return None
+
+    def _read_ext_dimension_kinds(self, chart_name: str) -> dict[str, str]:
+        """
+        {Ref_Key: PredefinedDataName} всех элементов плана видов характеристик. Планов видов
+        субконто много не бывает (в демо-базе бухгалтерии 50 элементов), поэтому читаем целиком и
+        без страниц.
+
+        Элемент без предопределённого имени (вид субконто, заведённый пользователем руками) в
+        карту не попадает — ключом у него останется Guid.
+        """
+        query = f'?$select=Ref_Key,{PREDEFINED_NAME_FIELD}'
+        response = requests.get(f'{self.odata_url}/{quote(chart_name)}{query}',
+                                auth=self.odata_auth,
+                                timeout=resolve_timeout(self.request_timeout))
+        raise_for_status(response, f'read {chart_name}{query}')
+        entries = (xmltodict.parse(response.text, force_list=('entry',))
+                   .get('feed') or {}).get('entry') or []
+        names = {}
+        for entry in entries:
+            properties = (entry.get('content') or {}).get('m:properties') or {}
+            ref_key = properties.get('d:Ref_Key')
+            name = properties.get('d:' + PREDEFINED_NAME_FIELD)
+            if isinstance(ref_key, str) and isinstance(name, str) and name:
+                names[ref_key] = name
+        return names
+
+    def _ext_dimensions(self, object_name: str, element: dict) -> dict[str, dict]:
         """
         Слоты субконто одного движения -> {колонка: {вид субконто: {"value", "type"}}}.
 
         Ключ — ВИД субконто, а не номер слота: номер смысла не имеет (субконто1 счёта 10 это
-        Номенклатура, счёта 60 — Контрагенты). Слот без вида или без значения пропускается: назвать
-        такое субконто нечем. Тип значения храним рядом со значением — субконто бывает и не
-        ссылкой (число, строка), и тогда это единственный способ понять, что лежит в value.
+        Номенклатура, счёта 60 — Контрагенты). Именем вида служит его предопределённое имя из
+        плана видов характеристик (`РаботникиОрганизаций`), потому что читать и писать в запросах
+        предстоит именно его; вид, которого в карте нет, остаётся Guid — см.
+        _ensure_ext_dimension_kinds.
+
+        Слот без вида или без значения пропускается: назвать такое субконто нечем. Тип значения
+        храним рядом со значением — субконто бывает и не ссылкой (в демо-базе бухгалтерии
+        встречаются значения перечислений, `СтавкиНДС` = `НДС18`), и тогда это единственный способ
+        понять, что лежит в value.
         """
+        names = self._ext_dimension_kinds.get(object_name) or {}
         columns: dict[str, dict] = {}
         for side, field in EXT_DIMENSIONS_FIELDS.items():
             found: dict[str, dict] = {}
@@ -594,11 +693,12 @@ class DataReader1C(UserDict):
                 value = element.get(EXT_DIMENSION_VALUE.format(side=side, slot=slot))
                 if not isinstance(kind, str) or not isinstance(value, str):
                     continue
-                found[kind] = {EXT_DIMENSION_VALUE_KEY: value}
+                key = names.get(kind, kind)
+                found[key] = {EXT_DIMENSION_VALUE_KEY: value}
                 value_type = element.get(EXT_DIMENSION_VALUE_TYPE.format(side=side, slot=slot))
                 if isinstance(value_type, str):
-                    found[kind][EXT_DIMENSION_TYPE_KEY] = (value_type.removeprefix(ODATA_PREFIX)
-                                                           .removeprefix(EDM_TYPE_PREFIX))
+                    found[key][EXT_DIMENSION_TYPE_KEY] = (value_type.removeprefix(ODATA_PREFIX)
+                                                          .removeprefix(EDM_TYPE_PREFIX))
             columns[field] = found
         return columns
 

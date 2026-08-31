@@ -7,6 +7,7 @@
 с ключом по ВИДУ субконто. Проверяем именно свёртку, состав колонок и сшивку с пакетом изменений.
 """
 
+import logging
 from urllib.parse import unquote
 
 import pytest
@@ -52,6 +53,25 @@ def _element(line_number: str = "1", period: str = "2013-01-14T12:00:01") -> str
       </d:element>"""
 
 
+CHART = "ChartOfCharacteristicTypes_VidySubkonto"
+
+
+def _ext_urls(reader) -> list[str]:
+    """Только запросы к виртуальной таблице: поиск плана видов характеристик тут ни при чём."""
+    return [unquote(u) for u in reader.requested_urls if 'RecordsWithExtDimensions' in unquote(u)]
+
+
+def _chart_feed(names: dict) -> str:
+    """Ответ плана видов характеристик: Ref_Key + предопределённое имя каждого элемента."""
+    entries = ''.join(
+        '<entry><content><m:properties>'
+        f'<d:Ref_Key>{ref}</d:Ref_Key><d:PredefinedDataName>{name}</d:PredefinedDataName>'
+        '</m:properties></content></entry>' for ref, name in names.items())
+    return ('<feed xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"'
+            ' xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">'
+            + entries + '</feed>')
+
+
 def _result(*elements: str) -> str:
     return ('<?xml version="1.0" encoding="UTF-8"?>'
             '<d:Result xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"'
@@ -77,6 +97,9 @@ def reader(monkeypatch):
     metadata = MetadataReader1C(odata_url="http://fake")
     metadata[REG] = MetadataObject1C(REG, dict(_FIELDS), dict(_PRIMARY_KEY),
                                      object_key=["Recorder", "Recorder_Type"])
+    # План видов характеристик, в котором лежат виды субконто. Его приходится искать перебором:
+    # в поле вида субконто голый Guid, а навигационной ссылки на владельца 1С не отдаёт.
+    metadata[CHART] = MetadataObject1C(CHART, {"Ref_Key": "Guid"}, {"Ref_Key": "Guid"})
     metadata.is_loaded = True
     obj = DataReader1C(odata_url="http://fake", metadata=metadata)
     obj.exchange_message_no = 7
@@ -87,8 +110,18 @@ def reader(monkeypatch):
 
     import cdc_1c.data_reader as module
 
+    # Ответы плана видов характеристик: None — плана нет вовсе (прямой адрес отдаёт 404,
+    # как это делает 1С для отсутствующего элемента), иначе {Ref_Key: PredefinedDataName}.
+    obj.chart_names = None
+
     def fake_get(url, **kwargs):
         obj.requested_urls.append(url)
+        if CHART in unquote(url):
+            if obj.chart_names is None:
+                return _Response('Экземпляр сущности не найден', 404)
+            if '$select' in url and 'guid' not in url:
+                return _Response(_chart_feed(obj.chart_names))
+            return _Response('<entry/>')          # проба прямым адресом: элемент есть
         if obj.response_queue:
             status, text = obj.response_queue.pop(0)
             return _Response(text, status)
@@ -138,8 +171,7 @@ def test_page_is_read_by_period_window_not_by_top(reader):
     # окно берётся целиком, одним запросом с Condition по периоду.
     reader.read_accounting_register(REG, condition="Period ge datetime'2013-01-01T00:00:00'")
 
-    url = reader.requested_urls[-1]
-    assert 'RecordsWithExtDimensions' in url
+    url = _ext_urls(reader)[-1]
     assert 'Condition' in url and 'Top' not in url
 
 
@@ -162,7 +194,7 @@ def test_changes_package_is_enriched_by_periods(reader):
     data = reader[REG].data
     # Адресно по регистратору субконто не спросить (Condition по Recorder врёт), поэтому
     # спрашиваем период — он общий для обеих строк, а сшивка идёт по номеру строки.
-    condition = unquote(reader.requested_urls[-1])
+    condition = _ext_urls(reader)[-1]
     assert "/RecordsWithExtDimensions(" in condition   # имя функции — сегмент пути, не %2F
     assert "Period eq datetime''2013-01-14T12:00:01''" in condition
     assert data[EXT_DIMENSIONS_FIELDS['Dr']][0] == {KIND_1: {"value": VALUE_1,
@@ -192,8 +224,7 @@ def test_periods_are_split_by_url_segment_budget(reader):
 
     reader.fill_ext_dimensions(REG)
 
-    segments = [unquote(url).split('/RecordsWithExtDimensions', 1)[1]
-                for url in reader.requested_urls]
+    segments = [url.split('/RecordsWithExtDimensions', 1)[1] for url in _ext_urls(reader)]
     assert len(segments) > 1                                    # в один запрос не влезло
     assert all(len('RecordsWithExtDimensions' + s) <= 260 for s in segments)
     # Ни один период не потерян и ни один не спрошен дважды.
@@ -211,7 +242,7 @@ def test_url_too_long_halves_the_budget_and_retries(reader):
 
     assert reader._ext_dimensions_segment_limit == 130           # 260 // 2
     # Первый запрос отвергнут, дальше пачки короче — но все четыре периода спрошены.
-    segments = [unquote(url) for url in reader.requested_urls]
+    segments = _ext_urls(reader)
     assert len(segments) > 2
     assert sum(s.count('Period eq datetime') for s in segments[1:]) == 4
 
@@ -224,3 +255,50 @@ def test_other_400_is_not_treated_as_a_long_url(reader):
     with pytest.raises(Exception):
         reader.fill_ext_dimensions(REG)
     assert reader._ext_dimensions_segment_limit == 260
+
+
+def test_kind_key_is_the_predefined_name(reader):
+    # Ключ JSON — вид субконто, и читать его должно быть можно: Guid вида ни о чём не говорит,
+    # а предопределённое имя из плана видов характеристик говорит всё.
+    reader.chart_names = {KIND_1: "StatiZatrat", KIND_2: "RabotnikiOrganizatsij"}
+
+    reader.read_accounting_register(REG)
+
+    data = reader[REG].data
+    assert data[EXT_DIMENSIONS_FIELDS['Dr']][0] == {
+        "StatiZatrat": {"value": VALUE_1, "type": "Catalog_StatiZatrat"}}
+    assert data[EXT_DIMENSIONS_FIELDS['Cr']][0] == {
+        "RabotnikiOrganizatsij": {"value": "1650", "type": "Double"}}
+
+
+def test_kind_without_predefined_name_stays_a_guid(reader):
+    # Вид субконто, заведённый пользователем руками, предопределённого имени не имеет. Ключом у
+    # него остаётся Guid — это по-прежнему рабочий вариант, вид join-ится к плану видов.
+    reader.chart_names = {KIND_2: "RabotnikiOrganizatsij"}
+
+    reader.read_accounting_register(REG)
+
+    assert list(reader[REG].data[EXT_DIMENSIONS_FIELDS['Dr']][0]) == [KIND_1]
+
+
+def test_missing_chart_leaves_guids_and_warns(reader, caplog):
+    # План видов характеристик не нашёлся — молчать нельзя: разница видна прямо в данных.
+    reader.chart_names = None
+
+    with caplog.at_level(logging.WARNING):
+        reader.read_accounting_register(REG)
+
+    assert list(reader[REG].data[EXT_DIMENSIONS_FIELDS['Dr']][0]) == [KIND_1]
+    assert 'JSON keys stay GUIDs' in caplog.text
+
+
+def test_chart_is_read_once_per_process(reader):
+    # Карта имён строится один раз: перебор планов и чтение — это сетевые запросы, а состав
+    # видов субконто за прогон не меняется.
+    reader.chart_names = {KIND_1: "StatiZatrat"}
+
+    reader.read_accounting_register(REG)
+    reader.read_accounting_register(REG)
+
+    chart_calls = [u for u in reader.requested_urls if CHART in unquote(u)]
+    assert len(chart_calls) == 2, 'проба адресом + чтение плана, и только на первом чтении'

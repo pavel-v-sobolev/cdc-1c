@@ -1,6 +1,6 @@
 """
 Живой smoke-тест Replicator1C против реального сервера 1С (тестовая база торговли) и
-dev-Postgres. Параметры подключения берутся из debug.py — там они и правятся, чтобы контуры не
+dev-Postgres. Параметры подключения берутся из debug_trade.py — там они и правятся, чтобы контуры не
 разъезжались (раньше здесь стояла своя копия, и адрес 1С успел разойтись с отладочным).
 
 Гоняет полный цикл Replicator1C.run_once(notify_changes=False): read → save БЕЗ notify, чтобы
@@ -18,8 +18,8 @@ from sqlalchemy import create_engine, inspect
 
 from cdc_1c import Replicator1C
 
-# Тестовый/dev-контур, не боевой (debug.py лежит рядом и импортируется как обычный модуль).
-from debug import DB_SCHEMA, DB_URL, EXCHANGE_NAME, ODATA_AUTH, ODATA_URL, QUEUE_GUID
+# Тестовый/dev-контур, не боевой (debug_trade.py лежит рядом и импортируется как обычный модуль).
+from debug_trade import DB_SCHEMA, DB_URL, EXCHANGE_NAME, ODATA_AUTH, ODATA_URL, QUEUE_GUID
 
 
 @pytest.mark.integration

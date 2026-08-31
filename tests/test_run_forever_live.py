@@ -1,6 +1,6 @@
 """
 Ручной прогон Replicator1C.run_forever против живой 1С и dev-Postgres (параметры берутся из
-debug.py). notify включён по умолчанию — изменения подтверждаются после успешного сохранения.
+debug_trade.py). notify включён по умолчанию — изменения подтверждаются после успешного сохранения.
 
 Тестовых функций здесь нет: цикл бесконечный, и pytest, собрав файл, ничего в нём не найдёт и не
 запустит. Запуск только вручную:
@@ -17,8 +17,8 @@ from sqlalchemy import create_engine
 
 from cdc_1c import Replicator1C
 
-# Тестовый/dev-контур, не боевой (debug.py лежит рядом и импортируется как обычный модуль).
-from debug import DB_SCHEMA, DB_URL, EXCHANGE_NAME, ODATA_AUTH, ODATA_URL, QUEUE_GUID
+# Тестовый/dev-контур, не боевой (debug_trade.py лежит рядом и импортируется как обычный модуль).
+from debug_trade import DB_SCHEMA, DB_URL, EXCHANGE_NAME, ODATA_AUTH, ODATA_URL, QUEUE_GUID
 
 POLL_INTERVAL = 60.0
 
