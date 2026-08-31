@@ -102,9 +102,12 @@ ICONS = {
     "clear-all":     lambda s: many_docs(s, RED, "x"),
 }
 
+# 16 не выпускаем: в обработке используются 32 px. Добавьте 16 в SIZES, если понадобится —
+# для него рисуется отдельный упрощённый вариант (fn(True)).
+SIZES = (32, 64)
+
 for name, fn in ICONS.items():
-    big, sml = fn(False), fn(True)
-    sml.resize((16, 16), Image.LANCZOS).save(f"{OUT}/{name}-16.png")
-    big.resize((32, 32), Image.LANCZOS).save(f"{OUT}/{name}-32.png")
-    big.resize((64, 64), Image.LANCZOS).save(f"{OUT}/{name}-64.png")
+    for px in SIZES:
+        src = fn(px <= 16)
+        src.resize((px, px), Image.LANCZOS).save(f"{OUT}/{name}-{px}.png")
 print("ok")
