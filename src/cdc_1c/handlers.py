@@ -837,6 +837,12 @@ class HandlerLoop:
             context = self._context(window_start, boundary, objects, sources,
                                     full_rebuild=False, rebuild_from=None)
             self._prepare(context)
+
+            # Парная запись к «finished»: без неё по логу не отличить идущий прогон от
+            # незапустившегося, а для долгой витрины это единственный признак, что она считает.
+            # Границы окна пишем здесь же — по ним видно, какой отрезок обработчик забрал.
+            logger.info("Handler %s: update started (objects=%s, window=%s … %s)",
+                        self.name, sorted(objects), window_start, boundary)
             self.handler.handle(context)
         except Exception:
             logger.exception("Handler %s failed, retry in %ss", self.name, RETRY_DELAY)
