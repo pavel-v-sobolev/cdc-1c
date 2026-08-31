@@ -9,7 +9,8 @@ import uuid
 
 import xmltodict
 
-from cdc_1c.metadata_reader import (COMPOSITE_VALUE_SUFFIX, ENTITY_TYPES, REGISTER_TYPES,
+from cdc_1c.metadata_reader import (ACCOUNTING_REGISTER_TYPE, COMPOSITE_VALUE_SUFFIX,
+                                    ENTITY_TYPES, EXT_DIMENSIONS_FIELDS, REGISTER_TYPES,
                                     SUPPORTED_TYPES, MetadataReader1C, resolve_timeout)
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.common_functions import format_bytes, parse_object_full_name, raise_for_status
@@ -71,6 +72,51 @@ RECORDER_FIELDS = ('Recorder', 'Recorder_Key')
 RECORDER_TYPE_FIELD = 'Recorder_Type'
 # Набор записей регистра в entry регистраторного регистра (у независимого регистра его нет).
 RECORD_SET_FIELD = 'd:RecordSet'
+
+# --- Субконто регистра бухгалтерии ---
+# Виртуальная таблица, отдающая движения ВМЕСТЕ с субконто. В самом наборе записей (_RowType)
+# субконто нет вообще, и другого источника у них нет: соседняя функция ExtDimensions() не
+# принимает ни одного параметра (ни периода, ни Top) — то есть либо вся аналитика базы одним
+# ответом, либо ничего.
+RECORDS_WITH_EXT_DIMENSIONS = 'RecordsWithExtDimensions'
+# Ответ функции — не feed/entry, а <d:Result> со списком <d:element>; поля в элементе лежат
+# ПЛОСКО, как в m:properties.
+FUNCTION_RESULT_FIELD = 'd:Result'
+FUNCTION_ELEMENT_FIELD = 'd:element'
+# Слоты субконто: значение, тип значения и ВИД субконто — три разных поля на слот.
+EXT_DIMENSION_SLOTS = (1, 2, 3)
+EXT_DIMENSION_VALUE = 'd:ExtDimension{side}{slot}'
+EXT_DIMENSION_VALUE_TYPE = 'd:ExtDimension{side}{slot}_Type'
+EXT_DIMENSION_KIND = 'd:ExtDimensionType{side}{slot}_Key'
+# Ключи внутри JSON-значения субконто.
+EXT_DIMENSION_VALUE_KEY = 'value'
+EXT_DIMENSION_TYPE_KEY = 'type'
+# Числовые типы 1С. Нужны, чтобы согласовать два ответа платформы об одном и том же движении:
+# см. _ext_dimensions_record.
+NUMERIC_TYPES = ('Double', 'Int64', 'Int32', 'Int16')
+# Бюджет длины СЕГМЕНТА адреса, в который сводятся периоды одного запроса за субконто
+# (см. _ext_dimensions_chunk). Параметры функции 1С лежат в пути, и режет их http.sys своим
+# UrlSegmentMaxLength (260 символов по умолчанию) — раньше, чем IIS дойдёт до maxUrl или
+# maxQueryString. Проверено на живой 1С: 249 символов проходят, 292 дают 400 «Invalid URL».
+EXT_DIMENSIONS_MAX_SEGMENT_CHARS = 260
+# Ниже не опускаемся даже при отказах: короче — это уже меньше одного периода.
+EXT_DIMENSIONS_MIN_SEGMENT_CHARS = 80
+
+# Приметы отказа «адрес слишком длинный». Штатный код — 414, но IIS на превышение
+# UrlSegmentMaxLength отдаёт обычный 400 и html-страницу, поэтому 400 засчитываем только по
+# примете в теле: иначе любая другая ошибка 400 молча урезала бы бюджет до самого дна.
+URL_TOO_LONG_CODES = (414,)
+URL_TOO_LONG_MARKERS = ('Invalid URL', 'URL is invalid', 'Request URL Too Long')
+
+
+def _is_url_too_long(exc: requests.HTTPError) -> bool:
+    response = exc.response
+    if response is None:
+        return False
+    if response.status_code in URL_TOO_LONG_CODES:
+        return True
+    return (response.status_code == 400
+            and any(marker in response.text for marker in URL_TOO_LONG_MARKERS))
 # Пустая ссылка 1С — нулевой GUID (в данных 1С отдаёт именно его).
 EMPTY_UUID = uuid.UUID(int=0)
 
@@ -91,6 +137,15 @@ def _odata_literal(value: Any, type_name: str) -> str:
     if type_name == 'Boolean':
         return 'true' if value else 'false'
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _odata_string_literal(value: str) -> str:
+    """
+    Строковый литерал для ПАРАМЕТРА функции 1С (Condition=…): значение целиком берётся в кавычки,
+    а кавычки внутри удваиваются. Внутри лежит выражение в синтаксисе OData, поэтому своих кавычек
+    там много (datetime'…', guid'…').
+    """
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _keyset_filter(key_fields: list[str], after_values: list, key_types: list[str]) -> str:
@@ -240,6 +295,10 @@ class DataReader1C(UserDict):
         # Объекты, ради неизвестного поля которых метаданные уже перечитывались (см. _get_record_fields).
         # Без этого каждая запись с полем вне $metadata давала бы свой полный GET $metadata + dbmerge.
         self._metadata_refreshed_for: set[str] = set()
+        # Бюджет длины сегмента адреса для запросов за субконто. Опускается отказом сервера и
+        # обратно не растёт — как потолок размера страницы у полной выгрузки
+        # (см. _ext_dimensions_chunk).
+        self._ext_dimensions_segment_limit = EXT_DIMENSIONS_MAX_SEGMENT_CHARS
 
     def read_object(self, object_name: str, top: int | None = None,
                     key_fields: list[str] | None = None, after_values: list | None = None,
@@ -323,6 +382,225 @@ class DataReader1C(UserDict):
         logger.info('Read %s: %s entries, %s rows, %s', object_name, len(object_entries),
                     self.rows_read(), format_bytes(self.last_response_bytes))
         return len(object_entries)
+
+    def read_accounting_register(self, object_name: str, top: int | None = None,
+                                 after_period: datetime | None = None,
+                                 condition: str | None = None) -> int:
+        """
+        Читает СТРАНИЦУ регистра бухгалтерии из виртуальной таблицы RecordsWithExtDimensions —
+        движения вместе с субконто (в наборе записей субконто нет вовсе, см.
+        RECORDS_WITH_EXT_DIMENSIONS). Возвращает число прочитанных движений.
+
+        Страница здесь устроена иначе, чем у read_object, потому что у этой функции работают не
+        query-опции, а собственные параметры. Проверено на живой 1С:
+
+        | `$skip`                            | 400                                            |
+        | `$orderby` и параметр `Order`      | **200 и молча проигнорированы** (порядок не тот)|
+        | `Top`, `Condition`                 | работают                                       |
+        | `Condition` по `Period` и `*_Key`  | работают, в том числе через `or`               |
+        | `Condition` по `Recorder` как guid | 500                                            |
+        | `Condition` по `Recorder` строкой  | **200 и НОЛЬ строк** (молча врёт)              |
+
+        Отсюда курсор: `Period gt <последний период>` плюс `Top`. Ни смещения, ни сортировки нет,
+        поэтому хвостовой неполный период отбрасывает вызывающий (см. Replicator1C._load_pages) —
+        иначе движения одной секунды разорвались бы между страницами.
+
+        condition — дополнительное условие (диапазон дат), объединяется с курсором по AND.
+        """
+        terms = []
+        if after_period is not None:
+            terms.append(f"Period gt {_odata_literal(after_period, 'DateTime')}")
+        if condition:
+            terms.append(condition)
+        elements = self._request_ext_dimensions(object_name, ' and '.join(terms) or None, top)
+
+        self.clear()
+        self._add_records(object_name, [self._ext_dimensions_record(object_name, element)
+                                        for element in elements])
+        logger.info('Read %s: %s records, %s', object_name, len(elements),
+                    format_bytes(self.last_response_bytes))
+        return len(elements)
+
+    def fill_ext_dimensions(self, object_name: str) -> int:
+        """
+        Дочитывает субконто к уже разобранным движениям регистра бухгалтерии — для ПАКЕТА
+        ИЗМЕНЕНИЙ, который приносит набор записей без аналитики. Возвращает число запросов в 1С.
+
+        Адресно, по регистратору, субконто не спросить: `Condition` по `Recorder` отвечает 500, а
+        строковым литералом — 200 и ноль строк, то есть врёт молча (см. read_accounting_register).
+        Зато период каждого движения известен из самого набора, а `Condition` по `Period` работает
+        и понимает `or`. Поэтому спрашиваем периоды пакета (пачками, см.
+        _ext_dimensions_chunk) и сшиваем ответ с движениями по паре
+        (регистратор, номер строки). Движения чужих регистраторов той же секунды пары не находят.
+
+        Движение без пары (фиктивная запись удалённого набора; проводка без аналитики) получает
+        пустой JSON, а не NULL: колонка означает «субконто нет», а не «не читали».
+        """
+        data_object = self.get(object_name)
+        if data_object is None or data_object.data_length == 0:
+            return 0
+        data = data_object.data
+        # Регистратор регистра бухгалтерии 1С всегда отдаёт составным (Recorder + Recorder_Type),
+        # но сшивка держится на его наличии — без него молча оставили бы субконто пустыми.
+        if 'Period' not in data or 'Recorder' not in data or LINE_NUMBER_FIELD not in data:
+            logger.warning('Cannot fill ext dimensions of %s: no Period/Recorder/%s in records',
+                           object_name, LINE_NUMBER_FIELD)
+            return 0
+
+        remaining = sorted({p for p in data['Period'] if p is not None})
+        index: dict[tuple, dict] = {}
+        requests_made = 0
+        periods_asked = len(remaining)
+        while remaining:
+            chunk = self._ext_dimensions_chunk(object_name, remaining)
+            try:
+                elements = self._request_ext_dimensions(
+                    object_name, self._periods_condition(chunk), None)
+            except requests.HTTPError as exc:
+                # Пачка не влезла в лимит длины адреса, урезанный ниже умолчания. Делим бюджет и
+                # повторяем ту же пачку короче (см. _ext_dimensions_chunk).
+                if len(chunk) == 1 or not _is_url_too_long(exc):
+                    raise
+                self._ext_dimensions_segment_limit = max(
+                    EXT_DIMENSIONS_MIN_SEGMENT_CHARS, self._ext_dimensions_segment_limit // 2)
+                logger.warning('Ext dimensions request of %s was rejected as too long, '
+                               'retrying with a %s-character budget',
+                               object_name, self._ext_dimensions_segment_limit)
+                continue
+            for element in elements:
+                key = self._ext_dimensions_key(element)
+                if key is not None:
+                    index[key] = self._ext_dimensions(element)
+            remaining = remaining[len(chunk):]
+            requests_made += 1
+
+        columns: dict[str, list] = {field: [] for field in EXT_DIMENSIONS_FIELDS.values()}
+        for recorder, line_number in zip(data['Recorder'], data[LINE_NUMBER_FIELD]):
+            found = index.get((recorder, line_number)) or {}
+            for field, column in columns.items():
+                column.append(found.get(field, {}))
+        data.update(columns)
+        logger.info('Filled ext dimensions of %s: %s periods in %s requests',
+                    object_name, periods_asked, requests_made)
+        return requests_made
+
+    @staticmethod
+    def _periods_condition(periods: list) -> str:
+        """Условие «период — один из перечисленных». `or` внутри Condition платформа понимает."""
+        return ' or '.join(f"Period eq {_odata_literal(p, 'DateTime')}" for p in periods)
+
+    def _ext_dimensions_chunk(self, object_name: str, periods: list) -> list:
+        """
+        Сколько периодов помещается в один запрос, по бюджету длины СЕГМЕНТА адреса.
+
+        Меряем именно сегмент пути, а не строку запроса: параметры функции 1С лежат в адресе, и
+        режет их http.sys ещё до IIS — у него свой лимит на длину одного сегмента URL
+        (UrlSegmentMaxLength, по умолчанию 260 символов), про который не сказано ни в
+        maxUrl, ни в maxQueryString. Проверено на живой 1С: пять периодов (сегмент 249 символов)
+        проходят, шесть (292) дают 400 «Bad Request — Invalid URL» от IIS, а не ошибку 1С.
+
+        Длину считаем по РАСКОДИРОВАННОМУ сегменту: http.sys меряет его до процентного
+        декодирования адреса, и кириллица в имени объекта тут ничего не меняет — она в другом
+        сегменте. Первый период кладём всегда: пачка из одного периода — это уже минимум, и если
+        не влезет даже он, честнее отдать ошибку, чем зациклиться.
+        """
+        chunk: list = []
+        for period in periods:
+            candidate = chunk + [period]
+            segment = self._ext_dimensions_segment(self._periods_condition(candidate), None)
+            if chunk and len(segment) > self._ext_dimensions_segment_limit:
+                break
+            chunk = candidate
+        return chunk
+
+    @staticmethod
+    def _ext_dimensions_segment(condition: str | None, top: int | None) -> str:
+        """Сегмент адреса с вызовом функции, до процентного кодирования (см. _ext_dimensions_chunk)."""
+        args = []
+        if condition:
+            args.append('Condition=' + _odata_string_literal(condition))
+        if top is not None:
+            args.append(f'Top={top}')
+        return f"{RECORDS_WITH_EXT_DIMENSIONS}({','.join(args)})"
+
+    def _request_ext_dimensions(self, object_name: str, condition: str | None,
+                                top: int | None) -> list:
+        """Запрос к RecordsWithExtDimensions; возвращает список элементов ответа (d:element)."""
+        # Слэш оставляем как есть: имя функции — сегмент пути, а не значение. Закодированный
+        # %2F часть веб-серверов (IIS по умолчанию) отвергает, не доводя запрос до 1С.
+        path = quote(f"{object_name}/{self._ext_dimensions_segment(condition, top)}",
+                     safe="/()=,':")
+        url = f'{self.odata_url}/{path}'
+        response = requests.get(url, auth=self.odata_auth,
+                                timeout=resolve_timeout(self.request_timeout))
+        raise_for_status(response, f'read {path}')
+        self.last_response_bytes = len(response.content)
+        result = xmltodict.parse(response.text, force_list=(FUNCTION_ELEMENT_FIELD,))
+        return (result.get(FUNCTION_RESULT_FIELD) or {}).get(FUNCTION_ELEMENT_FIELD) or []
+
+    def _ext_dimensions_key(self, element: dict) -> tuple | None:
+        """(регистратор, номер строки) элемента виртуальной таблицы — ключ сшивки с движением."""
+        recorder = element.get('d:Recorder')
+        line_number = element.get('d:' + LINE_NUMBER_FIELD)
+        if not isinstance(recorder, str) or not isinstance(line_number, str):
+            return None
+        return self._convert_value(recorder, 'Guid'), self._convert_value(line_number, 'Int64')
+
+    def _ext_dimensions_record(self, object_name: str, element: dict) -> dict:
+        """
+        Движение из виртуальной таблицы: поля самого регистра разбираются как обычно, слоты
+        субконто сворачиваются в JSON.
+
+        Поля, которых в описании регистра нет, отбрасываем ЗДЕСЬ, а не в _get_record_fields:
+        виртуальная таблица шире движения (PointInTime, сами слоты), и без фильтра каждое такое
+        поле заводило бы в таблице лишнюю колонку и перечитывало метаданные.
+        """
+        metadata_obj = self.metadata[object_name]
+        properties = {k: v for k, v in element.items()
+                      if k.startswith('d:') and k.removeprefix('d:') in metadata_obj}
+        record = self._get_record_fields(properties, object_name)
+
+        # Незаполненное числовое поле платформа отдаёт ПО-РАЗНОМУ, смотря откуда его читать: в
+        # наборе записей это <d:КоличествоDr>0</d:КоличествоDr>, в виртуальной таблице —
+        # <d:КоличествоDr m:null="true"/>. Проверено на одном и том же движении. Разница не
+        # безобидна: пакет изменений приходит набором записей, полная выгрузка — виртуальной
+        # таблицей, и без выравнивания они переписывали бы друг друга вечно — каждый прогон
+        # отчитывался бы изменёнными строками, хотя в 1С ничего не менялось.
+        # Выравниваем на НУЛЕ, а не на NULL: у ресурса регистра пустого значения не бывает вовсе,
+        # пустой ресурс в 1С — это ноль, и набор записей говорит ровно это. NULL в этих колонках
+        # остаётся признаком погашенной строки (см. DBWriter1C._resource_reset_values).
+        for field, type_name in metadata_obj.items():
+            if type_name in NUMERIC_TYPES and record.get(field) is None:
+                record[field] = 0
+
+        record.update(self._ext_dimensions(element))
+        return record
+
+    @staticmethod
+    def _ext_dimensions(element: dict) -> dict[str, dict]:
+        """
+        Слоты субконто одного движения -> {колонка: {вид субконто: {"value", "type"}}}.
+
+        Ключ — ВИД субконто, а не номер слота: номер смысла не имеет (субконто1 счёта 10 это
+        Номенклатура, счёта 60 — Контрагенты). Слот без вида или без значения пропускается: назвать
+        такое субконто нечем. Тип значения храним рядом со значением — субконто бывает и не
+        ссылкой (число, строка), и тогда это единственный способ понять, что лежит в value.
+        """
+        columns: dict[str, dict] = {}
+        for side, field in EXT_DIMENSIONS_FIELDS.items():
+            found: dict[str, dict] = {}
+            for slot in EXT_DIMENSION_SLOTS:
+                kind = element.get(EXT_DIMENSION_KIND.format(side=side, slot=slot))
+                value = element.get(EXT_DIMENSION_VALUE.format(side=side, slot=slot))
+                if not isinstance(kind, str) or not isinstance(value, str):
+                    continue
+                found[kind] = {EXT_DIMENSION_VALUE_KEY: value}
+                value_type = element.get(EXT_DIMENSION_VALUE_TYPE.format(side=side, slot=slot))
+                if isinstance(value_type, str):
+                    found[kind][EXT_DIMENSION_TYPE_KEY] = (value_type.removeprefix(ODATA_PREFIX)
+                                                           .removeprefix(EDM_TYPE_PREFIX))
+            columns[field] = found
+        return columns
 
     def read_by_key(self, object_name: str, key_values: dict) -> int:
         """
@@ -418,9 +696,14 @@ class DataReader1C(UserDict):
         вызывающий логирует итог одной строкой: entry в ответе бывают тысячами, и лог на каждую
         забивает вывод (см. read_object / ChangeReader1C.read_changes).
 
-        Объекты неподдерживаемых классов (см. SUPPORTED_TYPES) пропускаются с ошибкой в логе: пакет
-        изменений подтверждается целиком, поэтому такие изменения 1С больше не пришлёт — молчать
-        об этом нельзя. Лог один на пакет, а не на entry.
+        Объекты неподдерживаемых классов (см. SUPPORTED_TYPES) пропускаются с предупреждением в
+        логе: пакет изменений подтверждается целиком, поэтому такие изменения 1С больше не пришлёт —
+        молчать об этом нельзя. Лог один на пакет, а не на entry.
+
+        Уровень именно WARNING, а не ERROR: неподдерживаемый класс — это состав плана обмена, а не
+        сбой прогона. Останавливать на нём репликацию нечем и незачем — пакет подтверждается, цикл
+        идёт дальше, а решение (убрать объект из плана обмена или ждать поддержки) принимает
+        человек, прочитав предупреждение.
         """
         parsed: Counter = Counter()
         unsupported: Counter = Counter()
@@ -449,7 +732,7 @@ class DataReader1C(UserDict):
                 self._get_entity_records(object_name, properties)
 
         if unsupported:
-            logger.error(
+            logger.warning(
                 "Objects of unsupported classes were skipped and their changes are lost "
                 "(the exchange message is confirmed as a whole, 1C will not send them again): %s",
                 ', '.join(f'{name} ({n} entries)' for name, n in unsupported.items()))

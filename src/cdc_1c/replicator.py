@@ -12,7 +12,7 @@ from dbmerge import mergeResult
 from sqlalchemy import Engine, Integer, Numeric
 from sqlalchemy.exc import NoSuchTableError, OperationalError
 
-from cdc_1c.metadata_reader import MetadataReader1C
+from cdc_1c.metadata_reader import ACCOUNTING_REGISTER_TYPE, MetadataReader1C
 from cdc_1c.common_functions import format_duration
 from cdc_1c.data_reader import (DataReader1C, IS_DELETED_OR_EMPTY_FIELD, ODATA_PREFIX,
                                 RECORDER_FIELDS, _odata_literal)
@@ -83,15 +83,23 @@ FULL_LOAD_WINDOW_DAYS = 30
 FULL_LOAD_WINDOW_MIN_DAYS = 1
 FULL_LOAD_WINDOW_DIVISOR = 3
 
-# Сколько пустых окон подряд считать концом истории. Нужно только там, где границы периода у 1С
-# не спросить, — у регистра, подчинённого регистратору (см. _supports_date_bounds): у него дата
-# лежит внутри набора записей, и $orderby по ней платформа молча игнорирует. У документа границы
-# точные, и эта эвристика не применяется вовсе.
+# Сколько пустых окон подряд считать «дальше шагать не по чему»: обход прекращается, а остаток
+# истории добирается одним сплошным чтением без нижней границы.
+#
+# Считаем их ВСЕГДА, а не только когда границы периода у 1С не спросить (регистр, подчинённый
+# регистратору: дата лежит внутри набора записей, и $orderby по ней платформа молча игнорирует —
+# см. _supports_date_bounds). Полученной от 1С границе тоже нельзя верить как мере работы: в
+# периоде встречается мусор — пустая дата 1С (0001-01-01) или промах пальцем (в демо-базе
+# бухгалтерии есть запись за 0209 год). Одна такая запись растягивала обход на 22 тысячи окон.
+# Граница остаётся полезной как признак ПОСЛЕДНЕГО окна, когда история кончается честно.
 FULL_LOAD_EMPTY_WINDOWS_TO_STOP = 3
 
 # Поля, по которым выгрузка режется на периоды, если пользователь не задал своё: у документа это
 # Date, у регистра — Period. Порядок важен: у регистра сведений бывают оба.
 PARTITION_DATE_FIELDS = ('Date', 'Period')
+# Поле периода записи регистра. У регистра бухгалтерии оно же — единственная ось, по которой
+# режется полная выгрузка (см. full_load).
+PERIOD_FIELD = 'Period'
 
 # Имя переменной в лямбде OData-фильтра по вложенной коллекции записей регистра:
 # RecordSet/any(r: r/Period ge ...). См. _Window.filter.
@@ -703,7 +711,10 @@ class Replicator1C:
         # Ключ курсора: справочник/документ → [Ref_Key], регистраторный → [Recorder]/[Recorder_Key],
         # независимый регистр → весь первичный ключ (составной ключ).
         key_fields, key_types = self._full_load_key(object_name)
-        use_keyset = self._supports_keyset(object_name, key_fields)
+        # Регистр бухгалтерии читается из виртуальной таблицы (только там есть субконто), а у неё
+        # ни $skip, ни сортировки: страницы идут курсором по периоду, см. _load_pages.
+        by_period = self._is_accounting_register(object_name)
+        use_keyset = False if by_period else self._supports_keyset(object_name, key_fields)
         date_filter = self._build_date_filter(object_name, date_field, date_from, date_to)
 
         reader = DataReader1C(self._odata_url, self.metadata, odata_auth=self._odata_auth,
@@ -718,12 +729,15 @@ class Replicator1C:
         # Поле, по которому объект можно порезать на периоды, если он окажется глубоким. Нарезка
         # имеет смысл только там, где страницы берутся через $skip: keyset-курсор в глубину не
         # уходит и в окнах не нуждается.
-        partition_field = None if use_keyset else self._partition_date_field(object_name, date_field)
+        # Курсор по периоду в глубину не уходит (смещения нет вовсе), поэтому окна ему не нужны.
+        partition_field = (None if use_keyset or by_period
+                           else self._partition_date_field(object_name, date_field))
 
         log_id = self.replicator_log.start(self._exchange_name, object_name, None, LOAD_TYPE_FULL)
         logger.info("Full load of %s started (batch_size=%s, key=%s, paging=%s, date_filter=%s, "
                     "partition_field=%s)", object_name, batch_size, key_fields,
-                    'keyset' if use_keyset else 'skip', date_filter, partition_field)
+                    'period' if by_period else ('keyset' if use_keyset else 'skip'),
+                    date_filter, partition_field)
         total = 0
         rows_modified = 0
         # Ключи прогона: собираются постранично, в конце по ним помечаются пропавшие строки.
@@ -734,7 +748,7 @@ class Replicator1C:
             if keys is not None:
                 stack.enter_context(keys)
             page_args = dict(reader=reader, key_fields=key_fields, key_types=key_types,
-                             use_keyset=use_keyset, batch_size=batch_size,
+                             use_keyset=use_keyset, by_period=by_period, batch_size=batch_size,
                              keys=keys, log_id=log_id)
             # Читался ли объект окнами по дате. Важно для пометки пропавших строк: окно
             # порождает «уехавшие» строки (см. _mark_missing_rows), и неважно, задал его
@@ -745,11 +759,25 @@ class Replicator1C:
             # (а таких большинство) окна только вредят: он укладывается в пару страниц, а за
             # обход пришлось бы заплатить запросом на каждое окно истории, даже пустое.
             # Лимит страниц ставим, только если резать вообще есть по чему.
-            records, modified, exhausted = self._load_pages(
-                object_name, extra_filter=date_filter, **page_args,
-                max_pages=FULL_LOAD_PARTITION_MAX_PAGES if partition_field else None)
-            total += records
-            rows_modified += modified
+            if by_period:
+                # Регистр бухгалтерии читается ТОЛЬКО окнами: у виртуальной таблицы нет ни
+                # смещения, ни сортировки, а Top отдаёт произвольное подмножество выборки, а не
+                # её начало (проверено: Top=20 вернул двадцать движений вразброс по всей истории).
+                # Значит, единственный способ прочитать объект целиком и ничего не потерять —
+                # разбить время на отрезки и взять каждый отрезок ЦЕЛИКОМ.
+                windowed = True
+                records, modified = self._load_by_windows(
+                    object_name, reader=reader, date_field=PERIOD_FIELD,
+                    date_filter=date_filter, page_args=page_args)
+                total += records
+                rows_modified += modified
+                exhausted = True
+            else:
+                records, modified, exhausted = self._load_pages(
+                    object_name, extra_filter=date_filter, **page_args,
+                    max_pages=FULL_LOAD_PARTITION_MAX_PAGES if partition_field else None)
+                total += records
+                rows_modified += modified
 
             if not exhausted:
                 # Объект глубокий: $skip уже уходит далеко, и дальше цена растёт квадратично —
@@ -784,7 +812,7 @@ class Replicator1C:
     def _load_pages(self, object_name: str, *, reader: DataReader1C, key_fields: list[str],
                     key_types: list[str], use_keyset: bool, extra_filter: str | None,
                     batch_size: int, keys, log_id,
-                    max_pages: int | None) -> tuple[int, int, bool]:
+                    max_pages: int | None, by_period: bool = False) -> tuple[int, int, bool]:
         """
         Постраничное чтение одной выборки (объект целиком либо его окно по периоду) с записью
         каждой страницы. Возвращает (сколько записей прочитано, сколько строк изменено, дочитано ли
@@ -792,6 +820,9 @@ class Replicator1C:
 
         max_pages ограничивает число страниц: превышение означает «выборка слишком глубокая», и
         вызывающий режет её на меньшие периоды (см. full_load). None — читать до конца.
+
+        by_period — регистр бухгалтерии: читается из виртуальной таблицы, где нет ни $skip, ни
+        сортировки, и курсором служит сам ПЕРИОД (см. DataReader1C.read_accounting_register).
         """
         after_values = None
         skip = 0
@@ -824,11 +855,25 @@ class Replicator1C:
             # тогда её merge не держал бы границу. Обращение локальное, в сеть не ходит.
             page_started_at = self.writes.boundary(self._full_load_tables(object_name))
             try:
-                page = reader.read_object(object_name, top=page_size, key_fields=key_fields,
-                                          after_values=after_values, key_types=key_types,
-                                          extra_filter=extra_filter, use_keyset=use_keyset,
-                                          skip=None if use_keyset else skip)
+                if by_period:
+                    # Окно берётся ЦЕЛИКОМ, одним запросом: страницу внутри него не отрезать
+                    # ничем — Top отдаёт произвольное подмножество, а не начало выборки
+                    # (см. read_accounting_register).
+                    page = reader.read_accounting_register(object_name, condition=extra_filter)
+                else:
+                    page = reader.read_object(object_name, top=page_size, key_fields=key_fields,
+                                              after_values=after_values, key_types=key_types,
+                                              extra_filter=extra_filter, use_keyset=use_keyset,
+                                              skip=None if use_keyset else skip)
             except requests.HTTPError as exc:
+                if by_period:
+                    # Окно не по зубам серверу 1С. Уменьшать тут нечего — размер выборки задаёт
+                    # только ширина окна, поэтому отдаём «не дочитано» и вызывающий сузит окно.
+                    if _is_permanent_error(exc):
+                        raise
+                    logger.warning("Full load of %s: window failed, narrowing it (%s)",
+                                   object_name, exc)
+                    return total, rows_modified, False
                 # Страница не по зубам серверу 1С (упирается в память/временные файлы) —
                 # уменьшаем её и повторяем с того же места. Курсор/смещение не сдвигались.
                 if _is_permanent_error(exc) or page_size <= FULL_LOAD_MIN_BATCH:
@@ -865,6 +910,9 @@ class Replicator1C:
                 self._signal_handlers(table_name, result, SOURCE_FULL_LOAD)
             total += page
             pages += 1
+            if by_period:
+                # Окно прочитано целиком — «следующей страницы» у него не бывает.
+                break
             if page < page_size:
                 break
             if max_pages is not None and pages >= max_pages:
@@ -924,8 +972,8 @@ class Replicator1C:
            у них быть должна) и всё, что создаётся уже во время прогона.
         2. Вниз окнами `[cursor - window, cursor)`, встык: end одного окна = start следующего,
            поэтому пропустить между ними нельзя ничего.
-        3. Хвост `(-inf, cursor)` одним сплошным $skip — только там, где границу снизу спросить не
-           у кого (см. ниже).
+        3. Хвост `(-inf, cursor)` одним сплошным $skip — как только подряд попалось
+           FULL_LOAD_EMPTY_WINDOWS_TO_STOP пустых окон (см. ниже).
 
         Окно, упёршееся в лимит страниц, СУЖАЕТСЯ (делится на FULL_LOAD_WINDOW_DIVISOR) и
         перечитывается с того же места — заново, а не с середины: страницы упорядочены по ключу, а
@@ -985,6 +1033,9 @@ class Replicator1C:
         cursor = anchor
         window_days = FULL_LOAD_WINDOW_DAYS
         empty_in_a_row = 0
+        # Обход прекращён по пустым окнам, а не потому, что дошёл до самой ранней даты. Значит,
+        # ниже cursor данные ещё могут быть, и их надо добрать (см. ниже).
+        history_probed = False
         while oldest is None or cursor > oldest:
             start = cursor - timedelta(days=window_days)
             # Окно, накрывшее самую раннюю дату, — последнее: ниже ничего нет, и лимит страниц ему
@@ -1004,13 +1055,22 @@ class Replicator1C:
             cursor = start
             if last:
                 return total, rows_modified
-            if oldest is None:
-                empty_in_a_row = empty_in_a_row + 1 if records == 0 else 0
-                if empty_in_a_row >= FULL_LOAD_EMPTY_WINDOWS_TO_STOP:
-                    break
+            # Пустые окна считаем ВСЕГДА, а не только когда границу снизу спросить не у кого.
+            # Известная граница доверия не заслуживает: 1С отдаёт её как есть, а в периоде
+            # регистра сведений встречается мусор — пустая дата 1С (0001-01-01) или просто
+            # промах пальцем (в демо-базе бухгалтерии лежит запись за 0209 год). Одна такая
+            # запись заставляла шагать окнами от сегодняшнего дня до неё: 22 тысячи запросов
+            # на регистр, внешне неотличимые от зависшего прогона. Теперь обход ограничен
+            # ПЛОТНОСТЬЮ ДАННЫХ, а не календарём, и древний хвост стоит трёх пустых окон плюс
+            # одно сплошное чтение.
+            empty_in_a_row = empty_in_a_row + 1 if records == 0 else 0
+            if empty_in_a_row >= FULL_LOAD_EMPTY_WINDOWS_TO_STOP:
+                history_probed = True
+                break
 
-        if oldest is None:
-            # Границ снизу не было: остаток истории добираем одним окном без нижней границы.
+        if history_probed:
+            # Дальше шагать окнами не по чему: остаток истории добираем одним окном без нижней
+            # границы. Дороже одного окна, но дешевле сотен пустых — и ничего не теряем.
             logger.info("Full load of %s: %s empty windows in a row, reading everything below "
                         "%s in one go", object_name, empty_in_a_row, cursor)
             read(None, cursor, max_pages=None)
@@ -1050,11 +1110,17 @@ class Replicator1C:
         """
         return not self._is_record_set_object(object_name)
 
+    def _is_accounting_register(self, object_name: str) -> bool:
+        """Регистр бухгалтерии: читается из виртуальной таблицы RecordsWithExtDimensions, потому
+        что субконто есть только там (см. DataReader1C.read_accounting_register)."""
+        return object_name.startswith(ACCOUNTING_REGISTER_TYPE)
+
     def _window(self, object_name: str, date_field: str,
                 start: datetime | None, end: datetime | None) -> _Window:
         """Окно [start, end) с фильтром, подходящим этому объекту (см. _Window)."""
         return _Window(date_field, start, end,
-                       record_set=self._is_record_set_object(object_name))
+                       record_set=(self._is_record_set_object(object_name)
+                                   and not self._is_accounting_register(object_name)))
 
     def _primary_key_columns(self, object_name: str) -> dict:
         """Первичный ключ объекта в терминах целевой таблицы: {колонка: тип SQLAlchemy}. По нему
@@ -1268,7 +1334,11 @@ class Replicator1C:
             return None
         if not date_field:
             raise ValueError("full_load: date_from/date_to require date_field")
-        record_set = self._is_record_set_object(object_name)
+        # Регистр бухгалтерии читается не набором записей, а виртуальной таблицей
+        # RecordsWithExtDimensions (там движения плоские и Period лежит на верхнем уровне),
+        # поэтому лямбда по вложенной коллекции ему не нужна и не подходит.
+        record_set = (self._is_record_set_object(object_name)
+                      and not self._is_accounting_register(object_name))
         field = f'{RECORD_SET_LAMBDA}/{date_field}' if record_set else date_field
         clauses = []
         if date_from is not None:

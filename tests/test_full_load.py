@@ -609,6 +609,36 @@ def test_deep_object_is_read_by_day_windows_newest_first(db, monkeypatch):
     assert ends == starts[:-1]
 
 
+def test_absurd_oldest_date_does_not_walk_the_calendar(db, monkeypatch):
+    """
+    Нижняя граница, полученная от 1С, не годится как мера работы: в периоде регистра сведений
+    встречается мусор — пустая дата 1С (0001-01-01) или промах пальцем (в демо-базе бухгалтерии
+    лежит запись за 0209 год). Шагая окнами до неё, обход дал бы 22 тысячи запросов, внешне
+    неотличимых от зависшего прогона.
+
+    Поэтому пустые окна считаются ВСЕГДА, а не только когда границу спросить не у кого: три
+    подряд — и остаток истории добирается одним сплошным чтением. Обход ограничен плотностью
+    данных, а не календарём.
+    """
+    # Данные есть только в самом свежем окне; всё, что ниже, пусто — как у регистра с одной
+    # древней записью.
+    rep, calls = _partitioned(db, monkeypatch,
+                              lambda flt, skip: 10 if flt is None else (1 if 'lt' not in flt else 0))
+    monkeypatch.setattr(DataReader1C, "read_date_bound",
+                        lambda self, name, field, *, newest, extra_filter=None:
+                        datetime(2026, 3, 20) if newest else datetime(209, 1, 1))
+
+    rep.full_load("Document_Y", batch_size=10)
+
+    windows = [c for c in calls if c]
+    assert len(windows) == 2 + FULL_LOAD_EMPTY_WINDOWS_TO_STOP, (
+        f'окон должно быть ровно {2 + FULL_LOAD_EMPTY_WINDOWS_TO_STOP}: открытое вверх, '
+        f'{FULL_LOAD_EMPTY_WINDOWS_TO_STOP} пустых и хвост — а не тысячи до 209 года')
+    assert windows[0] == "Date ge datetime'2026-03-20T00:00:00'"
+    # Хвост открыт вниз: одним чтением забирает всё, включая древнюю запись.
+    assert windows[-1].startswith("Date lt datetime'") and ' ge ' not in windows[-1]
+
+
 def test_small_object_is_not_windowed(db, monkeypatch):
     """
     Мелкому объекту окна только вредят: он укладывается в пару страниц, а обход стоил бы запроса

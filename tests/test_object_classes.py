@@ -53,21 +53,54 @@ def test_reference_classes_are_parsed_like_catalogs(object_name):
     assert data[IS_DELETED_OR_EMPTY_FIELD] == [False]
 
 
-def test_unsupported_class_is_skipped_and_reported(caplog):
-    # Регистр бухгалтерии пока не поддерживается: устроен иначе (Dr/Cr-пары, счета).
-    reader = _reader()
+def test_accounting_register_is_parsed_like_accumulation_register(caplog):
+    # Регистр бухгалтерии в OData устроен как регистраторный регистр накопления: Recorder на уровне
+    # entry + коллекция RecordSet, поэтому разбирается тем же кодом.
+    name = "AccountingRegister_Hozraschetnyi"
+    metadata = MetadataReader1C(odata_url="http://fake")
+    metadata[name] = MetadataObject1C(
+        name, {"Recorder": "Guid", "Recorder_Type": "String", "LineNumber": "Int64",
+               "AccountDr_Key": "Guid", "AccountCr_Key": "Guid", "Summa": "Double"},
+        {"Recorder": "Guid", "LineNumber": "Int64", "Recorder_Type": "String"},
+        ["Recorder", "Recorder_Type"])
+    metadata.is_loaded = True
+    reader = DataReader1C(odata_url="http://fake", metadata=metadata)
+    reader.exchange_message_no = 7
 
     with caplog.at_level(logging.ERROR):
+        reader.read_data_entries([_entry(name, {
+            "d:Recorder": REF,
+            "d:Recorder_Type": "StandardODATA.Document_AvansovyjOtchet",
+            "d:RecordSet": {"d:element": [{"d:LineNumber": "1", "d:AccountDr_Key": REF,
+                                           "d:AccountCr_Key": REF, "d:Summa": "1650"}]},
+        })])
+
+    data = reader[name].data
+    assert data["LineNumber"] == [1]
+    assert data["Summa"] == [1650]
+    # Регистратор лежит на уровне entry и в строки набора проставляется разбором.
+    assert [str(v) for v in data["Recorder"]] == [REF]
+    assert data["Recorder_Type"] == ["Document_AvansovyjOtchet"]
+    assert "unsupported" not in caplog.text
+
+
+def test_unsupported_class_is_skipped_and_reported(caplog):
+    # Регистр расчёта не поддерживается: у него своя структура записи (периоды действия, вытеснение).
+    # Уровень WARNING, а не ERROR: пакет всё равно подтверждается, цикл репликации не останавливается.
+    reader = _reader()
+
+    with caplog.at_level(logging.WARNING):
         parsed = reader.read_data_entries([
-            _entry("AccountingRegister_Hozraschetnyi", {"d:Recorder": REF}),
-            _entry("AccountingRegister_Hozraschetnyi", {"d:Recorder": REF}),
+            _entry("CalculationRegister_Nachisleniya", {"d:Recorder": REF}),
+            _entry("CalculationRegister_Nachisleniya", {"d:Recorder": REF}),
         ])
 
-    assert "AccountingRegister_Hozraschetnyi" not in reader   # не сохранён
-    assert parsed["AccountingRegister_Hozraschetnyi"] == 2     # но сосчитан
+    assert "CalculationRegister_Nachisleniya" not in reader   # не сохранён
+    assert parsed["CalculationRegister_Nachisleniya"] == 2     # но сосчитан
     text = caplog.text
     assert "unsupported" in text and "lost" in text
     assert "2 entries" in text                                 # один лог на пакет, с количеством
+    assert [r.levelname for r in caplog.records if "unsupported" in r.getMessage()] == ["WARNING"]
 
 
 def test_reference_classes_are_saved_before_documents():

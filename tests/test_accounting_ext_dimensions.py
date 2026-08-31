@@ -1,0 +1,226 @@
+"""
+Субконто регистра бухгалтерии (оффлайн — ответ 1С подставляется заглушкой).
+
+В описании движения (`_RowType`) субконто нет вообще: они живут только в виртуальной таблице
+`RecordsWithExtDimensions` и приезжают СЛОТАМИ (`ExtDimensionDr1..3`). Номер слота смысла не имеет
+— субконто1 счёта 10 это Номенклатура, счёта 60 Контрагенты, — поэтому слоты сворачиваются в JSON
+с ключом по ВИДУ субконто. Проверяем именно свёртку, состав колонок и сшивку с пакетом изменений.
+"""
+
+from urllib.parse import unquote
+
+import pytest
+
+from cdc_1c.data_reader import DataReader1C
+from cdc_1c.metadata_reader import (ACCOUNTING_REGISTER_TYPE, EXT_DIMENSIONS_FIELDS,
+                                    EXT_DIMENSIONS_TYPE, MetadataObject1C, MetadataReader1C)
+
+REG = f"{ACCOUNTING_REGISTER_TYPE}_Main"
+REC = "6a85159f-8ba8-11dd-89d9-00055dcfc5ca"
+KIND_1 = "6a6ada17-52bb-4311-b1cc-cf7913896204"
+KIND_2 = "ac901067-a86f-48d4-93e0-bc525fc3dbe0"
+VALUE_1 = "e5b0e2f0-aa22-11dc-a0f4-0011d85708ff"
+
+# Поля движения (как в _RecordType) плюс синтетические колонки субконто.
+_FIELDS = {"Recorder": "Guid", "Recorder_Type": "String", "LineNumber": "Int64",
+           "Period": "DateTime", "AccountDr_Key": "Guid", "Summa": "Double",
+           "KolichestvoDr": "Double",
+           **{field: EXT_DIMENSIONS_TYPE for field in EXT_DIMENSIONS_FIELDS.values()}}
+_PRIMARY_KEY = {"Recorder": "Guid", "LineNumber": "Int64", "Recorder_Type": "String"}
+
+
+def _element(line_number: str = "1", period: str = "2013-01-14T12:00:01") -> str:
+    """Один <d:element> виртуальной таблицы: движение + слоты субконто + лишние поля."""
+    return f"""
+      <d:element>
+        <d:Period>{period}</d:Period>
+        <d:Recorder>{REC}</d:Recorder>
+        <d:Recorder_Type>StandardODATA.Document_AvansovyjOtchet</d:Recorder_Type>
+        <d:LineNumber>{line_number}</d:LineNumber>
+        <d:AccountDr_Key>51817a38-e8d9-4e9b-a6d8-ae22629ba12c</d:AccountDr_Key>
+        <d:Summa>1650</d:Summa>
+        <d:KolichestvoDr m:null="true"/>
+        <d:ExtDimensionDr1>{VALUE_1}</d:ExtDimensionDr1>
+        <d:ExtDimensionDr1_Type>StandardODATA.Catalog_StatiZatrat</d:ExtDimensionDr1_Type>
+        <d:ExtDimensionTypeDr1_Key>{KIND_1}</d:ExtDimensionTypeDr1_Key>
+        <d:ExtDimensionDr2 m:null="true"/>
+        <d:ExtDimensionTypeDr2_Key>{KIND_2}</d:ExtDimensionTypeDr2_Key>
+        <d:ExtDimensionCr1>1650</d:ExtDimensionCr1>
+        <d:ExtDimensionCr1_Type>Edm.Double</d:ExtDimensionCr1_Type>
+        <d:ExtDimensionTypeCr1_Key>{KIND_2}</d:ExtDimensionTypeCr1_Key>
+        <d:PointInTime>2013-01-14T12:00:01</d:PointInTime>
+      </d:element>"""
+
+
+def _result(*elements: str) -> str:
+    return ('<?xml version="1.0" encoding="UTF-8"?>'
+            '<d:Result xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"'
+            ' xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">'
+            + ''.join(elements) + '</d:Result>')
+
+
+class _Response:
+    headers: dict = {}
+    reason = 'Bad Request'
+    url = 'http://fake'
+
+    def __init__(self, text: str, status_code: int = 200):
+        self.text = text
+        self.content = text.encode()
+        self.status_code = status_code
+        self.ok = status_code < 400
+
+
+@pytest.fixture
+def reader(monkeypatch):
+    """DataReader1C с метаданными регистра бухгалтерии; запросы в 1С перехвачены."""
+    metadata = MetadataReader1C(odata_url="http://fake")
+    metadata[REG] = MetadataObject1C(REG, dict(_FIELDS), dict(_PRIMARY_KEY),
+                                     object_key=["Recorder", "Recorder_Type"])
+    metadata.is_loaded = True
+    obj = DataReader1C(odata_url="http://fake", metadata=metadata)
+    obj.exchange_message_no = 7
+    obj.requested_urls = []
+    obj.response_text = _result(_element())
+    # Очередь подставных ответов: (код, тело). Пусто — обычный 200 с response_text.
+    obj.response_queue = []
+
+    import cdc_1c.data_reader as module
+
+    def fake_get(url, **kwargs):
+        obj.requested_urls.append(url)
+        if obj.response_queue:
+            status, text = obj.response_queue.pop(0)
+            return _Response(text, status)
+        return _Response(obj.response_text)
+
+    monkeypatch.setattr(module.requests, 'get', fake_get)
+    return obj
+
+
+def test_ext_dimension_slots_are_folded_by_kind(reader):
+    reader.read_accounting_register(REG)
+
+    data = reader[REG].data
+    dr = data[EXT_DIMENSIONS_FIELDS['Dr']][0]
+    cr = data[EXT_DIMENSIONS_FIELDS['Cr']][0]
+    # Ключ — вид субконто, а не номер слота.
+    assert dr == {KIND_1: {"value": VALUE_1, "type": "Catalog_StatiZatrat"}}
+    # Слот без значения (m:null) пропущен, хотя вид субконто у него пришёл.
+    assert KIND_2 not in dr
+    # Субконто бывает и не ссылкой — тип значения нужен именно для этого, префикс Edm. снят.
+    assert cr == {KIND_2: {"value": "1650", "type": "Double"}}
+
+
+def test_virtual_table_extras_do_not_become_columns(reader):
+    # Виртуальная таблица шире движения: сами слоты и PointInTime в регистре не существуют,
+    # и колонок под них в таблице быть не должно.
+    reader.read_accounting_register(REG)
+
+    columns = set(reader[REG].data)
+    assert not [c for c in columns if c.startswith('ExtDimensionDr')
+                or c.startswith('ExtDimensionCr') or c.startswith('ExtDimensionType')]
+    assert 'PointInTime' not in columns
+    assert {'Recorder', 'LineNumber', 'Summa'} <= columns
+
+
+def test_empty_numeric_from_virtual_table_becomes_zero(reader):
+    # Одно и то же движение платформа описывает по-разному: набор записей отдаёт пустой ресурс
+    # нулём, виртуальная таблица — m:null. Пакет изменений приходит набором, полная выгрузка —
+    # таблицей, и без выравнивания они переписывали бы друг друга вечно.
+    reader.read_accounting_register(REG)
+
+    assert reader[REG].data["KolichestvoDr"] == [0]
+
+
+def test_page_is_read_by_period_window_not_by_top(reader):
+    # Top отдаёт произвольное подмножество выборки, а не её начало, поэтому страницу им не режут:
+    # окно берётся целиком, одним запросом с Condition по периоду.
+    reader.read_accounting_register(REG, condition="Period ge datetime'2013-01-01T00:00:00'")
+
+    url = reader.requested_urls[-1]
+    assert 'RecordsWithExtDimensions' in url
+    assert 'Condition' in url and 'Top' not in url
+
+
+def test_changes_package_is_enriched_by_periods(reader):
+    # Пакет изменений приносит набор записей БЕЗ субконто — их дочитывают по периодам пакета
+    # и сшивают по (регистратор, номер строки).
+    reader._get_register_records(REG, {
+        "d:Recorder": REC,
+        "d:Recorder_Type": "StandardODATA.Document_AvansovyjOtchet",
+        "d:RecordSet": {"d:element": [
+            {"d:LineNumber": "1", "d:Period": "2013-01-14T12:00:01", "d:Summa": "1650"},
+            {"d:LineNumber": "2", "d:Period": "2013-01-14T12:00:01", "d:Summa": "1600"},
+        ]},
+    })
+    assert EXT_DIMENSIONS_FIELDS['Dr'] not in reader[REG].data   # в наборе субконто нет
+
+    reader.response_text = _result(_element(line_number="1"))
+    assert reader.fill_ext_dimensions(REG) == 1                  # один период — один запрос
+
+    data = reader[REG].data
+    # Адресно по регистратору субконто не спросить (Condition по Recorder врёт), поэтому
+    # спрашиваем период — он общий для обеих строк, а сшивка идёт по номеру строки.
+    condition = unquote(reader.requested_urls[-1])
+    assert "/RecordsWithExtDimensions(" in condition   # имя функции — сегмент пути, не %2F
+    assert "Period eq datetime''2013-01-14T12:00:01''" in condition
+    assert data[EXT_DIMENSIONS_FIELDS['Dr']][0] == {KIND_1: {"value": VALUE_1,
+                                                             "type": "Catalog_StatiZatrat"}}
+    # Строке без пары достаётся пустой JSON, а не NULL: «субконто нет» != «не читали».
+    assert data[EXT_DIMENSIONS_FIELDS['Dr']][1] == {}
+    assert len(data[EXT_DIMENSIONS_FIELDS['Cr']]) == reader[REG].data_length
+
+
+def _package(reader, periods: list[str]) -> None:
+    """Кладёт в reader набор записей на заданные периоды — по одному движению на период."""
+    reader._get_register_records(REG, {
+        "d:Recorder": REC,
+        "d:Recorder_Type": "StandardODATA.Document_AvansovyjOtchet",
+        "d:RecordSet": {"d:element": [
+            {"d:LineNumber": str(i + 1), "d:Period": period, "d:Summa": "1"}
+            for i, period in enumerate(periods)
+        ]},
+    })
+
+
+def test_periods_are_split_by_url_segment_budget(reader):
+    # Параметры функции лежат В АДРЕСЕ, и режет их http.sys своим лимитом на длину одного
+    # сегмента URL (260 символов) — раньше, чем IIS дойдёт до maxUrl. Проверено на живой 1С:
+    # пять периодов проходят, шесть дают 400 «Invalid URL». Поэтому периоды бьются по бюджету.
+    _package(reader, [f"2013-01-{day:02d}T12:00:00" for day in range(1, 13)])
+
+    reader.fill_ext_dimensions(REG)
+
+    segments = [unquote(url).split('/RecordsWithExtDimensions', 1)[1]
+                for url in reader.requested_urls]
+    assert len(segments) > 1                                    # в один запрос не влезло
+    assert all(len('RecordsWithExtDimensions' + s) <= 260 for s in segments)
+    # Ни один период не потерян и ни один не спрошен дважды.
+    asked = sum(s.count('Period eq datetime') for s in segments)
+    assert asked == 12
+
+
+def test_url_too_long_halves_the_budget_and_retries(reader):
+    # Страховка на случай, когда лимит урезан ниже умолчания: сервер отвечает 400 с приметой
+    # в теле, бюджет делится и ТА ЖЕ пачка повторяется короче.
+    _package(reader, [f"2013-01-{day:02d}T12:00:00" for day in range(1, 5)])
+    reader.response_queue = [(400, '<h2>Bad Request - Invalid URL</h2>')]
+
+    reader.fill_ext_dimensions(REG)
+
+    assert reader._ext_dimensions_segment_limit == 130           # 260 // 2
+    # Первый запрос отвергнут, дальше пачки короче — но все четыре периода спрошены.
+    segments = [unquote(url) for url in reader.requested_urls]
+    assert len(segments) > 2
+    assert sum(s.count('Period eq datetime') for s in segments[1:]) == 4
+
+
+def test_other_400_is_not_treated_as_a_long_url(reader):
+    # Иначе любая ошибка 400 молча урезала бы бюджет до дна вместо внятного отказа.
+    _package(reader, [f"2013-01-{day:02d}T12:00:00" for day in range(1, 5)])
+    reader.response_queue = [(400, 'Неправильный запрос')]
+
+    with pytest.raises(Exception):
+        reader.fill_ext_dimensions(REG)
+    assert reader._ext_dimensions_segment_limit == 260

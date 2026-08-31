@@ -48,7 +48,11 @@ type_mapping = {'Guid':Uuid(),
                 # ХранилищеЗначения публикуется парой полей: <Имя> (Edm.Stream, см. IGNORED_TYPES)
                 # и <Имя>_Base64Data (Edm.Binary). Binary реально приходит в теле ответа
                 # base64-строкой (в ней бывает JSON или XML-сериализация 1С), поэтому храним как текст.
-                'Binary':String()}
+                'Binary':String(),
+                # Субконто регистра бухгалтерии: тип синтетический, поля с ним в $metadata нет —
+                # см. EXT_DIMENSIONS_FIELDS. JSON, а не JSONB: диалект знает только писатель
+                # (DBWriter1C.save поднимает его до JSONB на postgres).
+                'ExtDimensions':JSON()}
 
 # Типы, которых нет в данных: их нельзя отобразить в колонку, но это не ошибка метаданных.
 # Collection — табличная часть, читается отдельным объектом.
@@ -69,11 +73,15 @@ COMPOSITE_VALUE_SUFFIX = '_Value'
 # В этом случает VARCHAR поля лучше руками в базе поменять на UUID, 
 # т.к. иначе будут медленно работать JOIN
 
-REGISTER_TYPES = ('InformationRegister','AccumulationRegister')
+# Регистр бухгалтерии в OData устроен ровно как регистраторный регистр накопления: EntityType с
+# ключом Recorder(+Recorder_Type) и коллекцией RecordSet, рядом <Имя>_RecordType с описанием полей
+# движения. Поэтому он разбирается тем же кодом; отличается только классификация полей
+# (см. _classify_register_fields) и то, что субконто в набор записей вообще не приходят.
+# Регистр расчёта сюда не входит: у него своя структура записи (периоды действия, вытеснение).
+REGISTER_TYPES = ('InformationRegister','AccumulationRegister','AccountingRegister')
 # Ссылочные классы: устроены одинаково (Ref + DeletionMark + реквизиты + табличные части),
-# поэтому разбираются общим кодом. Регистры бухгалтерии и расчёта сюда не входят: у них своя
-# структура записи (Dr/Cr-пары, счета, периоды действия) — см. Приложение 12 руководства
-# разработчика, разделы 12.11 и 12.12.
+# поэтому разбираются общим кодом. Регистры сюда не входят — см. REGISTER_TYPES
+# (Приложение 12 руководства разработчика, разделы 12.11 и 12.12).
 ENTITY_TYPES = ('Catalog','Document','ChartOfCharacteristicTypes','ChartOfAccounts',
                 'ChartOfCalculationTypes','BusinessProcess','Task')
 # Классы, которые мы умеем сохранять. Всё остальное, придя в пакете изменений, будет потеряно
@@ -86,6 +94,19 @@ TYPE_PREFIX = 'Edm.'
 # Поля регистратора в OData: Recorder (+Recorder_Type), если регистратором может быть несколько
 # типов документов, и Recorder_Key (Guid, без Recorder_Type), если тип регистратора единственный.
 RECORDER_FIELDS = ('Recorder', 'Recorder_Key', 'Recorder_Type')
+
+# --- Субконто регистра бухгалтерии ---
+# Колонки, которых в $metadata нет: в описании движения (_RowType) субконто отсутствуют вовсе,
+# они живут только в виртуальной таблице RecordsWithExtDimensions и собираются оттуда
+# (см. DataReader1C). Ключ JSON-объекта — ВИД субконто (Guid), значение — {"value", "type"}.
+#
+# Почему JSON, а не колонки: 1С отдаёт субконто слотами (ExtDimensionDr1..3), а номер слота смысла
+# не имеет — субконто1 счёта 10 это Номенклатура, счёта 60 Контрагенты. Витрина, написавшая
+# `ExtDimensionDr1 = …`, была бы права ровно до следующего счёта, причём молча.
+ACCOUNTING_REGISTER_TYPE = 'AccountingRegister'
+EXT_DIMENSIONS_TYPE = 'ExtDimensions'
+# Сторона проводки -> имя колонки.
+EXT_DIMENSIONS_FIELDS = {'Dr': 'ExtDimensionsDr', 'Cr': 'ExtDimensionsCr'}
 # Системные поля движений регистра (не измерения/ресурсы/реквизиты).
 SYSTEM_REGISTER_FIELDS = frozenset(
     ('Period', 'LineNumber', 'Active', 'RecordType') + RECORDER_FIELDS)
@@ -94,6 +115,9 @@ TURNOVER_PERIOD_FIELDS = frozenset(
     ('Period', 'SecondPeriod', 'MinutePeriod', 'HourPeriod', 'DayPeriod', 'WeekPeriod',
      'TenDaysPeriod', 'MonthPeriod', 'QuarterPeriod', 'HalfYearPeriod', 'YearPeriod'))
 TURNOVER_RESOURCE_SUFFIXES = ('Turnover', 'Receipt', 'Expense')
+# Метка ресурса в виртуальной таблице _DrCrTurnover регистра бухгалтерии. Там она стоит НЕ в конце
+# имени, а перед Dr/Cr: СуммаTurnover -> Сумма, ВалютнаяСуммаTurnoverDr -> ВалютнаяСуммаDr.
+DR_CR_TURNOVER_MARKER = 'Turnover'
 
 def _check_object_is_table_part(base_name:str, complextypes: dict[str, list[str]]):
     """
@@ -115,12 +139,27 @@ def _classify_register_fields(base_name: str, properties: dict, complextypes: di
     prop_names = set(properties)
     balance = complextypes.get(base_name + '_Balance')
     turnover = complextypes.get(base_name + '_Turnover')
+    # Регистр бухгалтерии: _Balance/_Turnover у него сворачивают проводку в одну сторону
+    # (Account_Key, ExtDimension1, ВалютнаяСуммаBalance), а в движении лежат ПАРЫ Дт/Кт
+    # (AccountDr_Key/AccountCr_Key, ВалютнаяСуммаDr/Cr) — по этим таблицам не опознаётся почти
+    # ничего. Имена из _DrCrTurnover ложатся на движение один в один, поэтому для регистра
+    # бухгалтерии классифицируем по ней.
+    dr_cr_turnover = complextypes.get(base_name + '_DrCrTurnover')
 
-    if balance is None and turnover is None:
+    if balance is None and turnover is None and dr_cr_turnover is None:
         return [], [], []
 
     dimensions: list[str] = []
     resources: list[str] = []
+
+    if dr_cr_turnover is not None:
+        for f in dr_cr_turnover:
+            if DR_CR_TURNOVER_MARKER in f:
+                resources.append(f.replace(DR_CR_TURNOVER_MARKER, '', 1))
+            elif f in TURNOVER_PERIOD_FIELDS or f in SYSTEM_REGISTER_FIELDS or f.endswith('_Type'):
+                continue
+            else:
+                dimensions.append(f)
 
     if balance is not None:
         for f in balance:
@@ -270,10 +309,12 @@ class MetadataReader1C(UserDict):
         - регистр: набор записей одного регистратора -> Recorder (+ Recorder_Type) либо
           Recorder_Key, смотря как 1С назвала поле регистратора (см. RECORDER_FIELDS);
         - табличная часть (ключ Ref_Key + ещё поля) -> Ref_Key владельца;
-        - документ/справочник (единственная запись по Ref_Key) -> None, удаление не нужно.
+        - документ/справочник (единственная запись по Ref_Key) -> None, удаление не нужно;
+        - независимый регистр сведений -> None: регистратора у него нет, запись приходит поодиночке
+          и адресуется полным первичным ключом, то есть группы, которую надо чистить, не существует.
         """
         if item_name.startswith(REGISTER_TYPES):
-            return [c for c in RECORDER_FIELDS if c in properties]
+            return [c for c in RECORDER_FIELDS if c in properties] or None
         if 'Ref_Key' in primary_key and len(primary_key) > 1:
             return ['Ref_Key']
         return None
@@ -304,7 +345,7 @@ class MetadataReader1C(UserDict):
         raise_for_status(response, '$metadata')
         logger.info('Metadata received (%s)', format_bytes(len(response.content)))
 
-        metadata = xmltodict.parse(response.text,force_list=('Property','PropertyRef','ComplexType'))
+        metadata = xmltodict.parse(response.text,force_list=('Property','PropertyRef','ComplexType','EntityType'))
         metadata_schema = ((metadata.get('edmx:Edmx') or {}).get('edmx:DataServices') or {}).get('Schema') or {}
         metadata_entity_types = metadata_schema.get('EntityType') or []
         # Виртуальные таблицы регистров (_Balance/_Turnover) приходят как ComplexType — нужны для
@@ -314,6 +355,10 @@ class MetadataReader1C(UserDict):
                         for ct in (metadata_schema.get('ComplexType') or [])}
 
 
+        # Имена всех EntityType — по ним отличается независимый регистр от регистраторного:
+        # у регистраторного рядом лежит <Имя>_RecordType, у независимого его нет (см. ниже).
+        entity_type_names = {i.get('@Name') for i in metadata_entity_types}
+
         for item in metadata_entity_types:
 
             item_name = item.get('@Name')
@@ -321,6 +366,28 @@ class MetadataReader1C(UserDict):
             if item_name.startswith(REGISTER_TYPES) and item_name.endswith("_RecordType"):
             # регистр с постфиксом RecordType содержит описание полей регистра и описание ключа
                 item_name = item_name.removesuffix("_RecordType")
+                properties = self._read_metadata_item_properties(item, item_name)
+                primary_key = self._read_metadata_item_key(item,properties)
+                object_key = self._get_object_key(item_name, properties, primary_key)
+                dimensions, resources, attributes = _classify_register_fields(
+                    item_name, properties, complextypes)
+                if item_name.startswith(ACCOUNTING_REGISTER_TYPE):
+                    # Колонки субконто заводим ПОСЛЕ классификации: в 1С это измерения, но
+                    # программно ими не пользуются (внутри JSON), и в dimensions им делать нечего.
+                    properties.update({f: EXT_DIMENSIONS_TYPE
+                                       for f in EXT_DIMENSIONS_FIELDS.values()})
+                self[item_name] = MetadataObject1C(item_name, properties, primary_key, object_key,
+                                                   dimensions, resources, attributes)
+
+            elif (item_name.startswith(REGISTER_TYPES)
+                  and not item_name.endswith(METADATA_POSTFIXES)
+                  and item_name + '_RecordType' not in entity_type_names):
+            # Независимый регистр сведений: _RecordType 1С для него не публикует, поля и ключ
+            # (измерения + Period, если регистр периодический) лежат прямо в самом EntityType.
+            # Проверка именно на ОТСУТСТВИЕ соседнего _RecordType, а не на состав полей: у
+            # регистраторного регистра EntityType без постфикса тоже есть, но описывает он не
+            # запись, а набор записей регистратора (Recorder + коллекция RecordSet), и брать
+            # ключ оттуда нельзя.
                 properties = self._read_metadata_item_properties(item, item_name)
                 primary_key = self._read_metadata_item_key(item,properties)
                 object_key = self._get_object_key(item_name, properties, primary_key)

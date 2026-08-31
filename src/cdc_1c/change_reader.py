@@ -3,7 +3,7 @@ import requests
 import xmltodict
 
 from cdc_1c.data_reader import DataReader1C
-from cdc_1c.metadata_reader import MetadataReader1C, resolve_timeout
+from cdc_1c.metadata_reader import ACCOUNTING_REGISTER_TYPE, MetadataReader1C, resolve_timeout
 from cdc_1c.common_functions import format_bytes, raise_for_status
 from cdc_1c.logging_config import get_logger
 
@@ -40,6 +40,12 @@ class ChangeReader1C(DataReader1C):
         change_entries = (change_data.get('feed') or {}).get('entry') or []
 
         parsed = self.read_data_entries(change_entries)
+        # Пакет приносит набор записей регистра бухгалтерии БЕЗ субконто (их нет в описании
+        # движения вовсе) — дочитываем их отдельным запросом по периодам пакета, иначе колонки
+        # приехали бы пустыми и затёрли аналитику, полученную полной выгрузкой.
+        for object_name in list(self.keys()):
+            if object_name.startswith(ACCOUNTING_REGISTER_TYPE):
+                self.fill_ext_dimensions(object_name)
         # Одна строка на пакет: что пришло, сколько строк и сколько весил ответ. Раньше лог писался
         # на каждую entry, и один пакет давал сотни одинаковых строк.
         logger.info("Read changes (message %s): %s entries, %s rows, %s%s",

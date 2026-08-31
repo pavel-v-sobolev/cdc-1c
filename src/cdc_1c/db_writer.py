@@ -1,8 +1,9 @@
 
 from datetime import datetime
 
-from sqlalchemy import (Engine, Index, MetaData, Table, Integer, Numeric,
+from sqlalchemy import (Engine, Index, JSON, MetaData, Table, Integer, Numeric,
                         tuple_, select, or_, and_, exists)
+from sqlalchemy.dialects.postgresql import JSONB
 from dbmerge import dbmerge, mergeResult
 
 from cdc_1c.data_reader import (DataObject1C, EXCHANGE_MESSAGE_NO_FIELD,
@@ -12,6 +13,10 @@ from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+# Диалекты, где JSON-колонку надо объявлять как JSONB (см. save): у postgres-типа json нет
+# оператора сравнения, и dbmerge на нём отказывается писать. Список — как в dbmerge.
+JSONB_DIALECTS = ('postgresql', 'cockroachdb')
 
 # Служебные поля, которыми управляет dbmerge (момент merge/первой вставки строки).
 MERGED_ON_FIELD = 'merged_on'
@@ -23,7 +28,8 @@ INSERTED_ON_FIELD = 'inserted_on'
 # по префиксу. Состав ссылочных классов — см. ENTITY_TYPES в metadata_reader.
 SAVE_ORDER_PREFIXES = ('Catalog', 'ChartOfCharacteristicTypes', 'ChartOfAccounts',
                        'ChartOfCalculationTypes', 'BusinessProcess', 'Task',
-                       'Document', 'InformationRegister', 'AccumulationRegister')
+                       'Document', 'InformationRegister', 'AccumulationRegister',
+                       'AccountingRegister')
 
 
 def save_order_key(object_name: str) -> int:
@@ -108,6 +114,12 @@ class DBWriter1C:
         key = [self.name_mapper.map_field_name(k) for k in metadata_obj.primary_key]
         data_types = {self.name_mapper.map_field_name(col): typ
                       for col, typ in metadata_obj.get_column_types().items()}
+        # JSON-колонку (субконто регистра бухгалтерии) на postgres поднимаем до JSONB: dbmerge
+        # сравнивает старое значение с новым через IS DISTINCT FROM, а у типа json такого
+        # оператора нет — с обычным JSON он откажется писать вовсе.
+        if self.engine.dialect.name in JSONB_DIALECTS:
+            data_types = {col: JSONB() if isinstance(typ, JSON) and not isinstance(typ, JSONB)
+                          else typ for col, typ in data_types.items()}
 
         object_key = metadata_obj.object_key
         started_at = full_load_started_at
