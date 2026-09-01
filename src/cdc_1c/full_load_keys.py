@@ -121,21 +121,34 @@ class FullLoadKeys:
         merged_on = target.c['merged_on']
         return or_(merged_on.is_(None), merged_on < started_at)
 
-    def missing_rows(self, target: Table, started_at, mark_field: str) -> list[dict]:
+    def missing_rows(self, target: Table, started_at, mark_field: str,
+                     scope=None) -> list[dict]:
         """
         Ключи строк-кандидатов на пометку: не встретились в прогоне, ещё не помечены и не переписаны
         после старта прогона (тот же guard по merged_on, что и у самой выгрузки, — строку, которую
         изменения переписали уже во время прогона, снимок трогать не вправе).
+
+        scope — необязательное условие «строка входит в то, что прогон вообще читал». Нужно
+        выгрузке за период: она видела только своё окно, и без такого ограничения кандидатом
+        оказалась бы вся остальная таблица. См. Replicator1C._marking_scope.
         """
         query = (select(*(target.c[c] for c in self.key_columns))
-                 .where(and_(self._older_than_run(target, started_at),
-                             not_(target.c[mark_field].is_(True)),
-                             self._not_seen(target))))
+                 .where(and_(*self._conditions(target, started_at, mark_field, scope))))
         with self.engine.connect() as conn:
             return [dict(row) for row in conn.execute(query).mappings()]
 
+    def _conditions(self, target: Table, started_at, mark_field: str, scope) -> list:
+        """Условия отбора кандидатов — одни и те же у missing_rows и mark_missing: разойдись они,
+        перепроверенный список и то, что реально помечается, описывали бы разные множества."""
+        conditions = [self._older_than_run(target, started_at),
+                      not_(target.c[mark_field].is_(True)),
+                      self._not_seen(target)]
+        if scope is not None:
+            conditions.append(scope)
+        return conditions
+
     def mark_missing(self, target: Table, started_at, mark_field: str,
-                     reset_values: dict | None = None) -> int:
+                     reset_values: dict | None = None, scope=None) -> int:
         """
         Помечает строки-кандидаты (см. missing_rows) и поднимает им merged_on.
 
@@ -145,9 +158,7 @@ class FullLoadKeys:
         """
         values = {mark_field: True, 'merged_on': func.now(), **(reset_values or {})}
         statement = (update(target)
-                     .where(and_(self._older_than_run(target, started_at),
-                                 not_(target.c[mark_field].is_(True)),
-                                 self._not_seen(target)))
+                     .where(and_(*self._conditions(target, started_at, mark_field, scope)))
                      .values(**values))
         with self.engine.begin() as conn:
             return conn.execute(statement).rowcount

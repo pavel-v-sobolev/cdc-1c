@@ -488,7 +488,10 @@ class MetadataReader1C(UserDict):
                 'fields_en': [mapper.map_field_name(f) for f in field_names],
                 # эти значения устанавливаются только при insert, из update они исключены
                 'full_load_is_required': False, 'last_full_load_dt': None,
-                'last_full_load_rows_modified': None, 'last_full_load_minutes': None})
+                'last_full_load_rows_modified': None, 'last_full_load_minutes': None,
+                # Захват объекта под выгрузку (см. full_load_claim): ставится и снимается только
+                # тем, кто выгружает, поэтому здесь — лишь значения для вставки новой строки.
+                'full_load_owner': None, 'full_load_heartbeat_at': None})
             
         with dbmerge(engine=self.engine, table_name=METADATA_OBJECTS_TABLE, data=data,
                      key=['object_full_name'], delete_mode='delete', 
@@ -503,11 +506,15 @@ class MetadataReader1C(UserDict):
                                  'full_load_is_required': Boolean(),
                                  'last_full_load_dt': DateTime(),
                                  'last_full_load_rows_modified': Integer(),
-                                 'last_full_load_minutes': Float()
+                                 'last_full_load_minutes': Float(),
+                                 'full_load_owner': String(),
+                                 'full_load_heartbeat_at': DateTime()
                                  },
                      skip_update_fields=['full_load_is_required', 'last_full_load_dt',
                                          'last_full_load_rows_modified',
-                                         'last_full_load_minutes']) as merge:
+                                         'last_full_load_minutes',
+                                         'full_load_owner',
+                                         'full_load_heartbeat_at']) as merge:
             merge.exec()
             self.objects_table = merge.table   # Table-описание созданной/существующей таблицы
 
@@ -538,6 +545,27 @@ class MetadataReader1C(UserDict):
             with self.engine.begin() as conn:
                 conn.execute(update(table).where(table.c.object_full_name == object_full_name)
                              .values(full_load_is_required=True))
+
+    def was_fully_loaded(self, object_full_name: str) -> bool:
+        """
+        Выгружался ли объект целиком хоть раз (last_full_load_dt заполнен).
+
+        Отметка лежит в БД, а не в памяти процесса, поэтому переживает перезапуск: расписание,
+        поднятое заново, не станет перечитывать историю второй раз. Строки в реестре нет — считаем,
+        что не выгружался: реестр синхронизируется с $metadata, и её отсутствие значит «объекта ещё
+        не видели», а не «уже загружен».
+        """
+        table = self.objects_table
+        if table is None:
+            # Реестр создаётся первой синхронизацией метаданных (get_metadata → _sync_objects), и
+            # к этому моменту он обычно уже есть: расписание грузит метаданные, разбирая имена.
+            # Если всё же нет — сведений о выгрузке у нас нет, и безопаснее считать, что её не было:
+            # лишний раз прочитать объект целиком дешевле, чем не собрать историю вовсе.
+            return False
+        with self.engine.connect() as conn:
+            row = conn.execute(select(table.c.last_full_load_dt)
+                               .where(table.c.object_full_name == object_full_name)).first()
+        return row is not None and row.last_full_load_dt is not None
 
     def list_full_load_required(self) -> list[str]:
         """Полные имена объектов, ожидающих полной выгрузки (full_load_is_required)."""

@@ -662,7 +662,7 @@ def test_update_flag_survives_a_failed_run(db):
 def test_dead_replicator_does_not_freeze_the_boundary(db):
     # Строки брошенного процесса не должны морозить границу навсегда: раз процесса нет, его
     # транзакции откатились. Отсекаем по отметке живости.
-    from cdc_1c.handlers import HEARTBEAT_TTL, WriteTracker
+    from cdc_1c.handlers import MERGE_HEARTBEAT_TTL, WriteTracker
 
     tracker = WriteTracker(db.engine, db.schema, 'dead-replicator')
     tracked = tracker.track("Catalog_Nomenklatura")
@@ -671,7 +671,7 @@ def test_dead_replicator_does_not_freeze_the_boundary(db):
     # Отматываем отметку живости за TTL — как будто процесс умер и перестал её обновлять.
     with db.engine.begin() as conn:
         conn.execute(tracker.table.update().values(
-            heartbeat_at=tracked.started_at - timedelta(seconds=HEARTBEAT_TTL + 60)))
+            heartbeat_at=tracked.started_at - timedelta(seconds=MERGE_HEARTBEAT_TTL + 60)))
 
     assert tracker.boundary(["Catalog_Nomenklatura"]) > tracked.started_at
 
@@ -679,13 +679,13 @@ def test_dead_replicator_does_not_freeze_the_boundary(db):
 def test_abandoned_rows_of_a_gone_replicator_are_removed(db):
     # Брошенные строки при расчёте границы игнорируются, но удалить их некому: процесс может не
     # вернуться никогда — репликатор переименовали или выключили. Иначе они копились бы вечно.
-    from cdc_1c.handlers import ABANDONED_TTL, WriteTracker
+    from cdc_1c.handlers import MERGE_ABANDONED_TTL, WriteTracker
 
     gone = WriteTracker(db.engine, db.schema, 'renamed-away')
     tracked = gone.track("Catalog_Nomenklatura")
     with db.engine.begin() as conn:
         conn.execute(gone.table.update().values(
-            heartbeat_at=tracked.started_at - timedelta(seconds=ABANDONED_TTL + 60)))
+            heartbeat_at=tracked.started_at - timedelta(seconds=MERGE_ABANDONED_TTL + 60)))
 
     # Уборка идёт при старте любого другого трекера — своего процесса у брошенного уже нет.
     WriteTracker(db.engine, db.schema, 'План1')
@@ -717,11 +717,11 @@ def test_restart_forgets_own_stale_writes(db):
 def test_merge_heartbeat_works_without_a_replication_loop(db, monkeypatch):
     # Отметку живости раньше вёл только run_forever репликатора. Но строки реестра появляются и в
     # одиночном run_once, и в вызванном руками full_load — там цикла нет вовсе, и merge, идущий
-    # дольше HEARTBEAT_TTL, признавался бы брошенным: обработчик перешагнул бы его строки.
+    # дольше MERGE_HEARTBEAT_TTL, признавался бы брошенным: обработчик перешагнул бы его строки.
     from cdc_1c import write_tracker as tracker_module
-    from cdc_1c.handlers import HEARTBEAT_TTL
+    from cdc_1c.handlers import MERGE_HEARTBEAT_TTL
 
-    monkeypatch.setattr(tracker_module, 'HEARTBEAT_PERIOD', 0.05)
+    monkeypatch.setattr(tracker_module, 'MERGE_HEARTBEAT_PERIOD', 0.05)
     tracker = WriteTracker(db.engine, db.schema, 'План1')
     try:
         with tracker.track("Catalog_Nomenklatura") as tracked:
@@ -729,7 +729,7 @@ def test_merge_heartbeat_works_without_a_replication_loop(db, monkeypatch):
             # брошенным и границу больше не держит.
             with db.engine.begin() as conn:
                 conn.execute(tracker.table.update().values(
-                    heartbeat_at=tracked.started_at - timedelta(seconds=HEARTBEAT_TTL + 60)))
+                    heartbeat_at=tracked.started_at - timedelta(seconds=MERGE_HEARTBEAT_TTL + 60)))
 
             deadline = time.monotonic() + 10
             beat = None
@@ -755,7 +755,7 @@ def test_heartbeat_thread_is_started_once(db, monkeypatch):
 
     from cdc_1c import write_tracker as tracker_module
 
-    monkeypatch.setattr(tracker_module, 'HEARTBEAT_PERIOD', 0.05)
+    monkeypatch.setattr(tracker_module, 'MERGE_HEARTBEAT_PERIOD', 0.05)
     tracker = WriteTracker(db.engine, db.schema, 'План1')
     started = threading.Barrier(4)
 
@@ -788,7 +788,7 @@ def test_the_heartbeat_thread_goes_away_when_nothing_is_in_flight(db, monkeypatc
 
     from cdc_1c import write_tracker as tracker_module
 
-    monkeypatch.setattr(tracker_module, 'HEARTBEAT_PERIOD', 0.01)
+    monkeypatch.setattr(tracker_module, 'MERGE_HEARTBEAT_PERIOD', 0.01)
     tracker = WriteTracker(db.engine, db.schema, 'План1')
     try:
         with tracker.track("Catalog_Nomenklatura"):

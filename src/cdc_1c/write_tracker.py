@@ -24,18 +24,20 @@ from cdc_1c.logging_config import get_logger
 logger = get_logger(__name__)
 
 # Реестр идущих merge (WriteTracker). Репликатор обновляет отметку живости своих строк
-# не реже HEARTBEAT_PERIOD; строки, чья отметка старше HEARTBEAT_TTL, считаются брошенными —
+# не реже MERGE_HEARTBEAT_PERIOD; строки, чья отметка старше MERGE_HEARTBEAT_TTL, считаются
+# брошенными —
 # процесс, который их завёл, умер, а вместе с ним откатились и его транзакции, так что держать по
 # ним границу больше не нужно. TTL с запасом больше периода: разовая задержка не должна выглядеть
 # как смерть процесса.
 WRITES_TABLE = "writes_in_process_1c"
-HEARTBEAT_PERIOD = 20.0
-HEARTBEAT_TTL = 90.0
+MERGE_HEARTBEAT_PERIOD = 20.0
+MERGE_HEARTBEAT_TTL = 90.0
 # Через сколько строка брошенного процесса не просто игнорируется при расчёте границы, а удаляется.
 # Нужно потому, что процесс может не вернуться никогда: репликатор переименовали (сменился
 # exchange_name) или выключили совсем — его строки иначе остались бы в таблице навсегда. С запасом
-# больше HEARTBEAT_TTL: удалять то, что ещё держит границу, нельзя ни при каких обстоятельствах.
-ABANDONED_TTL = 3600.0
+# больше MERGE_HEARTBEAT_TTL: удалять то, что ещё держит границу, нельзя ни при каких
+# обстоятельствах.
+MERGE_ABANDONED_TTL = 3600.0
 
 
 class _TrackedWrite:
@@ -62,7 +64,7 @@ def _writes_table(metadata: MetaData, schema_name: str | None) -> Table:
         Column("object_name", String(255), nullable=False),
         # Момент старта merge по часам БД — то, к чему прижимается граница окна обработчика.
         Column("started_at", DateTime, nullable=False),
-        # Отметка живости: обновляется, пока процесс жив (см. HEARTBEAT_TTL).
+        # Отметка живости: обновляется, пока процесс жив (см. MERGE_HEARTBEAT_TTL).
         Column("heartbeat_at", DateTime, nullable=False),
         schema=schema_name,
     )
@@ -81,13 +83,14 @@ class WriteTracker:
 
     Брошенные строки (процесс умер между вставкой и удалением) отсекаются по отметке живости: раз
     процесса нет, его транзакции откатились, и держать по ним границу незачем. Поэтому падение
-    репликатора обработчиков не морозит — максимум на HEARTBEAT_TTL.
+    репликатора обработчиков не морозит — максимум на MERGE_HEARTBEAT_TTL.
 
     Отметку живости обновляет сам реестр, своим потоком. Именно реестр, а не цикл репликации:
     строки появляются в любом сценарии, включая одиночный run_once и вызванный руками full_load,
     а цикла в этих сценариях нет. Без этого одна страница выгрузки, считающаяся дольше
-    HEARTBEAT_TTL, признавалась бы брошенной — и обработчик молча перешагнул бы её строки. Поток
-    отдельный ещё и потому, что merge и сам может идти дольше HEARTBEAT_TTL: обновлять отметку
+    MERGE_HEARTBEAT_TTL, признавалась бы брошенной — и обработчик молча перешагнул бы её строки.
+    Поток
+    отдельный ещё и потому, что merge и сам может идти дольше MERGE_HEARTBEAT_TTL: обновлять отметку
     между merge поздно.
     """
 
@@ -137,7 +140,7 @@ class WriteTracker:
                 self.heartbeat()
             except Exception:
                 logger.exception("Merge heartbeat failed")
-            self._closed.wait(HEARTBEAT_PERIOD)
+            self._closed.wait(MERGE_HEARTBEAT_PERIOD)
             with self._lock:
                 if self._active == 0:
                     self._heartbeat_thread = None
@@ -148,9 +151,9 @@ class WriteTracker:
         Уборка при старте — двух видов строк.
 
         Свои, от прошлого запуска: транзакции того процесса давно откатились, и ждать по ним
-        HEARTBEAT_TTL после каждого рестарта незачем.
+        MERGE_HEARTBEAT_TTL после каждого рестарта незачем.
 
-        Чужие брошенные, старше ABANDONED_TTL: при расчёте границы они и так игнорируются, но
+        Чужие брошенные, старше MERGE_ABANDONED_TTL: при расчёте границы они и так игнорируются, но
         удалить их некому — процесс может не вернуться никогда (репликатор переименовали или
         выключили). Без этой уборки они копились бы в таблице вечно.
         """
@@ -159,7 +162,7 @@ class WriteTracker:
             now = conn.scalar(select(func.now()))
             result = conn.execute(t.delete().where(or_(
                 t.c.owner == self.owner,
-                t.c.heartbeat_at < now - timedelta(seconds=ABANDONED_TTL))))
+                t.c.heartbeat_at < now - timedelta(seconds=MERGE_ABANDONED_TTL))))
         if result.rowcount:
             logger.info("Removed %s stale rows from %s", result.rowcount, WRITES_TABLE)
 
@@ -205,7 +208,7 @@ class WriteTracker:
         earliest = (select(func.min(t.c.started_at))
                     .where(t.c.object_name.in_(list(object_names)),
                            t.c.heartbeat_at > DB_NOW_WITHOUT_TIMEZONE
-                           - timedelta(seconds=HEARTBEAT_TTL))
+                           - timedelta(seconds=MERGE_HEARTBEAT_TTL))
                     .scalar_subquery())
         with self.engine.connect() as conn:
             now, earliest = conn.execute(select(DB_NOW_WITHOUT_TIMEZONE, earliest)).one()

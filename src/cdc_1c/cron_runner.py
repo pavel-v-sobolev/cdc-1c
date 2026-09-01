@@ -14,6 +14,7 @@ request_stop().
 """
 
 import threading
+import time
 from datetime import date, datetime, timedelta
 
 from croniter import croniter
@@ -50,9 +51,21 @@ class FullLoadCron:
     прогон разводится claim'ом: занятый объект — срабатывание пропускается, ждём следующего по
     расписанию. Догонять пропущенное незачем: следующий прогон прочитает тот же период заново.
 
-    mark_missing=True — пометить строки, которых в 1С больше нет (физическое удаление объекта в
-    обмен не приходит вовсе, см. full_load). При заданном периоде кандидаты перед пометкой
-    перепроверяются в 1С: из окна строка могла уехать, а не исчезнуть.
+    Пометка пропавших строк включена ВСЕГДА и параметром не управляется. Физическое удаление в
+    обмен не приходит вовсе, а у независимого регистра нет и регистратора, по которому можно было
+    бы удалить набор, — поэтому расписание остаётся единственным местом, где удаление вообще
+    видно. Выключить его значило бы тихо сломать всё, что построено поверх: витрина замечает
+    изменения по merged_on, а у неудалённой строки он не двигается. Помечается только то, что
+    прогон читал: при заданном периоде — строки этого периода, и каждая перед пометкой
+    перепроверяется в 1С (из окна строка могла уехать, а не исчезнуть).
+
+    full_history_on_first_run — первый прогон идёт БЕЗ границ периода, то есть читает объект
+    целиком. Иначе объекта, которого нет в плане обмена, не появится вовсе: полную выгрузку по
+    флагу full_load_is_required репликатор заводит только тем, кто пришёл в пакете изменений
+    (Replicator1C._save_changes → require_full_load_if_new), а такой объект в пакете не появляется
+    никогда. Скользящее окно при этом собирало бы только свежий хвост, и история не приехала бы.
+    Признак «уже выгружался» — last_full_load_dt в metadata_objects_1c: он в БД, поэтому
+    перезапуск процесса историю заново не перечитывает.
 
     Время локальное — в контейнере задавайте TZ, иначе "0 3 * * *" сработает по UTC.
     """
@@ -60,7 +73,7 @@ class FullLoadCron:
     def __init__(self, replicator, table_name: str, *, cron: str,
                  date_field: str | None = None,
                  date_from: DateBound = None, date_to: DateBound = None,
-                 batch_size: int = 1000, mark_missing: bool = False):
+                 batch_size: int = 1000, full_history_on_first_run: bool = True):
         # Перехват SIGTERM/SIGINT — по той же причине, что у Replicator1C и HandlerLoop: run_forever
         # уходит в пул потоков, а поставить перехват можно только из главного (см. stop_signal).
         install_signal_handlers(quiet=False)
@@ -80,9 +93,9 @@ class FullLoadCron:
         self.date_from = date_from
         self.date_to = date_to
         self.batch_size = batch_size
-        # Помечать строки, которых в 1С не оказалось (см. full_load). По умолчанию выключено:
-        # прогон становится дороже, а нужно это не всем.
-        self.mark_missing = mark_missing
+        # Первый прогон — без границ периода (см. класс). Отключать стоит только там, где история
+        # заведомо не нужна и её чтение неприемлемо дорого.
+        self.full_history_on_first_run = full_history_on_first_run
 
         # Разрешённые имена 1С (объект и поле даты): требуют $metadata, то есть сетевого запроса,
         # поэтому считаются при первом прогоне — конструкторы в проекте в сеть не ходят.
@@ -152,9 +165,29 @@ class FullLoadCron:
                 return 0
             date_from = _bound(self.date_from)
             date_to = _bound(self.date_to)
+            # Первый прогон — объект целиком: границы снимаем (см. класс). Проверяем это ВНУТРИ
+            # claim, чтобы отметка о выгрузке не успела появиться между проверкой и прогоном.
+            first_run = (self.full_history_on_first_run
+                         and (date_from is not None or date_to is not None)
+                         and not self.replicator.metadata.was_fully_loaded(object_name))
+            if first_run:
+                logger.info("Full load of %s has never run: reading the whole object once, "
+                            "ignoring the configured period", self.table_name)
+                date_from = date_to = None
+            started = time.monotonic()
             rows_modified = self.replicator.full_load(
                 object_name, batch_size=self.batch_size, date_field=date_field,
-                date_from=date_from, date_to=date_to, mark_missing=self.mark_missing)
+                date_from=date_from, date_to=date_to)
+            if first_run:
+                # Прогон прочитал объект ЦЕЛИКОМ — это и есть полная выгрузка, и отметить её надо
+                # ровно так же, как её отмечает фоновый воркер репликатора. Без этого
+                # was_fully_loaded осталась бы ложной, и КАЖДОЕ следующее срабатывание снова читало
+                # бы всю историю. Обычный прогон за период реестр не трогает: объект целиком он не
+                # читал, и объявлять его выгруженным нельзя — это отменило бы фоновую выгрузку,
+                # которая ещё должна собрать базу.
+                self.replicator.metadata.mark_full_loaded(
+                    object_name, rows_modified=rows_modified,
+                    minutes=round((time.monotonic() - started) / 60, 3))
         logger.info("Scheduled full load of %s (%s..%s) modified %s rows",
                     self.table_name, date_from or '', date_to or '', rows_modified)
         return rows_modified

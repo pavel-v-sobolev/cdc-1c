@@ -1,5 +1,8 @@
 import functools
+import os
 import re
+import socket
+import uuid
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -9,14 +12,15 @@ from urllib.parse import quote
 
 import requests
 from dbmerge import mergeResult
-from sqlalchemy import Engine, Integer, Numeric
+from sqlalchemy import Engine, Integer, Numeric, and_
 from sqlalchemy.exc import NoSuchTableError, OperationalError
 
-from cdc_1c.metadata_reader import ACCOUNTING_REGISTER_TYPE, MetadataReader1C
+from cdc_1c.metadata_reader import ACCOUNTING_REGISTER_TYPE, MetadataReader1C, type_mapping
 from cdc_1c.common_functions import format_duration, odata_datetime_value
 from cdc_1c.data_reader import (DataReader1C, IS_DELETED_OR_EMPTY_FIELD, ODATA_PREFIX,
                                 RECORDER_FIELDS, _odata_literal)
 from cdc_1c.change_reader import ChangeReader1C
+from cdc_1c.full_load_claim import FullLoadClaim
 from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.db_writer import DBWriter1C, save_order_key
 from cdc_1c.db_logs import Replicator1CLog, LOAD_TYPE_CHANGES, LOAD_TYPE_FULL
@@ -494,11 +498,10 @@ class Replicator1C:
                                          temp_schema=self.db_temp_schema)
         self.name_mapper = NameMapper1C()
 
-        # Фоновая полная выгрузка: пул потоков и защита от повторного сабмита одного объекта.
+        # Фоновая полная выгрузка: пул потоков.
         self._full_load_workers = _check_full_load_workers(full_load_workers)
-        self._full_load_in_progress: set[str] = set()
         # Размер страницы, который 1С реально осилила по этому объекту (см. FULL_LOAD_MIN_BATCH).
-        # Пишет только поток самой выгрузки, а он на объект один (_full_load_in_progress).
+        # Пишет только поток самой выгрузки, а он на объект один (захват не пускает второго).
         self._full_load_page_size: dict[str, int] = {}
         # Потолок размера страницы по объекту: ставится отказом 1С и только опускается. Нужен
         # потому, что подбор по весу ответа (_next_page_size) причину отказа не видит и вернул бы
@@ -509,7 +512,12 @@ class Replicator1C:
         # (см. RECHECK_MAX_QUERY_BYTES и _still_in_1c). Общий на все объекты: ограничение стоит
         # перед 1С, а не внутри неё, и от объекта не зависит.
         self._recheck_query_budget = RECHECK_MAX_QUERY_BYTES - RECHECK_QUERY_RESERVE_BYTES
-        self._in_progress_lock = threading.Lock()
+        # Захват объекта под выгрузку (см. full_load_claim): не пускает второго ни в этом процессе,
+        # ни в чужом. Репликатор и расписание могут быть подняты в разных контейнерах, поэтому
+        # заслон только один и только в БД — множество в памяти их бы не развело.
+        self._full_load_claim = FullLoadClaim(
+            engine, lambda: self.metadata.objects_table,
+            owner=f'{exchange_name}:{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}')
         self.changes = ChangeReader1C(self._odata_url, self._exchange_name, self._queue_guid,
                                       self.metadata, odata_auth=self._odata_auth,
                                       request_timeout=self._request_timeout)
@@ -656,7 +664,7 @@ class Replicator1C:
                   date_field: str | None = None,
                   date_from: date | datetime | str | None = None,
                   date_to: date | datetime | str | None = None,
-                  mark_missing: bool = False) -> int:
+                  mark_missing: bool = True) -> int:
         """
         Полная постраничная выгрузка объекта 1С в целевую таблицу: страницами, размер которых
         подбирается по их весу (batch_size — лишь верхняя граница, см. ниже), и каждая страница
@@ -696,14 +704,20 @@ class Replicator1C:
         всё это оборачивается в лямбду по вложенной коллекции — см. _build_date_filter) и
         объединяется с keyset-курсором по AND. Полезно для ручной догрузки за нужный период.
 
-        mark_missing=True — пометить строки, которых в 1С не оказалось (см. full_load_keys). Нужно
+        mark_missing — пометить строки, которых в 1С не оказалось (см. full_load_keys). Нужно
         затем, что физическое удаление объекта в обмен не приходит вовсе, и такая строка иначе
         остаётся в таблице навсегда. Ключи прогона копятся в отдельной таблице, и после успешного
         завершения строки, которых там нет, помечаются (is_deleted_or_empty), а не удаляются:
-        обработчик замечает изменение только по merged_on. Если задан период, каждый кандидат перед
-        пометкой перепроверяется запросом в 1С — из окна он мог не исчезнуть, а уехать (у документа
-        изменилась дата, у независимого регистра — поле ключа). По умолчанию выключено: прогон
-        становится дороже, а нужен он не всем.
+        обработчик замечает изменение только по merged_on.
+
+        ПО УМОЛЧАНИЮ ВКЛЮЧЕНО. Выключать стоит осознанно: без пометки удалённые строки остаются в
+        таблице навсегда, а витрина, построенная поверх, не увидит удаления вообще — и разойдётся
+        с источником молча. Плата за пометку — таблица ключей на прогон и один UPDATE в конце.
+
+        Область пометки — то, что прогон читал: выгрузка за период помечает только строки этого
+        периода (см. _marking_scope). Внутри неё каждый кандидат перед пометкой ещё и
+        перепроверяется запросом в 1С: из окна строка могла не исчезнуть, а уехать (у документа
+        изменилась дата, у независимого регистра — поле ключа).
 
         Возвращает число РЕАЛЬНО изменённых строк (вставлено + обновлено + удалено, по всем
         страницам и вложенным объектам). Это проверка самого CDC: если изменения доезжают исправно,
@@ -814,7 +828,10 @@ class Replicator1C:
                 # объявил бы «пропавшим» весь непрочитанный хвост объекта.
                 rows_modified += self._mark_missing_rows(
                     object_name, keys, started_at, reader,
-                    recheck=date_filter is not None or windowed, log_id=log_id)
+                    recheck=date_filter is not None or windowed, log_id=log_id,
+                    date_column=(self.name_mapper.map_field_name(date_field)
+                                 if date_field else None),
+                    date_from=date_from, date_to=date_to)
         self.replicator_log.write_result(log_id, finish=True)
         logger.info("Full load of %s finished (%s records, %s rows modified)",
                     object_name, total, rows_modified)
@@ -858,7 +875,7 @@ class Replicator1C:
             # merge-транзакции, а коммитится позже: чужой merge, начавшийся до нашего чтения и
             # закоммиченный после, оставил бы merged_on левее «сейчас», guard счёл бы строку
             # старой, и снимок затёр бы свежее изменение. Брошенные строки реестра границу не
-            # держат — их отсекает отметка живости (HEARTBEAT_TTL), поэтому умерший процесс
+            # держат — их отсекает отметка живости (MERGE_HEARTBEAT_TTL), поэтому умерший процесс
             # тормозит выгрузку максимум на TTL, а не навсегда. Свои же записи помехой не
             # становятся: строка реестра живёт до коммита, а страницы пишутся последовательно —
             # к этому моменту нашей строки в реестре уже нет.
@@ -1135,12 +1152,18 @@ class Replicator1C:
                                    and not self._is_accounting_register(object_name)))
 
     def _primary_key_columns(self, object_name: str) -> dict:
-        """Первичный ключ объекта в терминах целевой таблицы: {колонка: тип SQLAlchemy}. По нему
-        собираются ключи прогона и по нему же идёт анти-join пометки."""
+        """
+        Первичный ключ объекта в терминах целевой таблицы: {колонка: тип SQLAlchemy}. По нему
+        собираются ключи прогона и по нему же идёт анти-join пометки.
+
+        Типы берём из самого primary_key, а не из полного набора полей: там лежат те же имена типов
+        1С (см. MetadataReader1C._read_metadata_item_key), но набор гарантированно полный. У полей
+        ключа, собранных не из $metadata напрямую, соответствия в списке полей может не быть —
+        и обращение по ключу роняло бы прогон.
+        """
         metadata_obj = self.metadata.get(object_name)
-        column_types = metadata_obj.get_column_types()
-        return {self.name_mapper.map_field_name(field): column_types[field]
-                for field in metadata_obj.primary_key}
+        return {self.name_mapper.map_field_name(field): type_mapping[type_name]
+                for field, type_name in metadata_obj.primary_key.items()}
 
     def _full_load_keys(self, object_name: str) -> FullLoadKeys:
         """Одноразовая таблица ключей прогона (см. full_load_keys)."""
@@ -1161,7 +1184,10 @@ class Replicator1C:
                 for i in range(data_object.data_length)]
 
     def _mark_missing_rows(self, object_name: str, keys: FullLoadKeys, started_at,
-                           reader: DataReader1C, recheck: bool, log_id: int | None = None) -> int:
+                           reader: DataReader1C, recheck: bool, log_id: int | None = None,
+                           date_column: str | None = None,
+                           date_from: date | datetime | str | None = None,
+                           date_to: date | datetime | str | None = None) -> int:
         """
         Помечает строки, которых прогон в 1С не увидел, и сообщает об этом обработчикам.
 
@@ -1179,16 +1205,18 @@ class Replicator1C:
                         object_name, table_name)
             return 0
         mark_field = self.name_mapper.map_field_name(IS_DELETED_OR_EMPTY_FIELD)
+        scope = self._marking_scope(target, date_column, date_from, date_to)
         if recheck:
-            candidates = keys.missing_rows(target, started_at, mark_field)
+            candidates = keys.missing_rows(target, started_at, mark_field, scope=scope)
             if candidates:
                 alive = self._still_in_1c(object_name, candidates, reader)
                 logger.info("Full load of %s: %s of %s candidates are still in 1C (moved out of "
                             "the period, not deleted)", object_name, len(alive), len(candidates))
                 keys.add(alive)
         with self.writes.track(table_name):
+            reset_values = self._resource_reset_values(object_name, target)
             marked = keys.mark_missing(target, started_at, mark_field,
-                                       reset_values=self._resource_reset_values(object_name, target))
+                                       reset_values=reset_values, scope=scope)
         if marked:
             logger.info("Full load of %s: %s rows are gone from 1C and were marked deleted",
                         object_name, marked)
@@ -1324,6 +1352,41 @@ class Replicator1C:
         if isinstance(value, (datetime, date)):
             value = odata_datetime_value(value)
         return f"datetime'{value}'"
+
+    @staticmethod
+    def _marking_scope(target, date_column: str | None,
+                       date_from: date | datetime | str | None,
+                       date_to: date | datetime | str | None):
+        """
+        Условие «строка лежит в том же периоде, что читал прогон» — область пометки пропавших строк.
+
+        Без него выгрузка ЗА ПЕРИОД помечала бы всю остальную таблицу: кандидат — это строка, не
+        встреченная в прогоне, а прогон видел только своё окно. Спасала бы их одна перепроверка в
+        1С, а она идёт пачками ключей по длине строки запроса — на регистре в 20 тысяч строк с
+        недельным окном это тысяча лишних запросов КАЖДУЮ ночь.
+
+        Границы повторяют _build_date_filter буква в букву, иначе пометка и загрузка разойдутся на
+        краю окна: чистая дата сверху включает весь день целиком, дата-время сравнивается как есть.
+
+        None — ограничивать нечем: период не задан (прогон прочитал объект целиком, и кандидатом
+        законно становится вся таблица) либо поля даты в целевой таблице нет.
+        """
+        if not date_column or (date_from is None and date_to is None):
+            return None
+        if date_column not in target.c:
+            logger.warning("Marking scope skipped: %s has no column %s",
+                           target.name, date_column)
+            return None
+        column = target.c[date_column]
+        conditions = []
+        if date_from is not None:
+            conditions.append(column >= date_from)
+        if date_to is not None:
+            if isinstance(date_to, date) and not isinstance(date_to, datetime):
+                conditions.append(column < date_to + timedelta(days=1))
+            else:
+                conditions.append(column <= date_to)
+        return and_(*conditions)
 
     def _build_date_filter(self, object_name: str, date_field: str | None,
                            date_from: date | datetime | str | None,
@@ -1542,6 +1605,10 @@ class Replicator1C:
         объекта данные не портят (у каждого снимка свой full_load_started_at, см. DBWriter1C.save),
         но дают 1С двойную работу и две параллельные строки в replicator_1c_log.
 
+        Заслон один и живёт в БД — отметкой в metadata_objects_1c (см. full_load_claim). Множества
+        в памяти процесса тут мало: репликатор и расписание могут работать в разных контейнерах, и
+        памятью их не развести. Занять объект удаётся тому, чей UPDATE изменил строку.
+
         Сам full_load намеренно не охраняется: прямой вызов «выгрузи вот это прямо сейчас» должен
         отрабатывать всегда.
 
@@ -1550,29 +1617,24 @@ class Replicator1C:
         """
         if self.metadata.is_loaded:
             object_full_name = self.metadata.resolve_object_name(object_full_name)
-        with self._in_progress_lock:
-            claimed = object_full_name not in self._full_load_in_progress
-            if claimed:
-                self._full_load_in_progress.add(object_full_name)
+        claimed = self._full_load_claim.claim(object_full_name)
         try:
             yield claimed
         finally:
             if claimed:
-                with self._in_progress_lock:
-                    self._full_load_in_progress.discard(object_full_name)
+                self._full_load_claim.release(object_full_name)
 
     def _dispatch_full_loads(self, executor: ThreadPoolExecutor) -> None:
         """
         Ставит в пул полные выгрузки объектов с full_load_is_required, кроме уже выполняющихся.
-        Защита от повторного сабмита — множество _full_load_in_progress (под локом). Claim берётся
-        здесь, а не внутри задания, чтобы объект не сабмитился повторно, пока ждёт своего воркера;
-        снимается он в _run_full_load (finally).
+
+        Захват берётся ЗДЕСЬ, а не внутри задания: иначе объект сабмитился бы повторно, пока ждёт
+        своего воркера. Снимается он в _run_full_load (finally).
         """
         for object_full_name in self.metadata.list_full_load_required():
-            with self._in_progress_lock:
-                if object_full_name in self._full_load_in_progress:
-                    continue
-                self._full_load_in_progress.add(object_full_name)
+            if not self._full_load_claim.claim(object_full_name):
+                logger.debug("Full load of %s is already claimed, skipping", object_full_name)
+                continue
             executor.submit(self._run_full_load, object_full_name)
 
     @_load_mode_tag(LOAD_MODE_FULL)
@@ -1588,5 +1650,4 @@ class Replicator1C:
         except Exception as exc:
             _log_failure(exc, "Background full_load of %s failed, will retry", object_full_name)
         finally:
-            with self._in_progress_lock:
-                self._full_load_in_progress.discard(object_full_name)
+            self._full_load_claim.release(object_full_name)

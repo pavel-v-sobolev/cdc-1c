@@ -7,7 +7,7 @@
 период кандидат сперва перепроверяется в 1С — из окна он мог уехать, а не исчезнуть.
 """
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 from sqlalchemy import MetaData, Table, select, text
@@ -98,13 +98,52 @@ def test_row_gone_from_1c_is_marked(db, monkeypatch):
     assert after["a"]["merged_on"] == before["a"]["merged_on"]
 
 
-def test_without_flag_nothing_is_marked(db, monkeypatch):
+def test_period_run_marks_only_rows_of_that_period(db, monkeypatch):
+    """
+    Выгрузка ЗА ПЕРИОД читала только своё окно, поэтому и помечать вправе только его.
+
+    Без ограничения кандидатом становилась бы вся остальная таблица, и от пометки её спасала бы
+    одна перепроверка — запрос в 1С на каждую пачку ключей, на каждом ночном прогоне.
+    """
+    rep = _replicator(db)
+    outside = _record(Ref_Key="jan", Val="1", Date=datetime(2026, 1, 15))
+    inside = _record(Ref_Key="jun", Val="2", Date=datetime(2026, 6, 15))
+    _pages(rep, CATALOG, monkeypatch, [[outside, inside]])
+    rep.full_load(CATALOG, batch_size=10)
+
+    # Июньское окно, и 1С отдаёт по нему пусто: июньская строка исчезла. Январская в окно не
+    # входит вовсе — прогон её не видел и судить о ней не может.
+    calls = _pages(rep, CATALOG, monkeypatch, [[]])
+    rep.full_load(CATALOG, batch_size=10, date_field="Date",
+                  date_from=date(2026, 6, 1), date_to=date(2026, 6, 30))
+
+    rows = _rows(db, CATALOG)
+    assert rows["jun"]["is_deleted_or_empty"] is True, 'строка окна исчезла — помечаем'
+    assert rows["jan"]["is_deleted_or_empty"] is False, 'строку вне окна прогон не видел'
+    assert len(calls["recheck"]) <= 1, 'перепроверяются только кандидаты окна, одной пачкой'
+
+
+def test_marking_is_on_by_default(db, monkeypatch):
+    # Умолчание — помечать. Выключенная пометка тихо ломает всё, что построено поверх: витрина
+    # видит изменения по merged_on, а у неудалённой строки он не двигается.
     rep = _replicator(db)
     _pages(rep, CATALOG, monkeypatch, [[_record(Ref_Key="a", Val="1"), _record(Ref_Key="b", Val="2")]])
     rep.full_load(CATALOG, batch_size=10)
 
     _pages(rep, CATALOG, monkeypatch, [[_record(Ref_Key="a", Val="1")]])
-    rep.full_load(CATALOG, batch_size=10)          # по умолчанию mark_missing=False
+    rep.full_load(CATALOG, batch_size=10)
+
+    assert _rows(db, CATALOG)["b"]["is_deleted_or_empty"] is True
+
+
+def test_marking_can_still_be_turned_off(db, monkeypatch):
+    # Выключается только осознанно и только у full_load: у расписания такого параметра нет вовсе.
+    rep = _replicator(db)
+    _pages(rep, CATALOG, monkeypatch, [[_record(Ref_Key="a", Val="1"), _record(Ref_Key="b", Val="2")]])
+    rep.full_load(CATALOG, batch_size=10)
+
+    _pages(rep, CATALOG, monkeypatch, [[_record(Ref_Key="a", Val="1")]])
+    rep.full_load(CATALOG, batch_size=10, mark_missing=False)
 
     assert _rows(db, CATALOG)["b"]["is_deleted_or_empty"] is False
 

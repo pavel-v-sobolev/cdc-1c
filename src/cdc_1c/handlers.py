@@ -109,7 +109,7 @@ from cdc_1c.stop_signal import StopSignal, install_signal_handlers
 # Реестр незавершённых merge переехал в свой модуль (им пользуется и репликатор). Имена
 # реэкспортируются: HandlerLoop прижимает к нему границу окна, а внешний код и тесты импортируют
 # WriteTracker отсюда с первых версий.
-from cdc_1c.write_tracker import (ABANDONED_TTL, HEARTBEAT_PERIOD, HEARTBEAT_TTL, WRITES_TABLE,
+from cdc_1c.write_tracker import (MERGE_ABANDONED_TTL, MERGE_HEARTBEAT_PERIOD, MERGE_HEARTBEAT_TTL, WRITES_TABLE,
                                   WriteTracker, _writes_table)
 
 logger = get_logger(__name__)

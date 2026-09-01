@@ -123,7 +123,10 @@ def test_full_load_register_paging(db, monkeypatch):
             recs.append(uuid.UUID(int=counter["v"]))
         self.clear()
         # две строки движений на регистратора — страница считается по entry (наборам), не по строкам.
-        self[object_name] = DataObject1C(meta, [{"Recorder": r, "LineNumber": ln}
+        # Все поля ключа, а не только читаемые страницей: по ключу собирается снимок прогона
+        # (пометка пропавших строк включена по умолчанию).
+        self[object_name] = DataObject1C(meta, [{"Recorder": r, "LineNumber": ln,
+                                                 "Recorder_Type": "StandardODATA.Document_X"}
                                                 for r in recs for ln in (1, 2)])
         return n
 
@@ -393,18 +396,21 @@ def test_dispatch_runs_full_load_and_marks_loaded(db):
     row = _flag_row(rep, "Catalog_X")
     assert row.full_load_is_required in (False, 0)       # mark_full_loaded снял требование
     assert row.last_full_load_dt is not None             # и проставил дату
-    assert rep._full_load_in_progress == set()           # из «в работе» убрали
+    assert rep._full_load_claim.claim("Catalog_X")        # захват снят — объект снова свободен
 
 
-def test_dispatch_skips_in_progress(db):
-    rep = _replicator(db)
+def test_dispatch_skips_claimed_object(db):
+    # Объект уже кто-то выгружает — повторно не сабмитим. Захват держится в БД, поэтому «кто-то» —
+    # это в том числе другой процесс, а не только соседний поток.
+    rep, other = _replicator(db), _replicator(db)
     rep.metadata._sync_objects(["Catalog_X"])
+    other.metadata._sync_objects(["Catalog_X"])
     rep.metadata.require_full_load_if_new("Catalog_X")
-    rep._full_load_in_progress.add("Catalog_X")          # уже выгружается
+    assert other._full_load_claim.claim("Catalog_X")
 
     ex = _RecordingExecutor()
     rep._dispatch_full_loads(ex)
-    assert ex.submitted == []                            # повторно не сабмитим
+    assert ex.submitted == []
 
 
 def test_build_date_filter(db):
@@ -460,7 +466,9 @@ def test_full_load_accepts_db_names(db, monkeypatch):
     assert captured["object_name"] == "Catalog_Номенклатура"
 
     # Один и тот же объект, названный по-разному, занимает ОДНУ позицию: иначе claim пропустил бы
-    # вторую выгрузку того же объекта (см. Replicator1C.claim_full_load).
+    # вторую выгрузку того же объекта (см. Replicator1C.claim_full_load). Захват живёт в реестре,
+    # поэтому реестр для этой проверки нужен настоящий.
+    rep.metadata._sync_objects(["Catalog_Номенклатура"])
     with rep.claim_full_load("Catalog_Nomenklatura") as first:
         with rep.claim_full_load("Catalog_Номенклатура") as second:
             assert first and not second
@@ -986,7 +994,7 @@ def _mark_missing_spy(rep, monkeypatch):
     интересна, интересен признак recheck — с ним прогон перепроверяет кандидатов в 1С."""
     captured = {}
 
-    def spy(self, object_name, keys, started_at, reader, recheck, log_id=None):
+    def spy(self, object_name, keys, started_at, reader, recheck, log_id=None, **kwargs):
         captured["recheck"] = recheck
         return 0
 
