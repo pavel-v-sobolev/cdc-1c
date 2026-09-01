@@ -27,7 +27,8 @@ def _replicator(db):
                        queue_guid=TEST_QUEUE_GUID, engine=db.engine, db_schema=db.schema)
     rep.metadata.is_loaded = True
     rep.metadata[CATALOG] = MetadataObject1C(
-        CATALOG, {"Ref_Key": "String", "Val": "String"}, {"Ref_Key": "String"}, object_key=None)
+        CATALOG, {"Ref_Key": "String", "Val": "String", "Date": "DateTime"},
+        {"Ref_Key": "String"}, object_key=None)
     # Независимый регистр сведений: ключ составной, регистратора нет — сегодня у него нет вообще
     # никакого механизма удаления, поэтому он здесь и проверяется.
     rep.metadata[REGISTER] = MetadataObject1C(

@@ -411,6 +411,52 @@ class MetadataReader1C(UserDict):
 
     # --- Реестр объектов и состояния полной выгрузки (metadata_objects_1c) ---
 
+    def resolve_object_name(self, name: str) -> str:
+        """
+        Имя объекта 1С по тому, что передал вызывающий: принимается и имя 1С как есть
+        (`Document_ЗаказКлиента`), и имя ТАБЛИЦЫ в БД (`Document_ZakazKlienta`).
+
+        Обе формы — потому что настраивают выгрузку, глядя в базу и в реестр
+        metadata_objects_1c (там имя таблицы лежит в object_full_name_en), а не в конфигуратор,
+        и то же имя стоит у обработчиков в `ON`. Отдельная таблица соответствий не нужна:
+        транслитерация детерминирована, поэтому обратное соответствие ищется перебором.
+
+        Не нашли — ValueError с обеими ожидаемыми формами: прежде такое имя доезжало до середины
+        прогона и падало «no primary key», по которому догадаться было невозможно.
+        """
+        if name in self:
+            return name
+        mapper = NameMapper1C()
+        matches = [candidate for candidate in self if mapper.map_object_name(candidate) == name]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            # Транслит длинного имени усекается с хэшем, так что совпасть у двух объектов он может
+            # только теоретически. Но выбирать тут наугад нельзя: выгрузка ушла бы не в тот объект.
+            raise ValueError(f"Object {name!r} is ambiguous: {', '.join(sorted(matches))}")
+        raise ValueError(f"Object {name!r} not found in 1C metadata; expected a 1C name like "
+                         f"'Document_ЗаказКлиента' or a table name like 'Document_ZakazKlienta' "
+                         f"(see metadata_objects_1c.object_full_name / object_full_name_en)")
+
+    def resolve_field_name(self, object_name: str, field: str) -> str:
+        """
+        Имя поля 1С по имени поля или КОЛОНКИ в БД — то же правило, что у resolve_object_name.
+        object_name должен быть уже разрешён (имя 1С).
+        """
+        fields = self.get(object_name) or {}
+        if field in fields:
+            return field
+        mapper = NameMapper1C()
+        matches = [candidate for candidate in fields if mapper.map_field_name(candidate) == field]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise ValueError(f"Field {field!r} of {object_name} is ambiguous: "
+                             f"{', '.join(sorted(matches))}")
+        raise ValueError(f"Field {field!r} not found in {object_name}; expected a 1C name like "
+                         f"'Дата' or a column name like 'Data' "
+                         f"(see metadata_objects_1c.fields / fields_en)")
+
     def _sync_objects(self, object_names: list[str]) -> None:
         """
         Синхронизирует реестр с актуальным составом $metadata через dbmerge (delete): новые объекты

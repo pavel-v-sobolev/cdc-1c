@@ -534,7 +534,7 @@ class HandlerSignals:
         self._subscriptions: dict[str, list[tuple[str, bool]]] = {}
         self._read_at = 0.0
 
-    def subscribers(self, object_name: str, source: str = SOURCE_CHANGES) -> list[str]:
+    def subscribers(self, table_name: str, source: str = SOURCE_CHANGES) -> list[str]:
         """
         Имена обработчиков, которых это изменение касается: подписаны на таблицу (update_on) и
         согласны на такой источник (on_full_load).
@@ -547,7 +547,7 @@ class HandlerSignals:
             if time.monotonic() - self._read_at > SUBSCRIPTIONS_TTL:
                 self._subscriptions = self._read_subscriptions()
                 self._read_at = time.monotonic()
-            subscribed = self._subscriptions.get(object_name, [])
+            subscribed = self._subscriptions.get(table_name, [])
         if source == SOURCE_FULL_LOAD:
             return [name for name, on_full_load in subscribed if on_full_load]
         return [name for name, _ in subscribed]
@@ -561,11 +561,11 @@ class HandlerSignals:
             rows = conn.execute(
                 select(t.c.name, t.c.update_on, t.c.on_full_load).where(t.c.enabled)).all()
         for name, update_on, on_full_load in rows:
-            for object_name in update_on or ():
-                subscriptions.setdefault(object_name, []).append((name, bool(on_full_load)))
+            for table in update_on or ():
+                subscriptions.setdefault(table, []).append((name, bool(on_full_load)))
         return subscriptions
 
-    def signal(self, object_name: str, source: str) -> None:
+    def signal(self, table_name: str, source: str) -> None:
         """
         Ставит подписчикам таблицы метку сигнала. Подписчиков нет — ничего не делаем.
 
@@ -574,7 +574,7 @@ class HandlerSignals:
         сигнал. С самым ранним сигнал, пришедший в середине прогона, не сдвинул бы значение — и
         был бы снят вместе с обработанными.
         """
-        names = self.subscribers(object_name, source)
+        names = self.subscribers(table_name, source)
         if not names:
             return
         with self.engine.begin() as conn:
@@ -582,9 +582,9 @@ class HandlerSignals:
                          .where(self.table.c.name.in_(names))
                          .values(update_requested_at=DB_NOW_WITHOUT_TIMEZONE))
         logger.info("Changed %s (%s) → update requested for %s",
-                    object_name, source, ', '.join(sorted(names)))
+                    table_name, source, ', '.join(sorted(names)))
 
-    def request_full_rebuild(self, object_name: str, reason: str,
+    def request_full_rebuild(self, table_name: str, reason: str,
                              source: str = SOURCE_CHANGES) -> None:
         """
         Просит подписчиков таблицы собрать витрину заново: ставит full_rebuild_is_required.
@@ -601,7 +601,7 @@ class HandlerSignals:
         бэкфилла отписался (ON_FULL_LOAD=False), нельзя: для отправщика во внешнюю систему
         пересборка — это повторная отправка всего с начала времён, ровно то, чего он и избегал.
         """
-        names = self.subscribers(object_name, source)
+        names = self.subscribers(table_name, source)
         if not names:
             return
         with self.engine.begin() as conn:
@@ -609,7 +609,7 @@ class HandlerSignals:
                          .where(self.table.c.name.in_(names))
                          .values(full_rebuild_is_required=True))
         logger.info("Changed %s (%s) → full rebuild requested for %s",
-                    object_name, reason, ', '.join(sorted(names)))
+                    table_name, reason, ', '.join(sorted(names)))
 
 
 class HandlerLoop:

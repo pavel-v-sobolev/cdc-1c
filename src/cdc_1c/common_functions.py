@@ -1,6 +1,8 @@
 import json
 import re
 
+from datetime import date, datetime
+
 import requests
 from sqlalchemy import DateTime, func
 
@@ -122,6 +124,27 @@ def extract_error_text(body: str) -> str:
         return _one_line(re.sub(r'<[^>]+>', ' ', match.group(1)))
 
     return _one_line(text)
+
+
+def odata_datetime_value(value: "date | datetime") -> str:
+    """
+    Дата-время в виде YYYY-MM-DDTHH:MM:SS для OData-литерала datetime'…'.
+
+    Собирается вручную, а не strftime: у %Y год НЕ дополняется нулями до четырёх знаков (на этой
+    платформе datetime(1,1,1).strftime('%Y-…') даёт '1-01-01'), а 1С такой литерал отвергает —
+    400 «Ошибка при разборе опции запроса $filter». Проверено на живой 1С: datetime'1-01-01T00:00:00'
+    → 400, datetime'0001-01-01T00:00:00' → 200.
+
+    Это не экзотика: `0001-01-01` — ПУСТАЯ ДАТА 1С, она приходит в обычных данных (например, в
+    измерении-дате независимого регистра сведений), и литералы строятся в том числе из значений,
+    прочитанных из самой 1С (keyset-курсор, перепроверка кандидатов на пометку). Годы меньше 1000
+    встречаются и как опечатка оператора.
+
+    1С хранит дату-время с точностью до секунды, поэтому доли секунды усекаются — для 1С безопасно.
+    """
+    return (f'{value.year:04d}-{value.month:02d}-{value.day:02d}'
+            f'T{getattr(value, "hour", 0):02d}:{getattr(value, "minute", 0):02d}'
+            f':{getattr(value, "second", 0):02d}')
 
 
 def raise_for_status(response: requests.Response, context: str = '') -> None:

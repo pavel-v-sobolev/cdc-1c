@@ -13,7 +13,8 @@ from cdc_1c.metadata_reader import (ACCOUNTING_REGISTER_TYPE, COMPOSITE_VALUE_SU
                                     ENTITY_TYPES, EXT_DIMENSIONS_FIELDS, REGISTER_TYPES,
                                     SUPPORTED_TYPES, MetadataReader1C, resolve_timeout)
 from cdc_1c.name_mapper import NameMapper1C
-from cdc_1c.common_functions import format_bytes, parse_object_full_name, raise_for_status
+from cdc_1c.common_functions import (format_bytes, odata_datetime_value,
+                                     parse_object_full_name, raise_for_status)
 from cdc_1c.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -138,7 +139,9 @@ def _odata_literal(value: Any, type_name: str) -> str:
     if type_name == 'Guid':
         return f"guid'{value}'"
     if type_name == 'DateTime':
-        v = value.strftime('%Y-%m-%dT%H:%M:%S') if isinstance(value, (datetime, date)) else str(value)
+        # Год — четырьмя знаками, иначе 1С отвергает литерал (см. odata_datetime_value): значения
+        # сюда приходят прочитанными из самой 1С, а среди них бывает пустая дата 0001-01-01.
+        v = odata_datetime_value(value) if isinstance(value, (datetime, date)) else str(value)
         return f"datetime'{v}'"
     if type_name in ('Int64', 'Int32', 'Int16', 'Double'):
         return str(value)

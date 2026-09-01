@@ -13,7 +13,7 @@ from sqlalchemy import Engine, Integer, Numeric
 from sqlalchemy.exc import NoSuchTableError, OperationalError
 
 from cdc_1c.metadata_reader import ACCOUNTING_REGISTER_TYPE, MetadataReader1C
-from cdc_1c.common_functions import format_duration
+from cdc_1c.common_functions import format_duration, odata_datetime_value
 from cdc_1c.data_reader import (DataReader1C, IS_DELETED_OR_EMPTY_FIELD, ODATA_PREFIX,
                                 RECORDER_FIELDS, _odata_literal)
 from cdc_1c.change_reader import ChangeReader1C
@@ -642,6 +642,10 @@ class Replicator1C:
         части исключаются — у них нет отдельной OData-сущности, их нельзя выгрузить напрямую (они
         приходят вложенно с владельцем). Метаданные при необходимости подгружаются (первый сетевой
         запрос). Удобно, чтобы узнать, что передавать в full_load.
+
+        Имена — как в 1С (кириллица). В full_load годится и такое имя, и имя таблицы в БД: он
+        принимает обе формы (см. MetadataReader1C.resolve_object_name). Список имён таблиц лежит в
+        реестре metadata_objects_1c, колонка object_full_name_en.
         """
         if not self.metadata.is_loaded:
             self.metadata.get_metadata()
@@ -707,6 +711,14 @@ class Replicator1C:
         """
         if not self.metadata.is_loaded:
             self.metadata.get_metadata()
+
+        # Имя объекта и имя поля даты принимаются в ОБЕИХ формах — как в 1С и как в БД
+        # (`Document_ЗаказКлиента` / `Document_ZakazKlienta`, `Дата` / `Data`), см.
+        # MetadataReader1C.resolve_object_name. Ровно то же делают FullLoadCron и Handler1C.ON:
+        # настраивая выгрузку, смотрят в базу, а не в конфигуратор.
+        object_name = self.metadata.resolve_object_name(object_name)
+        if date_field:
+            date_field = self.metadata.resolve_field_name(object_name, date_field)
 
         # Ключ курсора: справочник/документ → [Ref_Key], регистраторный → [Recorder]/[Recorder_Key],
         # независимый регистр → весь первичный ключ (составной ключ).
@@ -1307,10 +1319,10 @@ class Replicator1C:
     @staticmethod
     def _odata_datetime(value: date | datetime | str) -> str:
         """OData-литерал datetime'YYYY-MM-DDTHH:MM:SS' из datetime/date (date → полночь) или строки.
-        1С хранит дату-время с точностью до секунды (без миллисекунд), поэтому формат — до секунд;
-        доли секунды у переданного datetime усекаются (для 1С безопасно)."""
+        Форматирование — odata_datetime_value: год обязан быть четырёхзначным, иначе 1С отвечает
+        400 (важно для пустой даты 1С, 0001-01-01)."""
         if isinstance(value, (datetime, date)):
-            value = value.strftime('%Y-%m-%dT%H:%M:%S')
+            value = odata_datetime_value(value)
         return f"datetime'{value}'"
 
     def _build_date_filter(self, object_name: str, date_field: str | None,
@@ -1532,7 +1544,12 @@ class Replicator1C:
 
         Сам full_load намеренно не охраняется: прямой вызов «выгрузи вот это прямо сейчас» должен
         отрабатывать всегда.
+
+        Имя принимается в обеих формах, как и у full_load, — иначе один и тот же объект, названный
+        по-разному, занял бы две разные позиции в множестве занятых, и claim не сработал бы.
         """
+        if self.metadata.is_loaded:
+            object_full_name = self.metadata.resolve_object_name(object_full_name)
         with self._in_progress_lock:
             claimed = object_full_name not in self._full_load_in_progress
             if claimed:

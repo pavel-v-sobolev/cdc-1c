@@ -37,7 +37,10 @@ def _replicator(db):
                        exchange_name="E", queue_guid=TEST_QUEUE_GUID, engine=engine, db_schema=db.schema)
     # Метаданные «уже загружены» — full_load не пойдёт в сеть; primary_key даёт $orderby.
     rep.metadata.is_loaded = True
-    rep.metadata["Catalog_X"] = MetadataObject1C("Catalog_X", {"Ref_Key": "Guid"},
+    # Date в полях — чтобы date_field проходил проверку существования (full_load разрешает имя
+    # поля по метаданным, принимая и имя 1С, и имя колонки в БД).
+    rep.metadata["Catalog_X"] = MetadataObject1C("Catalog_X",
+                                                 {"Ref_Key": "Guid", "Date": "DateTime"},
                                                  {"Ref_Key": "Guid"}, object_key=None)
     return rep
 
@@ -423,6 +426,78 @@ def test_build_date_filter(db):
         rep._build_date_filter("Document_Y", None, date(2026, 6, 1), None)
 
 
+def test_full_load_accepts_db_names(db, monkeypatch):
+    """
+    Имя объекта и имя поля даты принимаются в ОБЕИХ формах: как в 1С (`Catalog_Номенклатура`,
+    `Дата`) и как в БД (`Catalog_Nomenklatura`, `Data`). Настраивая выгрузку, смотрят в базу и в
+    реестр metadata_objects_1c, а не в конфигуратор, и то же имя таблицы стоит у обработчиков
+    в `ON` — API не должен требовать переключаться между двумя словарями.
+    """
+    rep = _replicator(db)
+    rep.metadata["Catalog_Номенклатура"] = MetadataObject1C(
+        "Catalog_Номенклатура", {"Ref_Key": "Guid", "Дата": "DateTime"},
+        {"Ref_Key": "Guid"}, object_key=None)
+    captured = {}
+
+    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
+                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+        captured["object_name"] = object_name
+        captured["extra_filter"] = extra_filter
+        self.clear()
+        return 0
+
+    monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
+    monkeypatch.setattr(DataReader1C, "read_date_bound", lambda *a, **k: None)
+    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
+
+    # Имя таблицы и имя колонки — в 1С уходят имена 1С.
+    rep.full_load("Catalog_Nomenklatura", date_field="Data", date_from=date(2026, 6, 1))
+    assert captured["object_name"] == "Catalog_Номенклатура"
+    assert captured["extra_filter"] == "Дата ge datetime'2026-06-01T00:00:00'"
+
+    # Формы можно смешивать.
+    rep.full_load("Catalog_Nomenklatura", date_field="Дата", date_from=date(2026, 6, 1))
+    assert captured["object_name"] == "Catalog_Номенклатура"
+
+    # Один и тот же объект, названный по-разному, занимает ОДНУ позицию: иначе claim пропустил бы
+    # вторую выгрузку того же объекта (см. Replicator1C.claim_full_load).
+    with rep.claim_full_load("Catalog_Nomenklatura") as first:
+        with rep.claim_full_load("Catalog_Номенклатура") as second:
+            assert first and not second
+
+
+def test_unknown_name_names_both_forms(db):
+    # Раньше имя в форме БД доезжало до середины прогона и падало «no primary key» — по такому
+    # сообщению догадаться, что дело в форме имени, было невозможно.
+    rep = _replicator(db)
+    with pytest.raises(ValueError, match="expected a 1C name .* or a table name"):
+        rep.full_load("Catalog_NetTakogo")
+    with pytest.raises(ValueError, match="expected a 1C name .* or a column name"):
+        rep.full_load("Catalog_X", date_field="NetTakogo", date_from=date(2026, 6, 1))
+
+
+def test_odata_datetime_pads_the_year():
+    """
+    Год в литерале datetime обязан быть четырёхзначным. `strftime('%Y')` его НЕ дополняет
+    (на этой платформе datetime(1,1,1) даёт '1-01-01'), а 1С такой литерал отвергает — проверено
+    на живой 1С: `datetime'1-01-01T00:00:00'` → 400 «Ошибка при разборе опции запроса $filter»,
+    `datetime'0001-01-01T00:00:00'` → 200.
+
+    Это не экзотика: 0001-01-01 — ПУСТАЯ ДАТА 1С, она лежит в обычных данных (измерение-дата
+    независимого регистра сведений), и литералы строятся в том числе из прочитанных значений —
+    keyset-курсор и перепроверка кандидатов на пометку. Из-за этого `mark_missing` падал на любом
+    регистре с пустой датой в ключе.
+    """
+    from cdc_1c.data_reader import _odata_literal
+
+    assert Replicator1C._odata_datetime(date(1, 1, 1)) == "datetime'0001-01-01T00:00:00'"
+    assert Replicator1C._odata_datetime(datetime(209, 1, 1)) == "datetime'0209-01-01T00:00:00'"
+    assert _odata_literal(datetime(1, 1, 1), 'DateTime') == "datetime'0001-01-01T00:00:00'"
+    # Обычная дата-время не пострадала, доли секунды усекаются.
+    assert _odata_literal(datetime(2026, 4, 22, 13, 5, 9, 7777), 'DateTime') \
+        == "datetime'2026-04-22T13:05:09'"
+
+
 def test_build_date_filter_wraps_record_set_register(db):
     """
     У регистра, подчинённого регистратору, entry — это НАБОР записей, и поля Period на верхнем
@@ -450,6 +525,18 @@ def test_build_date_filter_wraps_record_set_register(db):
     assert not rep._is_record_set_object("Document_Y_Tovary")
     assert rep._build_date_filter("Document_Y_Tovary", "Date", date(2026, 6, 1), None) \
         == "Date ge datetime'2026-06-01T00:00:00'"
+
+    # Независимый регистр сведений читается плоскими записями (регистратора у него нет вовсе,
+    # object_key пуст), и дата-измерение лежит на верхнем уровне — лямбда ему не нужна и не
+    # подходит. Имя поля при этом произвольное: у документа это Date, у регистра с регистратором
+    # Period, а у независимого — как назвал разработчик конфигурации.
+    rep.metadata["InformationRegister_P"] = MetadataObject1C(
+        "InformationRegister_P", {"Номенклатура_Key": "Guid", "Дата": "DateTime"},
+        {"Номенклатура_Key": "Guid", "Дата": "DateTime"}, object_key=None)
+    assert not rep._is_record_set_object("InformationRegister_P")
+    assert rep._build_date_filter("InformationRegister_P", "Дата",
+                                  date(2026, 6, 1), date(2026, 6, 30)) == (
+        "Дата ge datetime'2026-06-01T00:00:00' and Дата lt datetime'2026-07-01T00:00:00'")
 
 
 def test_full_load_passes_date_filter(db, monkeypatch):

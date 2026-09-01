@@ -19,7 +19,6 @@ from datetime import date, datetime, timedelta
 from croniter import croniter
 
 from cdc_1c.logging_config import get_logger
-from cdc_1c.name_mapper import NameMapper1C
 from cdc_1c.stop_signal import StopSignal, install_signal_handlers
 
 logger = get_logger(__name__)
@@ -178,38 +177,17 @@ class FullLoadCron:
             metadata = self.replicator.metadata
             if not metadata.is_loaded:
                 metadata.get_metadata()
-            mapper = NameMapper1C()
 
-            object_name = _find(self.table_name, metadata.keys(), mapper.map_object_name)
-            if object_name is None:
-                raise ValueError(
-                    f"Object {self.table_name!r} not found in 1C metadata; expected a table name "
-                    f"like 'Document_ZakazKlienta' (see metadata_objects_1c.object_full_name_en)")
-
-            date_field = None
-            if self.date_field:
-                fields = (metadata.get(object_name) or {}).keys()
-                date_field = _find(self.date_field, fields, mapper.map_field_name)
-                if date_field is None:
-                    raise ValueError(
-                        f"Field {self.date_field!r} not found in {object_name}; expected a column "
-                        f"name (see metadata_objects_1c.fields_en)")
+            # Разбор имён — общий с full_load (MetadataReader1C.resolve_*): обе формы, имя 1С и
+            # имя таблицы/колонки в БД. Раньше это же правило жило здесь своей копией.
+            object_name = metadata.resolve_object_name(self.table_name)
+            date_field = (metadata.resolve_field_name(object_name, self.date_field)
+                          if self.date_field else None)
 
             logger.info("Schedule %s resolved to 1C object %s (date_field=%s)",
                         self.table_name, object_name, date_field)
             self._object_name, self._date_field_1c = object_name, date_field
             return object_name, date_field
-
-
-def _find(name: str, candidates, translit) -> str | None:
-    """Имя 1С по имени в БД: как есть, иначе то, чей транслит совпал с переданным."""
-    candidates = list(candidates)
-    if name in candidates:
-        return name
-    for candidate in candidates:
-        if translit(candidate) == name:
-            return candidate
-    return None
 
 
 def _bound(bound: DateBound):
