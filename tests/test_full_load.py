@@ -1,7 +1,7 @@
 """
 Оффлайн-тест постраничной полной выгрузки Replicator1C.full_load. Без живой 1С: чтение страниц
-подменяется (read_object), проверяется логика цикла — keyset-пагинация (курсор after_values),
-условие останова, сохранение в режиме полной выгрузки (full_load_started_at) для каждого объекта страницы
+подменяется (read_object), проверяется логика цикла — постраничная пагинация ($skip), условие
+останова, сохранение в режиме полной выгрузки (full_load_started_at) для каждого объекта страницы
 и одна строка в replicator_1c_log.
 """
 
@@ -46,18 +46,16 @@ def _replicator(db):
 
 
 def test_full_load_paging(db, monkeypatch):
-    # Справочник: ключ Ref_Key — ссылка, keyset по ней в 1С неприменим (см. _supports_keyset),
-    # поэтому страницы берутся через $skip, а курсор after_values не используется.
+    # Страницы берутся смещением $skip — единственным способом (см. DataReader1C.read_object).
     rep = _replicator(db)
     meta = rep.metadata["Catalog_X"]
     pages = iter([2, 2, 1])      # batch_size=2: две полные страницы и хвост → останов
     calls = []
     counter = {"v": 0}
 
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
-        calls.append({"top": top, "key_fields": key_fields, "after_values": after_values,
-                      "key_types": key_types, "skip": skip})
+    def fake_read_object(self, object_name, top=None, key_fields=None,
+                         extra_filter=None, skip=None):
+        calls.append({"top": top, "key_fields": key_fields, "skip": skip})
         n = next(pages)
         keys = []
         for _ in range(n):       # детерминированно возрастающие Ref_Key
@@ -77,11 +75,10 @@ def test_full_load_paging(db, monkeypatch):
 
     rep.full_load("Catalog_X", batch_size=2)
 
-    # $skip растёт на размер выданной страницы; keyset-курсор не задействован.
+    # $skip растёт на размер выданной страницы.
     assert [c["skip"] for c in calls] == [0, 2, 4]
-    assert all(c["after_values"] is None for c in calls)
     assert all(c["top"] == 2 for c in calls)
-    assert all(c["key_fields"] == ["Ref_Key"] and c["key_types"] == ["Guid"] for c in calls)
+    assert all(c["key_fields"] == ["Ref_Key"] for c in calls)
     # каждая страница сохранена в режиме полной выгрузки, и отметка у неё СВОЯ: guard'ы снимка
     # спрашивают «не переписали ли строку после того, как мы прочитали эти данные», а данные
     # читаются постранично. С общей отметкой на прогон группа, разрезанная границей страниц,
@@ -112,10 +109,9 @@ def test_full_load_register_paging(db, monkeypatch):
     calls = []
     counter = {"v": 0}
 
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
-        calls.append({"key_fields": key_fields, "after_values": after_values,
-                      "key_types": key_types, "skip": skip})
+    def fake_read_object(self, object_name, top=None, key_fields=None,
+                         extra_filter=None, skip=None):
+        calls.append({"key_fields": key_fields, "skip": skip})
         n = next(pages)
         recs = []
         for _ in range(n):
@@ -135,26 +131,26 @@ def test_full_load_register_paging(db, monkeypatch):
 
     rep.full_load("AccumulationRegister_R", batch_size=2)
 
-    assert all(c["key_fields"] == ["Recorder"] and c["key_types"] == ["String"] for c in calls)
+    assert all(c["key_fields"] == ["Recorder"] for c in calls)
     assert [c["skip"] for c in calls] == [0, 2]
-    assert all(c["after_values"] is None for c in calls)
 
 
 def test_full_load_key_recorder_key(db):
     # Регистр с единственным типом регистратора: 1С отдаёт Recorder_Key (Guid) вместо
-    # Recorder/Recorder_Type — курсор всё равно должен быть по регистратору, а не составной.
+    # Recorder/Recorder_Type — сортировать страницы всё равно надо по регистратору, а не по
+    # составному ключу: одна entry = набор записей, и страница не должна рвать набор.
     rep = _replicator(db)
     rep.metadata["InformationRegister_R"] = MetadataObject1C(
         "InformationRegister_R", {"Recorder_Key": "Guid", "Period": "DateTime"},
         {"Recorder_Key": "Guid", "Period": "DateTime"}, object_key=["Recorder_Key"])
 
-    assert rep._full_load_key("InformationRegister_R") == (["Recorder_Key"], ["Guid"])
+    assert rep._full_load_key("InformationRegister_R") == ["Recorder_Key"]
 
 
 def _failing_above(limit, calls):
     """Стаб read_object: страницы больше limit сервер не отдаёт, остальные — пустые."""
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+    def fake_read_object(self, object_name, top=None, key_fields=None,
+                         extra_filter=None, skip=None):
         calls.append({"top": top, "skip": skip})
         if top > limit:
             raise requests.HTTPError("500", response=_response(500))
@@ -212,8 +208,8 @@ def test_full_load_reraises_permanent_error(db, monkeypatch):
     # 400/403/404 уменьшением страницы не лечатся — пробрасываем сразу, без повторов.
     rep = _replicator(db)
 
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+    def fake_read_object(self, object_name, top=None, key_fields=None,
+                         extra_filter=None, skip=None):
         raise requests.HTTPError("403", response=_response(403))
 
     monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
@@ -226,8 +222,8 @@ def test_full_load_reraises_permanent_error(db, monkeypatch):
 def test_full_load_empty_object(db, monkeypatch):
     rep = _replicator(db)
 
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+    def fake_read_object(self, object_name, top=None, key_fields=None,
+                         extra_filter=None, skip=None):
         self.clear()
         return 0     # объект пуст: первая же страница неполная → один запрос и останов
 
@@ -245,18 +241,17 @@ def test_full_load_empty_object(db, monkeypatch):
     assert len(rows) == 1 and rows[0].finished_at is not None
 
 
-def test_full_load_composite_key_with_reference(db, monkeypatch):
-    # Независимый регистр, в ключе есть измерение-ссылка (Dim_Key) → keyset запрещён, идём $skip.
+def test_full_load_composite_key(db, monkeypatch):
+    # Независимый регистр: ключ составной, сортировка идёт по всем его полям, страницы — $skip.
     rep = _replicator(db)
     meta = MetadataObject1C("InformationRegister_Indep", {"Period": "DateTime", "Dim_Key": "Guid"},
                             {"Period": "DateTime", "Dim_Key": "Guid"}, object_key=None)
     rep.metadata["InformationRegister_Indep"] = meta
     calls = []
 
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
-        calls.append({"key_fields": key_fields, "key_types": key_types,
-                      "after_values": after_values, "skip": skip})
+    def fake_read_object(self, object_name, top=None, key_fields=None,
+                         extra_filter=None, skip=None):
+        calls.append({"key_fields": key_fields, "skip": skip})
         self.clear()
         if len(calls) == 1:      # одна полная страница, затем пустая → останов
             self[object_name] = DataObject1C(meta, [
@@ -274,43 +269,11 @@ def test_full_load_composite_key_with_reference(db, monkeypatch):
     rep.full_load("InformationRegister_Indep", batch_size=2)
 
     assert calls[0]["key_fields"] == ["Period", "Dim_Key"]
-    assert calls[0]["key_types"] == ["DateTime", "Guid"]
     assert [c["skip"] for c in calls] == [0, 2]
-    assert all(c["after_values"] is None for c in calls)
 
 
-def test_full_load_composite_key_keyset(db, monkeypatch):
-    # Ключ без ссылок (Period + числовой код) — keyset корректен: курсор следующей страницы
-    # = значения всех ключевых полей последней записи, $skip не используется.
-    rep = _replicator(db)
-    meta = MetadataObject1C("InformationRegister_Scalar", {"Period": "DateTime", "Code": "Int64"},
-                            {"Period": "DateTime", "Code": "Int64"}, object_key=None)
-    rep.metadata["InformationRegister_Scalar"] = meta
-    calls = []
-
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
-        calls.append({"after_values": after_values, "skip": skip})
-        self.clear()
-        if len(calls) == 1:
-            self[object_name] = DataObject1C(meta, [
-                {"Period": datetime(2026, 1, 1), "Code": 1},
-                {"Period": datetime(2026, 1, 2), "Code": 2}])
-            return 2
-        return 0
-
-    monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
-    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
-
-    rep.full_load("InformationRegister_Scalar", batch_size=2)
-
-    assert calls[0]["after_values"] is None
-    assert calls[1]["after_values"] == [datetime(2026, 1, 2), 2]
-    assert all(c["skip"] is None for c in calls)
-
-
-def test_read_object_keyset_url(db, monkeypatch):
-    # Проверяем формирование URL keyset-страницы: $top, $orderby, $filter с guid-литералом.
+def test_read_object_page_url(db, monkeypatch):
+    # Формирование URL страницы: $top, $skip, $orderby.
     md = MetadataReader1C("http://x")
     reader = DataReader1C("http://x", md)
     captured = {}
@@ -326,22 +289,7 @@ def test_read_object_keyset_url(db, monkeypatch):
 
     monkeypatch.setattr("cdc_1c.data_reader.requests.get", fake_get)
 
-    key = uuid.UUID("11111111-1111-1111-1111-111111111111")
-    reader.read_object("Catalog_X", top=500, key_fields=["Ref_Key"], after_values=[key],
-                       key_types=["Guid"], use_keyset=True)
-    url = captured["url"]
-    assert "$top=500" in url and "$orderby=Ref_Key" in url
-    # фильтр закодирован (пробелы → %20), guid-литерал сохранён.
-    assert "$filter=Ref_Key%20gt%20guid'11111111-1111-1111-1111-111111111111'" in url
-
-    # Регистр: ключ Recorder, строковый литерал (без guid'...').
-    reader.read_object("AccumulationRegister_R", top=100, key_fields=["Recorder"],
-                       after_values=[key], key_types=["String"], use_keyset=True)
-    url = captured["url"]
-    assert "$orderby=Recorder" in url
-    assert "$filter=Recorder%20gt%20'11111111-1111-1111-1111-111111111111'" in url
-
-    # $skip-страница: смещение в URL, $filter не появляется (курсора нет).
+    # Смещение в URL; без фильтра $filter не появляется вовсе.
     reader.read_object("Catalog_X", top=500, key_fields=["Ref_Key"], skip=1000)
     url = captured["url"]
     assert "$top=500" in url and "$skip=1000" in url and "$orderby=Ref_Key" in url
@@ -350,16 +298,14 @@ def test_read_object_keyset_url(db, monkeypatch):
     reader.read_object("Catalog_X", top=500, key_fields=["Ref_Key"], skip=0)
     assert "$skip" not in captured["url"]
 
-    # Составной ключ: $orderby по всем полям, лексикографический фильтр с OR (в скобках).
+    # Регистр: сортировка по регистратору — одна entry = набор записей, страница не рвёт набор.
+    reader.read_object("AccumulationRegister_R", top=100, key_fields=["Recorder"], skip=100)
+    assert "$orderby=Recorder" in captured["url"]
+
+    # Составной ключ независимого регистра: $orderby по всем его полям.
     reader.read_object("InformationRegister_Indep", top=100,
-                       key_fields=["Period", "Dim_Key"],
-                       after_values=[datetime(2026, 1, 2), key],
-                       key_types=["DateTime", "Guid"], use_keyset=True)
-    url = captured["url"]
-    assert "$orderby=Period,Dim_Key" in url
-    assert "Period%20gt%20datetime'2026-01-02T00:00:00'" in url
-    assert "%20or%20" in url
-    assert "Period%20eq%20datetime'2026-01-02T00:00:00'%20and%20Dim_Key%20gt%20guid'11111111-1111-1111-1111-111111111111'" in url
+                       key_fields=["Period", "Dim_Key"], skip=100)
+    assert "$orderby=Period,Dim_Key" in captured["url"]
 
 
 class _SyncExecutor:
@@ -445,8 +391,8 @@ def test_full_load_accepts_db_names(db, monkeypatch):
         {"Ref_Key": "Guid"}, object_key=None)
     captured = {}
 
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+    def fake_read_object(self, object_name, top=None, key_fields=None,
+                         extra_filter=None, skip=None):
         captured["object_name"] = object_name
         captured["extra_filter"] = extra_filter
         self.clear()
@@ -493,8 +439,8 @@ def test_odata_datetime_pads_the_year():
 
     Это не экзотика: 0001-01-01 — ПУСТАЯ ДАТА 1С, она лежит в обычных данных (измерение-дата
     независимого регистра сведений), и литералы строятся в том числе из прочитанных значений —
-    keyset-курсор и перепроверка кандидатов на пометку. Из-за этого `mark_missing` падал на любом
-    регистре с пустой датой в ключе.
+    курсор по периоду и перепроверка кандидатов на пометку. Из-за этого `mark_missing` падал на
+    любом регистре с пустой датой в ключе.
     """
     from cdc_1c.data_reader import _odata_literal
 
@@ -552,8 +498,8 @@ def test_full_load_passes_date_filter(db, monkeypatch):
     rep = _replicator(db)
     captured = {}
 
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+    def fake_read_object(self, object_name, top=None, key_fields=None,
+                         extra_filter=None, skip=None):
         captured["extra_filter"] = extra_filter
         self.clear()
         return 0
@@ -571,8 +517,8 @@ def test_full_load_passes_date_filter(db, monkeypatch):
         "Date ge datetime'2026-06-01T00:00:00' and Date lt datetime'2026-07-01T00:00:00'"
 
 
-def test_read_object_combines_keyset_and_extra_filter(db, monkeypatch):
-    # keyset-курсор и extra_filter объединяются в один $filter по AND; двоеточия в datetime сохранены.
+def test_read_object_extra_filter(db, monkeypatch):
+    # extra_filter уходит в $filter как есть: пробелы кодируются, двоеточия datetime сохраняются.
     md = MetadataReader1C("http://x")
     reader = DataReader1C("http://x", md)
     captured = {}
@@ -585,14 +531,12 @@ def test_read_object_combines_keyset_and_extra_filter(db, monkeypatch):
     monkeypatch.setattr("cdc_1c.data_reader.requests.get",
                         lambda url, **kw: captured.__setitem__("url", url) or _Resp())
 
-    key = uuid.UUID("11111111-1111-1111-1111-111111111111")
-    reader.read_object("Document_X", top=100, key_fields=["Ref_Key"], after_values=[key],
-                       key_types=["Guid"], use_keyset=True,
-                       extra_filter="Date ge datetime'2026-06-01T00:00:00'")
+    reader.read_object("Document_X", top=100, key_fields=["Ref_Key"], skip=100,
+                       extra_filter="Date ge datetime'2026-06-01T00:00:00' "
+                                    "and Date lt datetime'2026-07-01T00:00:00'")
     url = captured["url"]
-    assert "Ref_Key%20gt%20guid'11111111-1111-1111-1111-111111111111'" in url
-    assert "%20and%20" in url
-    assert "Date%20ge%20datetime'2026-06-01T00:00:00'" in url  # ':' оставлены как есть
+    assert "$filter=Date%20ge%20datetime'2026-06-01T00:00:00'" in url  # ':' оставлены как есть
+    assert "%20and%20Date%20lt%20datetime'2026-07-01T00:00:00'" in url
 
 
 def test_page_timestamp_is_clamped_to_unfinished_merges(db, monkeypatch):
@@ -607,8 +551,8 @@ def test_page_timestamp_is_clamped_to_unfinished_merges(db, monkeypatch):
     rep = _replicator(db)
     meta = rep.metadata["Catalog_X"]
 
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+    def fake_read_object(self, object_name, top=None, key_fields=None,
+                         extra_filter=None, skip=None):
         self.clear()
         self[object_name] = DataObject1C(meta, [{"Ref_Key": uuid.UUID(int=1)}])
         return 1
@@ -641,8 +585,8 @@ def _partitioned(db, monkeypatch, rows_per_page, *, date_field="Date"):
     calls = []
     counter = {"v": 0}
 
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+    def fake_read_object(self, object_name, top=None, key_fields=None,
+                         extra_filter=None, skip=None):
         calls.append(extra_filter)
         n = rows_per_page(extra_filter, skip or 0)
         keys = []
@@ -841,8 +785,8 @@ def test_record_set_register_is_read_by_lambda_windows(db, monkeypatch):
     calls = []
     counter = {"v": 0}
 
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+    def fake_read_object(self, object_name, top=None, key_fields=None,
+                         extra_filter=None, skip=None):
         calls.append(extra_filter)
         n = 10 if extra_filter is None else 0
         self.clear()
@@ -870,8 +814,6 @@ def test_record_set_register_is_read_by_lambda_windows(db, monkeypatch):
     assert windows[0] == ("RecordSet/any(r: r/Period ge datetime'"
                           + windows[0].split("ge datetime'")[1][:19] + "')"), \
         'первое окно открыто вверх'
-
-
 def test_page_size_does_not_climb_back_after_a_refusal(db, monkeypatch):
     """
     Отказ 1С ставит потолок, и подбор по весу его не перешагивает.
@@ -884,8 +826,8 @@ def test_page_size_does_not_climb_back_after_a_refusal(db, monkeypatch):
     meta = rep.metadata["Catalog_X"]
     calls = []
 
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+    def fake_read_object(self, object_name, top=None, key_fields=None,
+                         extra_filter=None, skip=None):
         calls.append(top)
         if top > 5:
             raise requests.HTTPError("500", response=_response(500))
@@ -908,34 +850,12 @@ def test_page_size_does_not_climb_back_after_a_refusal(db, monkeypatch):
     assert rep._full_load_page_limit["Catalog_X"] == 5
 
 
-def test_keyset_page_without_own_entries_fails_loudly(db, monkeypatch):
+def test_orderby_is_extended_to_the_whole_primary_key(db, monkeypatch):
     """
-    Страница вернула entry, но ни одна не легла в наш объект (все были неподдерживаемого класса и
-    read_data_entries их пропустила). Курсор строить не из чего — раньше здесь был KeyError, теперь
-    внятная ошибка. Молча оборваться нельзя: прогон отчитался бы успехом на половине объекта.
-    """
-    rep = _replicator(db)
-    meta = MetadataObject1C("InformationRegister_Scalar", {"Period": "DateTime", "Code": "Int64"},
-                            {"Period": "DateTime", "Code": "Int64"}, object_key=None)
-    rep.metadata["InformationRegister_Scalar"] = meta
-
-    def fake_read_object(self, object_name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
-        self.clear()
-        return top          # полная страница, но объекта в reader нет
-
-    monkeypatch.setattr(DataReader1C, "read_object", fake_read_object)
-    rep.writer.save = lambda name, obj, full_load_started_at=None: _ZERO_RESULT
-
-    with pytest.raises(RuntimeError, match="keyset cursor"):
-        rep.full_load("InformationRegister_Scalar", batch_size=2)
-
-
-def test_orderby_is_the_same_on_the_first_keyset_page_and_the_next(db, monkeypatch):
-    """
-    Порядок страниц выбирается по способу пагинации, а не по «есть ли уже курсор»: у первой
-    keyset-страницы курсора нет, но $orderby у неё обязан быть тот же, что у следующих, — иначе
-    курсор продолжил бы не тот порядок (дубли и пропуски на границах страниц).
+    $orderby дополняется остальными полями первичного ключа, даже если страница сортируется по
+    одному полю. $skip отсчитывает смещение в выборке, поэтому порядок обязан быть однозначным:
+    внутри ничьей (одинаковый Period, разный Code) 1С порядок не гарантирует, и на границе
+    страниц это давало и дубли, и потерянные строки.
     """
     md = MetadataReader1C("http://x")
     md["InformationRegister_Scalar"] = MetadataObject1C(
@@ -952,17 +872,12 @@ def test_orderby_is_the_same_on_the_first_keyset_page_and_the_next(db, monkeypat
     monkeypatch.setattr("cdc_1c.data_reader.requests.get",
                         lambda url, **kw: (captured.append(url), _Resp())[1])
 
-    # keyset: первая страница (курсора ещё нет) — сортировка ровно по ключу курсора.
-    reader.read_object("InformationRegister_Scalar", top=10, key_fields=["Period"],
-                       key_types=["DateTime"], use_keyset=True)
-    assert "$orderby=Period&" in captured[-1] or captured[-1].endswith("$orderby=Period")
-
-    # $skip: та же первая страница — сортировка дополняется остальными полями ключа,
-    # иначе порядок внутри ничьей 1С не гарантирует (см. read_object).
-    reader.read_object("InformationRegister_Scalar", top=10, key_fields=["Period"],
-                       key_types=["DateTime"], skip=0)
+    # Первая страница и следующая сортируются одинаково — иначе смещение указывало бы в другой
+    # порядок строк.
+    reader.read_object("InformationRegister_Scalar", top=10, key_fields=["Period"], skip=0)
     assert "$orderby=Period,Code" in captured[-1]
-
+    reader.read_object("InformationRegister_Scalar", top=10, key_fields=["Period"], skip=10)
+    assert "$orderby=Period,Code" in captured[-1]
 
 def test_window_title_and_filter(db):
     """Заголовок окна в логе и его $filter, включая открытые границы и режим набора записей."""

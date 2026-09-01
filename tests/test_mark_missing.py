@@ -52,8 +52,8 @@ def _pages(rep, object_name, monkeypatch, pages, recheck_answer=None):
     remaining = list(pages)
     calls = {"pages": 0, "recheck": []}
 
-    def fake_read_object(self, name, top=None, key_fields=None, after_values=None,
-                         key_types=None, extra_filter=None, skip=None, use_keyset=False):
+    def fake_read_object(self, name, top=None, key_fields=None,
+                         extra_filter=None, skip=None):
         if top is None:
             # Перепроверка кандидатов: без $top и с фильтром по ключам.
             calls["recheck"].append(extra_filter)

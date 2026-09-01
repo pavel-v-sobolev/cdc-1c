@@ -569,8 +569,9 @@ class Replicator1C:
                     self.changes.rows_read())
         # Объект пришёл в пакете → он в плане обмена. Если ни разу не выгружался целиком,
         # помечаем на полную выгрузку (выполнит фоновый воркер в run_forever). 
-        # Табличные части пропускаем — у них нет отдельной OData-сущности, они
-        # догружаются вместе с владельцем при его full_load.
+        # Табличные части пропускаем: они догружаются вместе с владельцем при его full_load,
+        # приезжая вложенными в его entry. Отдельная сущность в OData у них есть, но грузить их
+        # ею незачем и дороже — страница владельца приносит его табличные части целиком.
         for object_full_name in self.changes:
             metadata_obj = self.metadata.get(object_full_name)
             if metadata_obj is None:
@@ -646,10 +647,12 @@ class Replicator1C:
 
     def list_objects(self) -> list[str]:
         """
-        Список имён объектов 1С, доступных для выгрузки (документы/справочники и регистры). Табличные
-        части исключаются — у них нет отдельной OData-сущности, их нельзя выгрузить напрямую (они
-        приходят вложенно с владельцем). Метаданные при необходимости подгружаются (первый сетевой
-        запрос). Удобно, чтобы узнать, что передавать в full_load.
+        Список имён объектов 1С, доступных для выгрузки (документы/справочники и регистры).
+        Табличные части исключаются: они приходят вложенно с владельцем и грузятся вместе с ним.
+        Отдельная сущность в OData у них есть, и full_load её примет, но выгружать табличную часть
+        отдельно не нужно — а страницей меньше её группы ещё и вредно (см. DataReader1C.read_object).
+        Метаданные при необходимости подгружаются (первый сетевой запрос). Удобно, чтобы узнать,
+        что передавать в full_load.
 
         Имена — как в 1С (кириллица). В full_load годится и такое имя, и имя таблицы в БД: он
         принимает обе формы (см. MetadataReader1C.resolve_object_name). Список имён таблиц лежит в
@@ -674,8 +677,9 @@ class Replicator1C:
 
         Документ/справочник выгружается вместе с табличными частями — они приходят вложенно в той же
         странице и сохраняются как отдельные объекты. Сортировка страниц — по первичному ключу
-        (см. _full_load_key), а способ перехода к следующей странице зависит от ключа: keyset-фильтр
-        «ключ больше последней строки» там, где он корректен, иначе $skip (см. _supports_keyset).
+        (см. _full_load_key), переход к следующей странице — смещением $skip: курсора по ключу 1С
+        не даёт, потому что в ключе стоит ссылка (см. DESIGN.md, «Почему страницы берутся только
+        через $skip»). Глубину лечит не курсор, а нарезка окнами по периоду (см. ниже).
         Один прогон = одна строка в replicator_1c_log (message_no=NULL — это не пакет обмена);
         finished_at проставляется после успеха всех страниц.
 
@@ -701,8 +705,8 @@ class Replicator1C:
         документов, Period у регистров), date_from/date_to — границы (datetime/date/ISO-строка,
         включительно). Транслируется в OData $filter `date_field ge …` + `le`/`lt` для верхней
         границы (чистая дата включает весь день целиком; у регистра, подчинённого регистратору,
-        всё это оборачивается в лямбду по вложенной коллекции — см. _build_date_filter) и
-        объединяется с keyset-курсором по AND. Полезно для ручной догрузки за нужный период.
+        всё это оборачивается в лямбду по вложенной коллекции — см. _build_date_filter).
+        Полезно для ручной догрузки за нужный период.
 
         mark_missing — пометить строки, которых в 1С не оказалось (см. full_load_keys). Нужно
         затем, что физическое удаление объекта в обмен не приходит вовсе, и такая строка иначе
@@ -734,13 +738,12 @@ class Replicator1C:
         if date_field:
             date_field = self.metadata.resolve_field_name(object_name, date_field)
 
-        # Ключ курсора: справочник/документ → [Ref_Key], регистраторный → [Recorder]/[Recorder_Key],
-        # независимый регистр → весь первичный ключ (составной ключ).
-        key_fields, key_types = self._full_load_key(object_name)
+        # Ключ сортировки: справочник/документ → [Ref_Key], регистраторный → [Recorder]/
+        # [Recorder_Key], независимый регистр → весь первичный ключ (составной ключ).
+        key_fields = self._full_load_key(object_name)
         # Регистр бухгалтерии читается из виртуальной таблицы (только там есть субконто), а у неё
         # ни $skip, ни сортировки: страницы идут курсором по периоду, см. _load_pages.
         by_period = self._is_accounting_register(object_name)
-        use_keyset = False if by_period else self._supports_keyset(object_name, key_fields)
         date_filter = self._build_date_filter(object_name, date_field, date_from, date_to)
 
         reader = DataReader1C(self._odata_url, self.metadata, odata_auth=self._odata_auth,
@@ -752,17 +755,17 @@ class Replicator1C:
         # (guard'ы save берут свою отметку на каждую страницу, см. ниже).
         started_at = self.writer.db_now()
 
-        # Поле, по которому объект можно порезать на периоды, если он окажется глубоким. Нарезка
-        # имеет смысл только там, где страницы берутся через $skip: keyset-курсор в глубину не
-        # уходит и в окнах не нуждается.
-        # Курсор по периоду в глубину не уходит (смещения нет вовсе), поэтому окна ему не нужны.
-        partition_field = (None if use_keyset or by_period
+        # Поле, по которому объект можно порезать на периоды, если он окажется глубоким. Нужно
+        # везде, где страницы берутся через $skip, то есть всюду, кроме регистра бухгалтерии:
+        # его курсор по периоду в глубину не уходит (смещения нет вовсе), и окна ему не нужны —
+        # точнее, он и так читается только окнами.
+        partition_field = (None if by_period
                            else self._partition_date_field(object_name, date_field))
 
         log_id = self.replicator_log.start(self._exchange_name, object_name, None, LOAD_TYPE_FULL)
         logger.info("Full load of %s started (batch_size=%s, key=%s, paging=%s, date_filter=%s, "
                     "partition_field=%s)", object_name, batch_size, key_fields,
-                    'period' if by_period else ('keyset' if use_keyset else 'skip'),
+                    'period' if by_period else 'skip',
                     date_filter, partition_field)
         total = 0
         rows_modified = 0
@@ -773,9 +776,8 @@ class Replicator1C:
         with stack:
             if keys is not None:
                 stack.enter_context(keys)
-            page_args = dict(reader=reader, key_fields=key_fields, key_types=key_types,
-                             use_keyset=use_keyset, by_period=by_period, batch_size=batch_size,
-                             keys=keys, log_id=log_id)
+            page_args = dict(reader=reader, key_fields=key_fields, by_period=by_period,
+                             batch_size=batch_size, keys=keys, log_id=log_id)
             # Читался ли объект окнами по дате. Важно для пометки пропавших строк: окно
             # порождает «уехавшие» строки (см. _mark_missing_rows), и неважно, задал его
             # пользователь или обход окнами выбрал сам.
@@ -839,8 +841,7 @@ class Replicator1C:
 
 
     def _load_pages(self, object_name: str, *, reader: DataReader1C, key_fields: list[str],
-                    key_types: list[str], use_keyset: bool, extra_filter: str | None,
-                    batch_size: int, keys, log_id,
+                    extra_filter: str | None, batch_size: int, keys, log_id,
                     max_pages: int | None, by_period: bool = False) -> tuple[int, int, bool]:
         """
         Постраничное чтение одной выборки (объект целиком либо его окно по периоду) с записью
@@ -853,7 +854,6 @@ class Replicator1C:
         by_period — регистр бухгалтерии: читается из виртуальной таблицы, где нет ни $skip, ни
         сортировки, и курсором служит сам ПЕРИОД (см. DataReader1C.read_accounting_register).
         """
-        after_values = None
         skip = 0
         total = 0
         rows_modified = 0
@@ -891,9 +891,7 @@ class Replicator1C:
                     page = reader.read_accounting_register(object_name, condition=extra_filter)
                 else:
                     page = reader.read_object(object_name, top=page_size, key_fields=key_fields,
-                                              after_values=after_values, key_types=key_types,
-                                              extra_filter=extra_filter, use_keyset=use_keyset,
-                                              skip=None if use_keyset else skip)
+                                              extra_filter=extra_filter, skip=skip)
             except requests.HTTPError as exc:
                 if by_period:
                     # Окно не по зубам серверу 1С. Уменьшать тут нечего — размер выборки задаёт
@@ -904,7 +902,7 @@ class Replicator1C:
                                    object_name, exc)
                     return total, rows_modified, False
                 # Страница не по зубам серверу 1С (упирается в память/временные файлы) —
-                # уменьшаем её и повторяем с того же места. Курсор/смещение не сдвигались.
+                # уменьшаем её и повторяем с того же места. Смещение не сдвигалось.
                 if _is_permanent_error(exc) or page_size <= FULL_LOAD_MIN_BATCH:
                     raise
                 page_size = max(FULL_LOAD_MIN_BATCH, page_size // FULL_LOAD_BATCH_DIVISOR)
@@ -948,21 +946,7 @@ class Replicator1C:
                 # Дочитать можно и так, но дальше $skip уходит в глубину — пусть вызывающий
                 # порежет выборку на меньшие периоды.
                 return total, rows_modified, False
-            if use_keyset:
-                # Курсор следующей страницы — значения ключевых полей последней записи.
-                # Объекта в reader может не оказаться, хотя entry пришли: все они были
-                # неподдерживаемого класса, и read_data_entries их пропустила (с ошибкой в лог).
-                # Курсор тогда строить не из чего, а молча оборваться значило бы отчитаться
-                # успехом на половине объекта.
-                data_object = reader.get(object_name)
-                if data_object is None or data_object.data_length == 0:
-                    raise RuntimeError(
-                        f"full_load: page of {object_name} returned {page} entries, but none of "
-                        f"them belong to {object_name} — the keyset cursor cannot be continued")
-                data = data_object.data
-                after_values = [data[f][-1] for f in key_fields]
-            else:
-                skip += page
+            skip += page
             page_size = self._next_page_size(object_name, page_size, page,
                                              reader.last_response_bytes, batch_size)
         return total, rows_modified, True
@@ -1463,51 +1447,25 @@ class Replicator1C:
                  if name == object_name or name.startswith(prefix)]
         return [self._handler_key(name) for name in names]
 
-    def _supports_keyset(self, object_name: str, key_fields: list[str]) -> bool:
+    def _full_load_key(self, object_name: str) -> list[str]:
         """
-        Можно ли листать объект keyset-курсором (фильтр «ключ больше последней строки») — или
-        придётся платить за $skip. Ссылочное поле в ключе запрещает keyset по двум причинам:
-
-        - сравнение: `Ref_Key gt guid'...'` 1С отдаёт 500 «Нельзя сравнивать поля неограниченной
-          длины и поля несовместимых типов» (в запрос уходит `sourceAlias.Ref > &param`). Строковый
-          литерал 500 не даёт, но сравнивает не то, что нужно;
-        - сортировка: `$orderby` по ссылке 1С разворачивает в АВТОУПОРЯДОЧИВАНИЕ — сортирует по
-          полям представления объекта (наименование/код у справочника, дата+номер у документа),
-          а не по GUID. Курсор «GUID больше предыдущего» такой порядок не продолжает: страницы
-          пересекаются и теряют строки.
-
-        Ссылочность определяем по типу из метаданных (Guid) и по имени поля — `Ref_Key`,
-        `Recorder`/`Recorder_Key`, измерения `*_Key`. Имя нужно потому, что часть ссылочных полей
-        1С описывает в $metadata как String (это и чинит GUESS_UUID_TYPES, но флаг отключаемый).
-        Period/LineNumber и прочие скаляры ссылками не считаются — по ним keyset корректен.
-        """
-        properties = self.metadata.get(object_name) or {}
-        return not any(properties.get(field) == 'Guid' or field.endswith('_Key')
-                       or field in RECORDER_FIELDS for field in key_fields)
-
-    def _full_load_key(self, object_name: str) -> tuple[list[str], list[str]]:
-        """
-        Поля и их типы для keyset-курсора full_load по метаданным объекта (списки — для составного
-        ключа, см. read_object):
-        - Ref_Key (справочник/документ) → (['Ref_Key'], ['Guid']);
-        - Recorder (регистраторный регистр) → (['Recorder'], ['String']; Recorder в OData отдаётся
-          строкой, одна entry = набор регистратора);
+        Поля сортировки страниц full_load по метаданным объекта (список — потому что у
+        независимого регистра ключ составной, см. read_object):
+        - Ref_Key (справочник/документ) → ['Ref_Key'];
+        - Recorder (регистраторный регистр) → ['Recorder']; одна entry = набор регистратора,
+          поэтому страница не рвёт набор;
         - Recorder_Key (тот же регистраторный регистр, но с единственным типом регистратора — 1С
-          отдаёт поле как Guid и без Recorder_Type) → (['Recorder_Key'], ['Guid']);
-        - иначе (независимый регистр сведений) → весь первичный ключ: (список полей, список типов) —
-          составной лексикографический keyset, т.к. одиночного уникального курсора нет.
+          отдаёт поле как Guid и без Recorder_Type) → ['Recorder_Key'];
+        - иначе (независимый регистр сведений) → весь первичный ключ.
         Пустой первичный ключ → ValueError.
         """
         metadata_obj = self.metadata.get(object_name)
         primary_key = metadata_obj.primary_key if metadata_obj else {}
-        if 'Ref_Key' in primary_key:
-            return ['Ref_Key'], ['Guid']
-        if 'Recorder' in primary_key:
-            return ['Recorder'], ['String']
-        if 'Recorder_Key' in primary_key:
-            return ['Recorder_Key'], ['Guid']
+        for field in ('Ref_Key', 'Recorder', 'Recorder_Key'):
+            if field in primary_key:
+                return [field]
         if primary_key:
-            return list(primary_key.keys()), list(primary_key.values())
+            return list(primary_key.keys())
         raise ValueError(f"full_load: no primary key for {object_name}")
 
     def run_forever(self, interval: float = 60.0, max_iterations: int = 0,
