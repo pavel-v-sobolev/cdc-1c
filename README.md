@@ -38,7 +38,7 @@ pip install cdc-1c
 from sqlalchemy import create_engine
 from cdc_1c import Replicator1C
 
-# pool_size >= full_load_workers + 2 (+1 на каждого обработчика и каждое расписание) —
+# pool_size >= full_load_workers + 3 (+1 на каждого обработчика и каждое расписание) —
 # почему столько, см. README_DB.md, «Сколько нужно соединений к БД»
 engine = create_engine("postgresql+psycopg2://user:pass@localhost:5432/cdc_1c", pool_size=5)
 

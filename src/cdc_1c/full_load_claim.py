@@ -36,6 +36,7 @@ from datetime import timedelta
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import Engine
 
+from cdc_1c.common_functions import DB_NOW_WITHOUT_TIMEZONE
 from cdc_1c.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -44,6 +45,12 @@ logger = get_logger(__name__)
 # TTL с запасом больше периода: разовая задержка не должна выглядеть как смерть процесса.
 CLAIM_HEARTBEAT_PERIOD = 20.0
 CLAIM_HEARTBEAT_TTL = 90.0
+# Пауза после НЕУДАЧНОЙ попытки продлить захват. Короче обычной: неудача — это, как правило,
+# нехватка соединений в пуле (все заняты страницами выгрузки), и обычным периодом мы получили бы
+# на весь TTL всего четыре попытки. Проверено: при исчерпанном пуле захват живого процесса
+# доставался чужому через 90 секунд, и объект грузили двое сразу. Сплошное голодание пула дольше
+# TTL это не лечит — там захват теряется честно, как и задумано.
+CLAIM_HEARTBEAT_RETRY_PERIOD = 5.0
 
 OWNER_FIELD = 'full_load_owner'
 HEARTBEAT_FIELD = 'full_load_heartbeat_at'
@@ -84,7 +91,10 @@ class FullLoadClaim:
             # прямой вызов full_load должен отрабатывать и на пустой базе.
             return True
         with self.engine.begin() as conn:
-            now = conn.scalar(select(func.now()))
+            # Часы БД, приведённые к наивному времени ею же: колонка отметки — timestamp без пояса,
+            # а сырой now() драйвер отдаёт offset-aware (см. DB_NOW_WITHOUT_TIMEZONE). Значение
+            # уходит обратно в БД, но живёт в Python, и наивным ему быть безопаснее.
+            now = conn.scalar(select(DB_NOW_WITHOUT_TIMEZONE))
             result = conn.execute(
                 update(table)
                 .where(table.c.object_full_name == object_full_name,
@@ -139,9 +149,14 @@ class FullLoadClaim:
         while not self._closed.is_set():
             try:
                 self.heartbeat()
+                delay = CLAIM_HEARTBEAT_PERIOD
             except Exception:
-                logger.exception("Full load claim heartbeat failed")
-            self._closed.wait(CLAIM_HEARTBEAT_PERIOD)
+                # Чаще всего это нехватка соединений в пуле — повторяем скорее, чтобы давка на
+                # пул не стоила захвата (см. CLAIM_HEARTBEAT_RETRY_PERIOD).
+                logger.exception("Full load claim heartbeat failed, retrying in %ss",
+                                 CLAIM_HEARTBEAT_RETRY_PERIOD)
+                delay = CLAIM_HEARTBEAT_RETRY_PERIOD
+            self._closed.wait(delay)
             with self._lock:
                 if not self._held:
                     self._heartbeat_thread = None

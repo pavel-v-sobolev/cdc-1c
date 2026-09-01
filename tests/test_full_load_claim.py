@@ -10,7 +10,8 @@ from datetime import timedelta
 
 from sqlalchemy import func, select, update
 
-from cdc_1c.full_load_claim import CLAIM_HEARTBEAT_TTL, HEARTBEAT_FIELD, OWNER_FIELD
+from cdc_1c.full_load_claim import (CLAIM_HEARTBEAT_PERIOD, CLAIM_HEARTBEAT_RETRY_PERIOD,
+                                    CLAIM_HEARTBEAT_TTL, HEARTBEAT_FIELD, OWNER_FIELD)
 from cdc_1c.metadata_reader import MetadataObject1C
 from cdc_1c.replicator import Replicator1C
 from conftest import TEST_QUEUE_GUID
@@ -103,3 +104,32 @@ def test_claim_is_a_no_op_without_the_registry(db):
     rep.metadata.objects_table = None
     assert rep._full_load_claim.claim(OBJECT) is True
     rep._full_load_claim.release(OBJECT)
+
+
+def test_failed_heartbeat_is_retried_sooner(db, monkeypatch):
+    """
+    Неудачная попытка продлить захват повторяется через укороченную паузу.
+
+    Неудача — это почти всегда нехватка соединений в пуле: все заняты страницами выгрузки, а
+    отметка живости приходит за своим. С обычным периодом на весь TTL пришлось бы четыре попытки,
+    и разовая давка на пул стоила бы захвата: чужое расписание сочло бы живой процесс мёртвым и
+    занялось бы тем же объектом (воспроизведено на живой связке с pool_size=2).
+    """
+    rep = _replicator(db)
+    claim = rep._full_load_claim
+    claim.claim(OBJECT)
+    delays = []
+    monkeypatch.setattr(claim, 'heartbeat', lambda: (_ for _ in ()).throw(RuntimeError('no connection')))
+    monkeypatch.setattr(claim._closed, 'wait', lambda delay: delays.append(delay) or claim._closed.set())
+
+    claim._heartbeat_loop()
+
+    assert delays == [CLAIM_HEARTBEAT_RETRY_PERIOD]
+
+    # Удачная попытка — обычный период.
+    claim._closed.clear()
+    delays.clear()
+    monkeypatch.setattr(claim, 'heartbeat', lambda: None)
+    claim._heartbeat_loop()
+
+    assert delays == [CLAIM_HEARTBEAT_PERIOD]
